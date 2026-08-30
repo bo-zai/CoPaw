@@ -27,7 +27,9 @@ from ...marketplace.schemas import PublishMCPRequest as MarketPublishMCPRequest
 from ...marketplace.service import (
     MCPNameConflictError,
     MCPVersionConflictError,
+    _QUERY_USERS_BY_TENANT_IDS_SQL,
 )
+from ...marketplace.mcp_registry import MCPRegistry
 from ...marketplace.fs import load_index
 from ..my_mcp_helpers import (
     load_agent_config_for_request,
@@ -552,6 +554,42 @@ async def create_my_mcp(
         body.name,
     )
 
+    # 查询 tenant_name 和 bbk_id
+    tenant_name = ""
+    bbk_id = ""
+    svc = request.app.state.marketplace
+    if svc.db.is_connected:
+        try:
+            rows = await svc.db.fetch_all(
+                _QUERY_USERS_BY_TENANT_IDS_SQL.format(placeholders="%s"),
+                (context.source_id, context.user_id),
+            )
+            if rows:
+                tenant_name = rows[0].get("tenant_name", "")
+                bbk_id = rows[0].get("bbk_id", "")
+        except Exception as e:
+            logger.warning("Failed to query tenant info: %s", e)
+
+    # 写入 swe_mcp_clients 表
+    if svc.db.is_connected:
+        try:
+            registry = MCPRegistry(svc.db)
+            await registry.upsert_mcp_client(
+                client_key=body.client_key,
+                mcp_name=body.name,
+                tenant_id=context.user_id,
+                tenant_name=tenant_name,
+                bbk_id=bbk_id,
+                source="",
+                source_id=context.source_id,
+                transport=body.transport,
+                url=body.url,
+                enabled=True,
+                cn_name=body.name,
+            )
+        except Exception as e:
+            logger.warning("Failed to upsert swe_mcp_clients: %s", e)
+
     detail = _mask_sensitive_values(new_client)
     detail.client_key = body.client_key
     return detail
@@ -667,6 +705,42 @@ async def update_my_mcp(
         updated_client.name,
     )
 
+    # 查询 tenant_name 和 bbk_id
+    tenant_name = ""
+    bbk_id = ""
+    svc = request.app.state.marketplace
+    if svc.db.is_connected:
+        try:
+            rows = await svc.db.fetch_all(
+                _QUERY_USERS_BY_TENANT_IDS_SQL.format(placeholders="%s"),
+                (context.source_id, context.user_id),
+            )
+            if rows:
+                tenant_name = rows[0].get("tenant_name", "")
+                bbk_id = rows[0].get("bbk_id", "")
+        except Exception as e:
+            logger.warning("Failed to query tenant info: %s", e)
+
+    # 更新 swe_mcp_clients 表
+    if svc.db.is_connected:
+        try:
+            registry = MCPRegistry(svc.db)
+            await registry.upsert_mcp_client(
+                client_key=client_key,
+                mcp_name=updated_client.name,
+                tenant_id=context.user_id,
+                tenant_name=tenant_name,
+                bbk_id=bbk_id,
+                source=getattr(updated_client, "source", "") or "",
+                source_id=context.source_id,
+                transport=updated_client.transport,
+                url=updated_client.url,
+                enabled=updated_client.enabled,
+                cn_name=getattr(updated_client, "name", "") or "",
+            )
+        except Exception as e:
+            logger.warning("Failed to upsert swe_mcp_clients: %s", e)
+
     detail = _mask_sensitive_values(updated_client)
     detail.client_key = client_key
     detail.version_changed = final_version != previous_version
@@ -704,6 +778,20 @@ async def delete_my_mcp(
         deleted_name,
     )
 
+    # 从 swe_mcp_clients 表中删除记录
+    svc = request.app.state.marketplace
+    if svc.db.is_connected:
+        try:
+            registry = MCPRegistry(svc.db)
+            source_id_for_db = context.source_id
+            await registry.delete_mcp_client(
+                tenant_id=context.user_id,
+                source_id=source_id_for_db,
+                client_key=client_key,
+            )
+        except Exception as e:
+            logger.warning("Failed to delete swe_mcp_clients: %s", e)
+
     return {"message": f"MCP client '{client_key}' deleted"}
 
 
@@ -726,6 +814,48 @@ async def toggle_my_mcp(
     client.enabled = not client.enabled
     client.updated_at = datetime.now(timezone.utc).isoformat()
     save_agent_config_for_request(context, agent_config, request)
+
+    # 查询 tenant_name 和 bbk_id
+    tenant_name = ""
+    bbk_id = ""
+    svc = request.app.state.marketplace
+    if svc.db.is_connected:
+        try:
+            rows = await svc.db.fetch_all(
+                _QUERY_USERS_BY_TENANT_IDS_SQL.format(placeholders="%s"),
+                (context.source_id, context.user_id),
+            )
+            if rows:
+                tenant_name = rows[0].get("tenant_name", "")
+                bbk_id = rows[0].get("bbk_id", "")
+        except Exception as e:
+            logger.warning("Failed to query tenant info: %s", e)
+
+    # 更新 swe_mcp_clients 表中的 enabled 状态
+    if svc.db.is_connected:
+        try:
+            registry = MCPRegistry(svc.db)
+            # 从 client 获取 mcp_name 和 source（MCPClientConfig 是 Pydantic 模型，source 在 extra 中）
+            mcp_name = getattr(client, "name", "") or ""
+            source = getattr(client, "source", "") or ""
+            # 使用 context.source_id（marketplace source UUID），与 distribute_mcp 写入时保持一致
+            source_id_for_db = context.source_id
+            if mcp_name and source_id_for_db:
+                await registry.upsert_mcp_client(
+                    client_key=client_key,
+                    mcp_name=mcp_name,
+                    tenant_id=context.user_id,
+                    tenant_name=tenant_name,
+                    bbk_id=bbk_id,
+                    source=source,
+                    source_id=source_id_for_db,
+                    transport=getattr(client, "transport", None),
+                    url=getattr(client, "url", None) or None,
+                    enabled=client.enabled,
+                    cn_name=mcp_name,
+                )
+        except Exception as e:
+            logger.warning("Failed to update swe_mcp_clients: %s", e)
 
     detail = _mask_sensitive_values(client)
     detail.client_key = client_key

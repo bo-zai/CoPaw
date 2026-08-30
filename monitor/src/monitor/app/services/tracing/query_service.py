@@ -13,6 +13,7 @@ from typing import Any, Optional
 from ...database import get_db_connection, DatabaseConnection
 from ....utils.bbk import get_bbk_name_by_id
 from ....utils.timing import MethodTimer
+from ....utils.sql import format_sql
 from ...models.tracing import (
     ErrorItem,
     ErrorListResponse,
@@ -778,6 +779,10 @@ class TracingQueryService:  # pylint: disable=too-many-public-methods
                       AND user_id != 'default'{bbk_filter_sql}
                 """
                 params = (s, e, *EXCLUDED_SOURCE_IDS, *bbk_filter_params)
+                logger.debug(
+                    "[get_growth_stats] SQL: %s",
+                    format_sql(query, params),
+                )
                 row = await self._db.fetch_one(query, params)
             else:
                 query = f"""
@@ -791,6 +796,10 @@ class TracingQueryService:  # pylint: disable=too-many-public-methods
                       AND user_id != 'default'{bbk_filter_sql}
                 """
                 params = (source_id, s, e, *bbk_filter_params)
+                logger.debug(
+                    "[get_growth_stats] SQL: %s",
+                    format_sql(query, params),
+                )
                 row = await self._db.fetch_one(query, params)
 
             if row is None:
@@ -1050,6 +1059,7 @@ class TracingQueryService:  # pylint: disable=too-many-public-methods
             bbk_filter_sql=bbk_filter_sql,
             bbk_filter_params=bbk_filter_params,
         )
+        logger.debug("[get_daily_trend] SQL: %s", format_sql(query, params))
         rows = await self._db.fetch_all(query, params)
 
         # 查询已读任务数
@@ -1661,6 +1671,10 @@ class TracingQueryService:  # pylint: disable=too-many-public-methods
 
         # 执行主查询
         step5_start = time.time()
+        logger.debug(
+            "[get_users] SQL: %s",
+            format_sql(query, tuple(final_params)),
+        )
         rows = await self._db.fetch_all(query, tuple(final_params))
         logger.info(
             "[get_users] 执行主查询耗时: %.3fms, 返回%d行",
@@ -2962,6 +2976,10 @@ class TracingQueryService:  # pylint: disable=too-many-public-methods
             LIMIT %s OFFSET %s
         """
         params = count_params + [page_size, offset]
+        logger.debug(
+            "[get_skills_paginated] SQL: %s",
+            format_sql(data_query, tuple(params)),
+        )
         rows = await self._db.fetch_all(data_query, tuple(params))
 
         skill_ids = [row["skill_id"] for row in rows if row.get("skill_id")]
@@ -3453,7 +3471,7 @@ class TracingQueryService:  # pylint: disable=too-many-public-methods
             offset,
         )
         params = tuple(p for p in params if p is not None)
-
+        logger.debug("[get_error_list] SQL: %s", format_sql(query, params))
         rows = await self._db.fetch_all(query, params)
 
         # 构建 count 查询
@@ -3650,6 +3668,10 @@ class TracingQueryService:  # pylint: disable=too-many-public-methods
             LIMIT %s OFFSET %s
         """
         params = count_params + [page_size, offset]
+        logger.debug(
+            "[get_mcp_servers_paginated] SQL: %s",
+            format_sql(server_query, tuple(params)),
+        )
         server_rows = await self._db.fetch_all(server_query, tuple(params))
 
         mcp_servers = []
@@ -3746,7 +3768,10 @@ class TracingQueryService:  # pylint: disable=too-many-public-methods
             LIMIT %s OFFSET %s
         """
         params = list(count_params) + [page_size, offset]
-
+        logger.debug(
+            "[get_skill_traces] SQL: %s",
+            format_sql(data_query, tuple(params)),
+        )
         rows = await self._db.fetch_all(data_query, tuple(params))
 
         traces = [
@@ -4587,6 +4612,10 @@ class TracingQueryService:  # pylint: disable=too-many-public-methods
             LIMIT %s OFFSET %s
         """
         main_params = params + [page_size, offset]
+        logger.debug(
+            "[get_sessions] SQL: %s",
+            format_sql(main_query, tuple(main_params)),
+        )
         main_rows = await self._db.fetch_all(main_query, tuple(main_params))
 
         if not main_rows:
@@ -5393,6 +5422,7 @@ class TracingQueryService:  # pylint: disable=too-many-public-methods
                 LIMIT %s OFFSET %s
             """
             params = [source_id, source_id] + params + [page_size, offset]
+        logger.debug("[get_traces] SQL: %s", format_sql(query, tuple(params)))
         rows = await self._db.fetch_all(query, tuple(params))
         traces = [
             TraceListItem(
@@ -6067,6 +6097,10 @@ class TracingQueryService:  # pylint: disable=too-many-public-methods
             LIMIT %s OFFSET %s
         """
         params.extend([page_size, offset])
+        logger.debug(
+            "[check_input_tokens_mismatch] SQL: %s",
+            format_sql(list_query, tuple(params)),
+        )
         rows = await self._db.fetch_all(list_query, tuple(params))
 
         items = [

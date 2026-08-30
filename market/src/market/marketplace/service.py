@@ -57,6 +57,7 @@ from .fs import (
 from .skill_registry import SkillRegistry
 from ..runtime.context import decode_scope_id
 from ..runtime.config_store import MCPClientConfig
+from .mcp_registry import MCPRegistry
 from .models import MarketItem
 from .schemas import (
     DistributeRequest,
@@ -281,6 +282,20 @@ _QUERY_DISTRIBUTED_USERS_SQL = """
 SELECT tenant_id, tenant_name, bbk_id
 FROM swe_skills
 WHERE skill_name = %s AND source_id = %s AND source LIKE 'marketplace:%%'
+"""
+
+# 查询已分发 MCP 客户端（从 swe_mcp_clients 表，获取当前实际持有的）
+_QUERY_DISTRIBUTED_MCP_CLIENTS_SQL = """
+SELECT tenant_id, tenant_name, bbk_id
+FROM swe_mcp_clients
+WHERE source_id = %s AND mcp_name = %s
+"""
+
+# 通过 source 字段查询已分发 MCP 客户端（当 index 中找不到 item 时使用）
+_QUERY_DISTRIBUTED_MCP_CLIENTS_BY_SOURCE_SQL = """
+SELECT tenant_id, tenant_name, bbk_id
+FROM swe_mcp_clients
+WHERE source = %s AND enabled = TRUE
 """
 
 
@@ -4704,6 +4719,37 @@ class MarketplaceService:
                             "Failed to log MCP distribute operation: %s",
                             e,
                         )
+
+                    # 写入 swe_mcp_clients 表（追踪用户当前持有的 MCP）
+                    try:
+                        registry = MCPRegistry(self.db)
+                        # 从 MCP 配置文件中读取 transport 和 url
+                        mcp_config = load_mcp_config(
+                            self.marketplace_root,
+                            source_id,
+                            item_id,
+                        )
+                        config_data = (
+                            mcp_config.get("config", {}) if mcp_config else {}
+                        )
+                        await registry.upsert_mcp_client(
+                            client_key=effective_client_key,
+                            mcp_name=item.name,
+                            tenant_id=tenant_id,
+                            tenant_name=tenant_name,
+                            bbk_id=bbk_id,
+                            source=f"marketplace:{item_id}",
+                            source_id=source_id,
+                            transport=config_data.get("transport"),
+                            url=config_data.get("url"),
+                            enabled=True,
+                            cn_name=item.chinese_name or "",
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to upsert swe_mcp_clients: %s",
+                            e,
+                        )
                 results.append(
                     MCPDistributionTenantResult(
                         tenant_id=tenant_id,
@@ -4805,7 +4851,7 @@ class MarketplaceService:
         guidance: str | None,
         bbk_ids: list[str],
     ) -> MarketItem:
-        """仅更新 MCP 市场条目的展示元数据。"""
+        """仅更新 MCP 市场条目的展示元数据（同步更新 index.json）。"""
         items = load_index(self.marketplace_root, source_id)
         item = next(
             (
@@ -4824,6 +4870,47 @@ class MarketplaceService:
         item.bbk_ids = bbk_ids
         item.updated_at = datetime.now(timezone.utc).isoformat()
         save_index(self.marketplace_root, source_id, items)
+        return item
+
+    async def update_mcp_metadata_and_sync_db(
+        self,
+        *,
+        source_id: str,
+        item_id: str,
+        chinese_name: str | None,
+        description: str | None,
+        guidance: str | None,
+        bbk_ids: list[str],
+    ) -> MarketItem:
+        """更新 MCP 市场条目的展示元数据，并同步更新数据库中所有已分发用户的 cn_name。"""
+        item = self.update_mcp_metadata(
+            source_id=source_id,
+            item_id=item_id,
+            chinese_name=chinese_name,
+            description=description,
+            guidance=guidance,
+            bbk_ids=bbk_ids,
+        )
+        # 同步 cn_name 到所有已分发用户的数据库记录
+        if self.db.is_connected and item.chinese_name is not None:
+            try:
+                registry = MCPRegistry(self.db)
+                updated = await registry.update_cn_name_by_marketplace_item(
+                    source_id=source_id,
+                    marketplace_item_id=item_id,
+                    cn_name=item.chinese_name,
+                )
+                logger.info(
+                    "Synced cn_name to %d distributed MCP records: item_id=%s, cn_name=%s",
+                    updated,
+                    item_id,
+                    item.chinese_name,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to sync cn_name to swe_mcp_clients: %s",
+                    e,
+                )
         return item
 
     def _update_market_item_cn_name(
@@ -5181,7 +5268,51 @@ class MarketplaceService:
                     )
                     for r in rows
                 ]
-            # 否则查询操作日志表
+            # MCP 类型优先查询 swe_mcp_clients 表获取当前实际持有的用户
+            if item_type == "mcp":
+                items = load_index(self.marketplace_root, source_id)
+                mcp_item = next(
+                    (
+                        i
+                        for i in items
+                        if i.item_id == item_id and i.item_type == "mcp"
+                    ),
+                    None,
+                )
+                if mcp_item:
+                    # index 中存在该 item，按 mcp_name 查询
+                    rows = await self.db.fetch_all(
+                        _QUERY_DISTRIBUTED_MCP_CLIENTS_SQL,
+                        (source_id, mcp_item.name),
+                    )
+                    if rows:
+                        return [
+                            DistributionRecord(
+                                target_user_id=r["tenant_id"],
+                                target_user_name=r.get("tenant_name") or "",
+                                target_bbk_id=r.get("bbk_id") or "",
+                                distributed_at=None,
+                            )
+                            for r in rows
+                        ]
+                else:
+                    # index 中不存在该 item（可能已下架），按 source 字段查询
+                    source_prefix = f"marketplace:{item_id}"
+                    rows = await self.db.fetch_all(
+                        _QUERY_DISTRIBUTED_MCP_CLIENTS_BY_SOURCE_SQL,
+                        (source_prefix,),
+                    )
+                    if rows:
+                        return [
+                            DistributionRecord(
+                                target_user_id=r["tenant_id"],
+                                target_user_name=r.get("tenant_name") or "",
+                                target_bbk_id=r.get("bbk_id") or "",
+                                distributed_at=None,
+                            )
+                            for r in rows
+                        ]
+            # 兜底查询操作日志表
             rows = await self.db.fetch_all(
                 _QUERY_DISTRIBUTIONS_SQL,
                 (source_id, item_id, item_type),
@@ -5548,6 +5679,22 @@ class MarketplaceService:
             "default",
             reload_source_id,
         )
+
+        # 从 swe_mcp_clients 表中删除记录
+        if self.db.is_connected:
+            try:
+                registry = MCPRegistry(self.db)
+                await registry.delete_mcp_by_name(
+                    tenant_id=user_id,
+                    source_id=source_id,
+                    mcp_name=mcp_name,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to delete from swe_mcp_clients: %s",
+                    e,
+                )
+
         return None
 
     def _require_market_item(
