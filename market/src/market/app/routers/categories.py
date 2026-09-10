@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
+import logging
 from typing import Optional
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from ...app.deps import DbDep
 from ...marketplace.models import CategoryItem
+from ...utils.logging_utils import log_params
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 class CreateCategoryRequest(BaseModel):
@@ -16,6 +19,7 @@ class CreateCategoryRequest(BaseModel):
 
 @router.get("/market/categories", response_model=list[CategoryItem])
 async def get_categories(
+    request: Request,
     db: DbDep,
     x_source_id: Optional[str] = Header(default=None, alias="X-Source-Id"),
 ):
@@ -25,6 +29,8 @@ async def get_categories(
             status_code=400,
             detail="X-Source-Id header is required",
         )
+
+    log_params(logger, request.method, request.url.path, source_id=x_source_id)
     if not db.is_connected:
         raise HTTPException(status_code=503, detail="Database unavailable")
 
@@ -43,6 +49,7 @@ async def get_categories(
     status_code=201,
 )
 async def create_category(
+    request: Request,
     req: CreateCategoryRequest,
     db: DbDep,
     x_source_id: Optional[str] = Header(default=None, alias="X-Source-Id"),
@@ -53,6 +60,14 @@ async def create_category(
             status_code=400,
             detail="X-Source-Id header is required",
         )
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        source_id=x_source_id,
+        name=req.name,
+    )
     if not db.is_connected:
         raise HTTPException(status_code=503, detail="Database unavailable")
 

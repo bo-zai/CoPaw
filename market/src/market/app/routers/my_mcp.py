@@ -31,6 +31,7 @@ from ...marketplace.service import (
 )
 from ...marketplace.mcp_registry import MCPRegistry
 from ...marketplace.fs import load_index
+from ...utils.logging_utils import log_params
 from ..my_mcp_helpers import (
     load_agent_config_for_request,
     mark_request_state,
@@ -415,6 +416,13 @@ async def list_my_mcp(request: Request) -> List[MyMCPListItem]:
     context, agent_config = load_agent_config_for_request(request)
     mark_request_state(request, context)
 
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        source_id=context.source_id,
+    )
+
     if agent_config.mcp is None or not agent_config.mcp.clients:
         return []
 
@@ -482,6 +490,14 @@ async def get_my_mcp_detail(
     context, agent_config = load_agent_config_for_request(request)
     mark_request_state(request, context)
 
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        client_key=client_key,
+        source_id=context.source_id,
+    )
+
     if agent_config.mcp is None:
         raise HTTPException(
             404,
@@ -512,6 +528,16 @@ async def create_my_mcp(
     """创建新的 MCP。"""
     context, agent_config = load_agent_config_for_request(request)
     mark_request_state(request, context)
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        client_key=body.client_key,
+        name=body.name,
+        transport=body.transport,
+        source_id=context.source_id,
+    )
 
     if agent_config.mcp is None:
         agent_config.mcp = MCPConfig(clients={})
@@ -667,6 +693,14 @@ async def update_my_mcp(
     context, agent_config = load_agent_config_for_request(request)
     mark_request_state(request, context)
 
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        client_key=client_key,
+        source_id=context.source_id,
+    )
+
     if agent_config.mcp is None or client_key not in agent_config.mcp.clients:
         raise HTTPException(
             404,
@@ -758,6 +792,14 @@ async def delete_my_mcp(
     context, agent_config = load_agent_config_for_request(request)
     mark_request_state(request, context)
 
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        client_key=client_key,
+        source_id=context.source_id,
+    )
+
     if agent_config.mcp is None or client_key not in agent_config.mcp.clients:
         raise HTTPException(
             404,
@@ -803,6 +845,14 @@ async def toggle_my_mcp(
     """启用/禁用 MCP。"""
     context, agent_config = load_agent_config_for_request(request)
     mark_request_state(request, context)
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        client_key=client_key,
+        source_id=context.source_id,
+    )
 
     if agent_config.mcp is None or client_key not in agent_config.mcp.clients:
         raise HTTPException(
@@ -918,6 +968,16 @@ async def publish_single_my_mcp_to_market(
     mark_request_state(request, context)
     source_id = context.source_id
 
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        client_key=client_key,
+        category_id=body.category_id,
+        bbk_ids=body.bbk_ids,
+        source_id=source_id,
+    )
+
     if agent_config.mcp is None:
         raise HTTPException(400, detail=NO_MCP_CLIENTS_CONFIGURED_DETAIL)
 
@@ -988,6 +1048,16 @@ async def publish_my_mcp_to_market(
     context, agent_config = load_agent_config_for_request(request)
     mark_request_state(request, context)
     source_id = context.source_id
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        client_keys=body.client_keys,
+        category_id=body.category_id,
+        bbk_ids=body.bbk_ids,
+        source_id=source_id,
+    )
 
     if agent_config.mcp is None:
         raise HTTPException(400, detail=NO_MCP_CLIENTS_CONFIGURED_DETAIL)
@@ -1156,6 +1226,14 @@ async def test_my_mcp_draft_connection(
     context, agent_config = load_agent_config_for_request(request)
     mark_request_state(request, context)
 
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        transport=body.transport,
+        source_id=context.source_id,
+    )
+
     existing: MCPClientConfig | None = None
     if body.baseline_client_key:
         if (
@@ -1187,6 +1265,14 @@ async def test_my_mcp_connection(
     """测试 MCP 连接。"""
     context, agent_config = load_agent_config_for_request(request)
     mark_request_state(request, context)
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        client_key=client_key,
+        source_id=context.source_id,
+    )
 
     if agent_config.mcp is None or client_key not in agent_config.mcp.clients:
         raise HTTPException(

@@ -1,7 +1,7 @@
 import { useState, useCallback } from "react";
 import { marketApi, Category, MarketSkill, MarketSkillDetail } from "../../api/modules/market";
 
-export function useMarket(sourceId: string) {
+export function useMarket(sourceId: string, isManager: boolean = true) {
   const [categories, setCategories] = useState<Category[]>([]);
   const [skills, setSkills] = useState<MarketSkill[]>([]);
   const [loading, setLoading] = useState(false);
@@ -23,10 +23,12 @@ export function useMarket(sourceId: string) {
   const refreshSkills = useCallback(async () => {
     setLoading(true);
     try {
+      // 非管理员不传 bbkIds，由后端根据 X-Bbk-Id header 隐式过滤
+      const bbkIdsToUse = isManager ? (selectedBbkId ?? undefined) : undefined;
       const data = await marketApi.listMarketSkills(
         sourceId,
         selectedCategory ?? undefined,
-        selectedBbkId ?? undefined,
+        bbkIdsToUse,
       );
       setSkills(data);
     } catch (err) {
@@ -34,7 +36,7 @@ export function useMarket(sourceId: string) {
     } finally {
       setLoading(false);
     }
-  }, [sourceId, selectedCategory, selectedBbkId]);
+  }, [sourceId, selectedCategory, selectedBbkId, isManager]);
 
   // 刷新当前选中技能的详情
   const refreshSelectedSkill = useCallback(async () => {

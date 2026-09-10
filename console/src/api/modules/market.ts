@@ -302,6 +302,11 @@ export const marketApi = {
     return request<Category>("/market/categories", opts);
   },
 
+  listBbkIds: async (sourceId: string): Promise<string[]> => {
+    const opts = mergeHeaders({ "X-Source-Id": sourceId });
+    return request<string[]>("/market/bbk-ids", opts);
+  },
+
   listMarketSkills: async (
     sourceId: string,
     categoryId?: number,

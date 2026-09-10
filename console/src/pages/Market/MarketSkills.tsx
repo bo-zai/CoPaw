@@ -43,6 +43,7 @@ const { Title, Text } = Typography;
 interface MarketSkillsProps {
   sourceId: string;
   isManager: boolean;
+  bbkId: string;
 }
 
 export function matchesMarketSkillSearch(skill: MarketSkill, query: string): boolean {
@@ -55,7 +56,7 @@ export function matchesMarketSkillSearch(skill: MarketSkill, query: string): boo
   );
 }
 
-export function MarketSkills({ sourceId, isManager }: MarketSkillsProps) {
+export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) {
   const {
     categories,
     skills,
@@ -71,7 +72,7 @@ export function MarketSkills({ sourceId, isManager }: MarketSkillsProps) {
     refreshSkills,
     refreshSkillsAndDetail,
     openSkillDetail,
-  } = useMarket(sourceId);
+  } = useMarket(sourceId, isManager);
 
   // MCP 相关状态
   const [mcpList, setMcpList] = useState<MarketMCPItem[]>([]);
@@ -98,6 +99,14 @@ export function MarketSkills({ sourceId, isManager }: MarketSkillsProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [activeResourceType, setActiveResourceType] = useState<ResourceType>("skill");
   const [uploadModalOpen, setUploadModalOpen] = useState(false);
+  const [allBbkIds, setAllBbkIds] = useState<string[]>([]);
+
+  // 获取所有有数据的分行 ID 列表（管理员用）
+  useEffect(() => {
+    if (isManager) {
+      marketApi.listBbkIds(sourceId).then(setAllBbkIds).catch(console.error);
+    }
+  }, [sourceId, isManager]);
 
   useEffect(() => {
     refreshCategories();
@@ -139,15 +148,16 @@ export function MarketSkills({ sourceId, isManager }: MarketSkillsProps) {
   const refreshMCP = useCallback(async () => {
     setMcpLoading(true);
     try {
-      // MCP 目前不支持分类，只传递 bbk_ids 参数
-      const data = await marketMcpApi.listMarketMCP(undefined, selectedMcpBbkId ?? undefined);
+      // 非管理员不传 bbkIds，由后端根据 X-Bbk-Id header 隐式过滤
+      const bbkIdsToUse = isManager ? (selectedMcpBbkId ?? undefined) : undefined;
+      const data = await marketMcpApi.listMarketMCP(undefined, bbkIdsToUse);
       setMcpList(data);
     } catch (err) {
       console.error("获取 MCP 列表失败:", err);
     } finally {
       setMcpLoading(false);
     }
-  }, [sourceId, selectedMcpBbkId]);
+  }, [sourceId, selectedMcpBbkId, isManager]);
 
   // 切换资源类型时刷新
   useEffect(() => {
@@ -558,43 +568,13 @@ export function MarketSkills({ sourceId, isManager }: MarketSkillsProps) {
                 {/* 所属分行筛选 */}
                 <div style={{ marginTop: 24, marginBottom: 12 }}>
                   <Text strong style={{ fontSize: 14 }}>所属分行</Text>
-                  {selectedBbkId !== null && (
-                    <Button
-                      type="link"
-                      size="small"
-                      style={{ fontSize: 12, padding: "0 0 0 8px" }}
-                      onClick={() => setSelectedBbkId(null)}
-                    >
-                      清除
-                    </Button>
-                  )}
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                  <div
-                    onClick={() => setSelectedBbkId(null)}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      padding: "8px 12px",
-                      borderRadius: 6,
-                      cursor: "pointer",
-                      backgroundColor: selectedBbkId === null ? "#e6f7ff" : "transparent",
-                      color: selectedBbkId === null ? "#1890ff" : "inherit",
-                      transition: "all 0.15s ease",
-                    }}
-                  >
-                    <span>全部</span>
-                    <Tag style={{ margin: 0 }}>{skills.length}</Tag>
-                  </div>
-                  {BBK_ID_MAP.map((bbk) => {
-                    const isActive = selectedBbkId === bbk.value;
-                    const count = bbkCountMap.get(bbk.value) || 0;
-                    if (count === 0) return null;
-                    return (
+                  {isManager ? (
+                    // 管理员：显示全部选项和分行列表
+                    <>
                       <div
-                        key={bbk.value}
-                        onClick={() => setSelectedBbkId(isActive ? null : bbk.value)}
+                        onClick={() => setSelectedBbkId(null)}
                         style={{
                           display: "flex",
                           alignItems: "center",
@@ -602,16 +582,79 @@ export function MarketSkills({ sourceId, isManager }: MarketSkillsProps) {
                           padding: "8px 12px",
                           borderRadius: 6,
                           cursor: "pointer",
-                          backgroundColor: isActive ? "#e6f7ff" : "transparent",
-                          color: isActive ? "#1890ff" : "inherit",
+                          backgroundColor: selectedBbkId === null ? "#e6f7ff" : "transparent",
+                          color: selectedBbkId === null ? "#1890ff" : "inherit",
                           transition: "all 0.15s ease",
                         }}
                       >
-                        <span>{bbk.label}</span>
-                        <Tag style={{ margin: 0 }}>{count}</Tag>
+                        <span>全部</span>
+                        <Tag style={{ margin: 0 }}>{skills.length}</Tag>
                       </div>
-                    );
-                  })}
+                      {allBbkIds.map((bbkId) => {
+                        const isActive = selectedBbkId === bbkId;
+                        const count = bbkCountMap.get(bbkId) || 0;
+                        if (count === 0) return null;
+                        return (
+                          <div
+                            key={bbkId}
+                            onClick={() => setSelectedBbkId(isActive ? null : bbkId)}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              padding: "8px 12px",
+                              borderRadius: 6,
+                              cursor: "pointer",
+                              backgroundColor: isActive ? "#e6f7ff" : "transparent",
+                              color: isActive ? "#1890ff" : "inherit",
+                              transition: "all 0.15s ease",
+                            }}
+                          >
+                            <span>{BBK_ID_TO_NAME_MAP[bbkId] || bbkId}</span>
+                            <Tag style={{ margin: 0 }}>{count}</Tag>
+                          </div>
+                        );
+                      })}
+                    </>
+                  ) : (
+                    // 非管理员：显示固定选项（总行 + 本分行）
+                    <>
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          padding: "8px 12px",
+                          borderRadius: 6,
+                          backgroundColor: "#e6f7ff",
+                          color: "#1890ff",
+                        }}
+                      >
+                        <span>总行</span>
+                        <Tag style={{ margin: 0 }}>
+                          {skills.filter(s => (s.bbk_ids || []).length === 0).length}
+                        </Tag>
+                      </div>
+                      {bbkId !== "100" && (
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            padding: "8px 12px",
+                            borderRadius: 6,
+                            backgroundColor: "#e6f7ff",
+                            color: "#1890ff",
+                          }}
+                        >
+                          <span>{BBK_ID_TO_NAME_MAP[bbkId] || bbkId}</span>
+                          <Tag style={{ margin: 0 }}>
+                            {skills.filter(s => (s.bbk_ids || []).includes(bbkId)).length}
+                          </Tag>
+                        </div>
+                      )}
+                    </>
+                  )}
                 </div>
               </div>
 
@@ -622,9 +665,13 @@ export function MarketSkills({ sourceId, isManager }: MarketSkillsProps) {
                     {selectedCategory !== null
                       ? `分类：${categories.find((c) => String(c.id) === String(selectedCategory))?.name || "未知"}`
                       : "分类：全部"}
-                    {selectedBbkId !== null
-                      ? ` · 分行：${BBK_ID_TO_NAME_MAP[selectedBbkId] || selectedBbkId}`
-                      : " · 分行：全部"}
+                    {isManager
+                      ? selectedBbkId !== null
+                        ? ` · 分行：${BBK_ID_TO_NAME_MAP[selectedBbkId] || selectedBbkId}`
+                        : " · 分行：全部"
+                      : bbkId === "100"
+                        ? " · 分行：总行"
+                        : ` · 分行：总行+${BBK_ID_TO_NAME_MAP[bbkId] || bbkId}`}
                     {" · 共 "}
                     {displayedSkills.length} 个
                   </Text>
@@ -675,43 +722,13 @@ export function MarketSkills({ sourceId, isManager }: MarketSkillsProps) {
             >
               <div style={{ marginBottom: 12 }}>
                 <Text strong style={{ fontSize: 14 }}>所属分行</Text>
-                {selectedMcpBbkId !== null && (
-                  <Button
-                    type="link"
-                    size="small"
-                    style={{ fontSize: 12, padding: "0 0 0 8px" }}
-                    onClick={() => setSelectedMcpBbkId(null)}
-                  >
-                    清除
-                  </Button>
-                )}
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                <div
-                  onClick={() => setSelectedMcpBbkId(null)}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    padding: "8px 12px",
-                    borderRadius: 6,
-                    cursor: "pointer",
-                    backgroundColor: selectedMcpBbkId === null ? "#e6f7ff" : "transparent",
-                    color: selectedMcpBbkId === null ? "#1890ff" : "inherit",
-                    transition: "all 0.15s ease",
-                  }}
-                >
-                  <span>全部</span>
-                  <Tag style={{ margin: 0 }}>{mcpList.length}</Tag>
-                </div>
-                {BBK_ID_MAP.map((bbk) => {
-                  const isActive = selectedMcpBbkId === bbk.value;
-                  const count = mcpBbkCountMap.get(bbk.value) || 0;
-                  if (count === 0) return null;
-                  return (
+                {isManager ? (
+                  // 管理员：显示全部选项和分行列表
+                  <>
                     <div
-                      key={bbk.value}
-                      onClick={() => setSelectedMcpBbkId(isActive ? null : bbk.value)}
+                      onClick={() => setSelectedMcpBbkId(null)}
                       style={{
                         display: "flex",
                         alignItems: "center",
@@ -719,16 +736,79 @@ export function MarketSkills({ sourceId, isManager }: MarketSkillsProps) {
                         padding: "8px 12px",
                         borderRadius: 6,
                         cursor: "pointer",
-                        backgroundColor: isActive ? "#e6f7ff" : "transparent",
-                        color: isActive ? "#1890ff" : "inherit",
+                        backgroundColor: selectedMcpBbkId === null ? "#e6f7ff" : "transparent",
+                        color: selectedMcpBbkId === null ? "#1890ff" : "inherit",
                         transition: "all 0.15s ease",
                       }}
                     >
-                      <span>{bbk.label}</span>
-                      <Tag style={{ margin: 0 }}>{count}</Tag>
+                      <span>全部</span>
+                      <Tag style={{ margin: 0 }}>{mcpList.length}</Tag>
                     </div>
-                  );
-                })}
+                    {allBbkIds.map((bbkId) => {
+                      const isActive = selectedMcpBbkId === bbkId;
+                      const count = mcpBbkCountMap.get(bbkId) || 0;
+                      if (count === 0) return null;
+                      return (
+                        <div
+                          key={bbkId}
+                          onClick={() => setSelectedMcpBbkId(isActive ? null : bbkId)}
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            padding: "8px 12px",
+                            borderRadius: 6,
+                            cursor: "pointer",
+                            backgroundColor: isActive ? "#e6f7ff" : "transparent",
+                            color: isActive ? "#1890ff" : "inherit",
+                            transition: "all 0.15s ease",
+                          }}
+                        >
+                          <span>{BBK_ID_TO_NAME_MAP[bbkId] || bbkId}</span>
+                          <Tag style={{ margin: 0 }}>{count}</Tag>
+                        </div>
+                      );
+                    })}
+                  </>
+                ) : (
+                  // 非管理员：显示固定选项（总行 + 本分行）
+                  <>
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        padding: "8px 12px",
+                        borderRadius: 6,
+                        backgroundColor: "#e6f7ff",
+                        color: "#1890ff",
+                      }}
+                    >
+                      <span>总行</span>
+                      <Tag style={{ margin: 0 }}>
+                        {mcpList.filter(m => (m.bbk_ids || []).length === 0).length}
+                      </Tag>
+                    </div>
+                    {bbkId !== "100" && (
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          padding: "8px 12px",
+                          borderRadius: 6,
+                          backgroundColor: "#e6f7ff",
+                          color: "#1890ff",
+                        }}
+                      >
+                        <span>{BBK_ID_TO_NAME_MAP[bbkId] || bbkId}</span>
+                        <Tag style={{ margin: 0 }}>
+                          {mcpList.filter(m => (m.bbk_ids || []).includes(bbkId)).length}
+                        </Tag>
+                      </div>
+                    )}
+                  </>
+                )}
               </div>
             </div>
 
@@ -750,9 +830,13 @@ export function MarketSkills({ sourceId, isManager }: MarketSkillsProps) {
                 <>
                   <div style={{ marginBottom: 12 }}>
                     <Text type="secondary" style={{ fontSize: 12 }}>
-                      {selectedMcpBbkId !== null
-                        ? `分行：${BBK_ID_TO_NAME_MAP[selectedMcpBbkId] || selectedMcpBbkId}`
-                        : "MCP 市场"}
+                      {isManager
+                        ? selectedMcpBbkId !== null
+                          ? `分行：${BBK_ID_TO_NAME_MAP[selectedMcpBbkId] || selectedMcpBbkId}`
+                          : "MCP 市场"
+                        : bbkId === "100"
+                          ? "分行：总行"
+                          : `分行：总行+${BBK_ID_TO_NAME_MAP[bbkId] || bbkId}`}
                       {" · 共 "}
                       {displayedMCP.length} 个
                     </Text>

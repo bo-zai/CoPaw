@@ -2584,21 +2584,50 @@ class MarketplaceService:
 
         return True
 
+    def list_all_bbk_ids(self, source_id: str) -> list[str]:
+        """获取所有有数据的分行 ID 列表（去重、排序）。
+
+        从 index.json 中提取所有活跃条目的 bbk_ids 字段，
+        用于前端分行菜单的固定渲染。
+        """
+        items = load_index(self.marketplace_root, source_id)
+        bbk_ids: set[str] = set()
+        for item in items:
+            if item.status == "active" and item.bbk_ids:
+                bbk_ids.update(item.bbk_ids)
+        return sorted(bbk_ids)
+
     async def list_skills(
         self,
         source_id: str,
         user_bbk_id: str,
         category_id: Optional[int] = None,
         bbk_ids: Optional[list[str]] = None,
+        is_manager: bool = False,
     ) -> list[MarketSkillResponse]:
-        """列出市场技能，可选按分类和分行过滤。"""
+        """列出市场技能，可选按分类和分行过滤。
+
+        Args:
+            source_id: 来源 ID。
+            user_bbk_id: 用户分行 ID（非管理员时用于可见性过滤）。
+            category_id: 可选的分类 ID 过滤。
+            bbk_ids: 可选的分行 ID 过滤（交集匹配）。
+            is_manager: 是否为管理员，管理员可查看所有技能。
+        """
         items = load_index(self.marketplace_root, source_id)
         visible = [
             i for i in items if i.item_type == "skill" and i.status == "active"
         ]
         if category_id is not None:
             visible = [i for i in visible if i.category_id == category_id]
-        # 按 bbk_ids 过滤（技能的 bbk_ids 与请求的 bbk_ids 有交集）
+        # 分级可见性过滤：非管理员只能看到总行技能和本分行技能
+        if not is_manager:
+            visible = [
+                i
+                for i in visible
+                if i.bbk_ids == [] or user_bbk_id in i.bbk_ids
+            ]
+        # 前端传参时再做交集过滤（保留原有功能）
         if bbk_ids is not None and len(bbk_ids) > 0:
             visible = [
                 i
@@ -4405,14 +4434,16 @@ class MarketplaceService:
         user_bbk_id: str,
         category_id: Optional[int] = None,
         bbk_ids: Optional[list[str]] = None,
+        is_manager: bool = False,
     ) -> list[MarketMCPItem]:
         """列出市场 MCP 条目。
 
         Args:
             source_id: 来源 ID。
-            user_bbk_id: 用户 bbk_id（保留参数兼容性，不再用于过滤）。
+            user_bbk_id: 用户分行 ID（非管理员时用于可见性过滤）。
             category_id: 可选的分类 ID 过滤。
             bbk_ids: 可选的分行 ID 过滤（交集匹配）。
+            is_manager: 是否为管理员，管理员可查看所有 MCP。
 
         Returns:
             MCP 条目列表（含调用统计）。
@@ -4426,7 +4457,14 @@ class MarketplaceService:
         if category_id is not None:
             mcp_items = [i for i in mcp_items if i.category_id == category_id]
 
-        # 按 bbk_ids 过滤（MCP 的 bbk_ids 与请求的 bbk_ids 有交集）
+        # 分级可见性过滤：非管理员只能看到总行 MCP 和本分行 MCP
+        if not is_manager:
+            mcp_items = [
+                i
+                for i in mcp_items
+                if i.bbk_ids == [] or user_bbk_id in i.bbk_ids
+            ]
+        # 前端传参时再做交集过滤（保留原有功能）
         if bbk_ids is not None and len(bbk_ids) > 0:
             mcp_items = [
                 i

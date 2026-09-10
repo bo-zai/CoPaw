@@ -21,10 +21,13 @@ async def list_market_mcp(
     ),
     x_source_id: Optional[str] = Header(default=None, alias="X-Source-Id"),
     x_bbk_id: Optional[str] = Header(default=None, alias="X-Bbk-Id"),
+    x_manager: Optional[str] = Header(default=None, alias="X-Manager"),
+    x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
 ):
-    """浏览市场 MCP 列表（按 category_id + bbk_ids 过滤）."""
+    """浏览市场 MCP 列表（按 category_id + bbk_ids 过滤）。"""
     source_id = require_source_id(x_source_id)
     user_bbk_id = x_bbk_id or "100"
+    is_manager = x_manager == "true" or x_user_role == "admin"
     # 解析 bbk_ids 参数（逗号分隔）
     parsed_bbk_ids = None
     if bbk_ids:
@@ -35,6 +38,7 @@ async def list_market_mcp(
         user_bbk_id,
         category_id=category_id,
         bbk_ids=parsed_bbk_ids,
+        is_manager=is_manager,
     )
 
 

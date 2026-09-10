@@ -54,6 +54,7 @@ from ...marketplace.version_service import SkillVersionService
 from ...security import SkillScanError
 from ..async_tasks import AsyncTaskStore
 from ..deps import decode_user_name, require_source_id
+from ...utils.logging_utils import log_params
 from .skills_browse import (
     _decode_zip_filename,
     _extract_zip_skills,
@@ -833,6 +834,19 @@ async def publish_skill_upload(
 
     svc = request.app.state.marketplace
     user_name = decode_user_name(x_user_name) or x_user_id
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        category_id=category_id,
+        overwrite=overwrite,
+        cn_name=cn_name,
+        skill_id=skill_id,
+        bbk_ids=bbk_ids,
+        include_in_statistics=include_in_statistics,
+        file_size=file.size,
+    )
 
     # 解析 bbk_ids（逗号分隔）
     parsed_bbk_ids = []

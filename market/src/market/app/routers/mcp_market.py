@@ -45,6 +45,7 @@ from ...marketplace.fs import (
 )
 from ...runtime.config_store import MCPClientConfig
 from ...runtime.context import tenant_context
+from ...utils.logging_utils import log_params
 from ..deps import require_source_id
 from .my_mcp import _test_mcp_connection
 
@@ -336,6 +337,19 @@ async def publish_mcp(
     source_id = require_source_id(x_source_id)
     _require_manager(x_manager)
     svc = request.app.state.marketplace
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        client_key=req.client_key,
+        name=req.name,
+        chinese_name=req.chinese_name,
+        category_id=req.category_id,
+        bbk_ids=req.bbk_ids,
+        version=req.version,
+        overwrite=req.overwrite,
+    )
     try:
         item, version_unchanged = await svc.publish_mcp(source_id, req)
     except MCPNameConflictError as exc:
@@ -494,6 +508,19 @@ async def upload_mcp(
     source_id = require_source_id(x_source_id)
     _require_manager(x_manager)
 
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        name=form.name,
+        chinese_name=form.chinese_name,
+        description=form.description,
+        guidance=form.guidance,
+        bbk_ids=form.bbk_ids,
+        raw_json=form.raw_json,
+        file_size=file.size if file else None,
+    )
+
     file_data, source_filename, error = await _parse_upload_json(file, form)
     if error is not None:
         return UploadMCPResponse(success=False, error=error)
@@ -539,6 +566,15 @@ async def distribute_mcp(
     source_id = require_source_id(x_source_id)
     _require_manager(x_manager)
     svc = request.app.state.marketplace
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        item_id=item_id,
+        target_tenant_ids=req.target_tenant_ids,
+        overwrite=req.overwrite,
+    )
 
     # 前端可能传市场 item_id，也可能传业务侧 client_key 或名称。
     item = _find_market_mcp_item(svc, source_id, item_id)
@@ -602,6 +638,8 @@ async def delete_mcp(
     _require_manager(x_manager)
     svc = request.app.state.marketplace
 
+    log_params(logger, request.method, request.url.path, item_id=item_id)
+
     # 检查条目是否存在
     items = load_index(svc.marketplace_root, source_id)
     item = next(
@@ -638,6 +676,18 @@ async def update_market_mcp_metadata(
     _require_manager(x_manager)
     user_bbk_id = x_bbk_id or "100"
     svc = request.app.state.marketplace
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        item_id=item_id,
+        chinese_name=payload.chinese_name,
+        description=payload.description,
+        guidance=payload.guidance,
+        bbk_ids=payload.bbk_ids,
+    )
+
     try:
         await svc.update_mcp_metadata_and_sync_db(
             source_id=source_id,
@@ -666,6 +716,8 @@ async def test_market_mcp(
     """测试市场 MCP 连接。"""
     source_id = require_source_id(x_source_id)
     svc = request.app.state.marketplace
+
+    log_params(logger, request.method, request.url.path, item_id=item_id)
 
     # 获取 MCP 配置
     items = load_index(svc.marketplace_root, source_id)
@@ -715,6 +767,8 @@ async def get_mcp_distributions(
     source_id = require_source_id(x_source_id)
     _require_manager(x_manager)
     svc = request.app.state.marketplace
+
+    log_params(logger, request.method, request.url.path, item_id=item_id)
     distributions = await svc.get_distributions(source_id, item_id, "mcp")
     return distributions
 
@@ -740,6 +794,15 @@ async def recall_mcp_by_name(
     body = await request.json()
     target_user_ids = body.get("target_user_ids")
     mcp_name = body.get("mcp_name")
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        mcp_name=mcp_name,
+        target_user_ids=target_user_ids,
+    )
+
     req = RecallRequest(
         target_user_ids=target_user_ids,
         mcp_name=mcp_name,
@@ -775,6 +838,8 @@ async def recall_mcp(
     source_id = require_source_id(x_source_id)
     _require_manager(x_manager)
     svc = request.app.state.marketplace
+
+    log_params(logger, request.method, request.url.path, item_id=item_id)
 
     # 解析请求体
     body = await request.json()
@@ -905,6 +970,15 @@ async def init_swe_mcp_clients(
     svc = request.app.state.marketplace
     swe_root = svc.swe_root
     registry = MCPRegistry(svc.db)
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        source_ids=payload.source_ids,
+        user_ids=payload.user_ids,
+        dry_run=payload.dry_run,
+    )
 
     results: _InitSweMCPClientsResult = {
         "dry_run": payload.dry_run,

@@ -52,6 +52,7 @@ from ...utils.skill_md import (
     parse_frontmatter,
 )
 from ...utils.skill_utils import clean_skill_name
+from ...utils.logging_utils import log_params
 from ..deps import decode_user_name, require_source_id
 
 logger = logging.getLogger(__name__)
@@ -623,6 +624,17 @@ def _import_skill_from_zip(
     return result
 
 
+@router.get("/market/bbk-ids", response_model=list[str])
+async def list_bbk_ids(
+    request: Request,
+    x_source_id: Optional[str] = Header(default=None, alias="X-Source-Id"),
+):
+    """获取所有有数据的分行 ID 列表（用于前端分行菜单固定渲染）。"""
+    source_id = require_source_id(x_source_id)
+    svc = request.app.state.marketplace
+    return svc.list_all_bbk_ids(source_id)
+
+
 @router.get("/market/skills", response_model=list[MarketSkillResponse])
 async def list_skills(
     request: Request,
@@ -633,10 +645,22 @@ async def list_skills(
     ),
     x_source_id: Optional[str] = Header(default=None, alias="X-Source-Id"),
     x_bbk_id: Optional[str] = Header(default=None, alias="X-Bbk-Id"),
+    x_manager: Optional[str] = Header(default=None, alias="X-Manager"),
+    x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
 ):
-    """浏览市场技能列表（按 source_id + category_id + bbk_ids 过滤）."""
+    """浏览市场技能列表（按 source_id + category_id + bbk_ids 过滤）。"""
     source_id = require_source_id(x_source_id)
     user_bbk_id = x_bbk_id or "100"
+    is_manager = x_manager == "true" or x_user_role == "admin"
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        category_id=category_id,
+        bbk_ids=bbk_ids,
+    )
+
     # 解析 bbk_ids 参数（逗号分隔）
     parsed_bbk_ids = None
     if bbk_ids:
@@ -647,6 +671,7 @@ async def list_skills(
         user_bbk_id,
         category_id=category_id,
         bbk_ids=parsed_bbk_ids,
+        is_manager=is_manager,
     )
 
 
@@ -665,6 +690,15 @@ async def get_my_skills(
             detail="X-User-Id header is required",
         )
     svc = request.app.state.marketplace
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        source_id=source_id,
+        user_id=x_user_id,
+        agent_id=agent_id,
+    )
     all_skills = await svc.get_my_skills(source_id, x_user_id, agent_id)
     return [s for s in all_skills if not s.is_received]
 
@@ -684,6 +718,15 @@ async def get_received_skills(
             detail="X-User-Id header is required",
         )
     svc = request.app.state.marketplace
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        source_id=source_id,
+        user_id=x_user_id,
+        agent_id=agent_id,
+    )
     all_skills = await svc.get_my_skills(source_id, x_user_id, agent_id)
     return [s for s in all_skills if s.is_received]
 
@@ -698,6 +741,9 @@ async def get_skill_detail(
     """预览技能详情."""
     source_id = require_source_id(x_source_id)
     user_bbk_id = x_bbk_id or "100"
+
+    log_params(logger, request.method, request.url.path, item_id=item_id)
+
     svc = request.app.state.marketplace
     detail = await svc.get_skill_detail(source_id, item_id, user_bbk_id)
     if detail is None:
@@ -718,6 +764,9 @@ async def list_market_skill_files(
     """获取市场技能详情页文件树。"""
     source_id = require_source_id(x_source_id)
     user_bbk_id = x_bbk_id or "100"
+
+    log_params(logger, request.method, request.url.path, item_id=item_id)
+
     svc = request.app.state.marketplace
     files = svc.list_market_skill_files(source_id, item_id, user_bbk_id)
     if files is None:
@@ -739,6 +788,15 @@ async def read_market_skill_file(
     """读取市场技能详情页文件内容。"""
     source_id = require_source_id(x_source_id)
     user_bbk_id = x_bbk_id or "100"
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        item_id=item_id,
+        file_path=file_path,
+    )
+
     svc = request.app.state.marketplace
     content, file_type = svc.read_market_skill_file(
         source_id,
@@ -900,6 +958,14 @@ async def parse_skill_zip(
             status_code=400,
             detail="X-User-Id header is required",
         )
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        market_mode=market_mode,
+        file_size=file.size,
+    )
 
     svc = request.app.state.marketplace
     swe_root = svc.swe_root
@@ -1233,6 +1299,19 @@ async def upload_skill_to_workspace(
             detail="X-User-Id header is required",
         )
 
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        enable=enable,
+        overwrite=overwrite,
+        target_name=target_name,
+        rename_map=rename_map,
+        category_id=category_id,
+        cn_name=cn_name,
+        file_size=file.size,
+    )
+
     # 解析 rename_map JSON
     parsed_rename_map: dict[str, str] = {}
     if rename_map:
@@ -1341,6 +1420,15 @@ async def list_skill_files(
             status_code=400,
             detail="X-User-Id header is required",
         )
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        skill_name=skill_name,
+        agent_id=agent_id,
+    )
+
     svc = request.app.state.marketplace
     return svc.list_skill_files(x_user_id, skill_name, agent_id, source_id)
 
@@ -1360,6 +1448,14 @@ async def download_my_skill(
             status_code=400,
             detail="X-User-Id header is required",
         )
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        skill_name=skill_name,
+        agent_id=agent_id,
+    )
 
     svc = request.app.state.marketplace
     skills = await svc.get_my_skills(source_id, x_user_id, agent_id)
@@ -1419,6 +1515,9 @@ async def download_market_skill(
     """下载市场当前版本技能 ZIP。"""
     source_id = require_source_id(x_source_id)
     user_bbk_id = x_bbk_id or "100"
+
+    log_params(logger, request.method, request.url.path, item_id=item_id)
+
     svc = request.app.state.marketplace
 
     detail = await svc.get_skill_detail(source_id, item_id, user_bbk_id)
@@ -1474,6 +1573,16 @@ async def read_skill_file(
             status_code=400,
             detail="X-User-Id header is required",
         )
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        skill_name=skill_name,
+        file_path=file_path,
+        agent_id=agent_id,
+    )
+
     svc = request.app.state.marketplace
     content, file_type = svc.read_skill_file(
         x_user_id,
@@ -1515,6 +1624,15 @@ async def save_skill_file(
             status_code=400,
             detail="X-User-Id header is required",
         )
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        skill_name=skill_name,
+        file_path=file_path,
+        agent_id=agent_id,
+    )
 
     svc = request.app.state.marketplace
     skills = await svc.get_my_skills(source_id, x_user_id, agent_id)
@@ -1598,6 +1716,14 @@ async def delete_my_skill(
             detail="X-User-Id header is required",
         )
 
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        skill_name=skill_name,
+        agent_id=agent_id,
+    )
+
     svc = request.app.state.marketplace
     ok = await svc.delete_skill(x_user_id, skill_name, agent_id, source_id)
     if not ok:
@@ -1651,6 +1777,15 @@ async def enable_my_skill(
             status_code=400,
             detail="X-User-Id header is required",
         )
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        skill_name=skill_name,
+        agent_id=agent_id,
+    )
+
     svc = request.app.state.marketplace
     result = await svc.enable_skill(x_user_id, skill_name, agent_id, source_id)
     if not result.get("success"):
@@ -1684,6 +1819,15 @@ async def disable_my_skill(
             status_code=400,
             detail="X-User-Id header is required",
         )
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        skill_name=skill_name,
+        agent_id=agent_id,
+    )
+
     svc = request.app.state.marketplace
     result = await svc.disable_skill(
         x_user_id,
@@ -1717,6 +1861,15 @@ async def batch_delete_my_skills(
             status_code=400,
             detail="X-User-Id header is required",
         )
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        skills=body.skills,
+        agent_id=agent_id,
+    )
+
     svc = request.app.state.marketplace
     results = await svc.batch_delete_skills(
         x_user_id,
@@ -1750,6 +1903,15 @@ async def batch_enable_my_skills(
             status_code=400,
             detail="X-User-Id header is required",
         )
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        skills=body.skills,
+        agent_id=agent_id,
+    )
+
     svc = request.app.state.marketplace
     results = await svc.batch_enable_skills(
         x_user_id,
@@ -1783,6 +1945,15 @@ async def batch_disable_my_skills(
             status_code=400,
             detail="X-User-Id header is required",
         )
+
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        skills=body.skills,
+        agent_id=agent_id,
+    )
+
     svc = request.app.state.marketplace
     results = await svc.batch_disable_skills(
         x_user_id,
