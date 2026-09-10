@@ -1,7 +1,11 @@
+import { FilePreviewPresentationProvider } from "@/components/agentscope-chat/FilePreviewPresentationContext";
+
 export default function ReportView() {
   return (
-    <div>
-      <h1>ReportView</h1>
-    </div>
+    <FilePreviewPresentationProvider value="modal">
+      <div>
+        <h1>ReportView</h1>
+      </div>
+    </FilePreviewPresentationProvider>
   );
 }

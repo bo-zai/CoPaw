@@ -46,8 +46,13 @@ console_push_store.take_all = _noop_take_all
 sys.modules["swe.app.console_push_store"] = console_push_store
 
 agent_context = types.ModuleType("swe.app.agent_context")
+agent_context.get_agent_and_config_for_request = lambda request: (None, None)
 agent_context.get_agent_for_request = lambda request: None
 agent_context.get_current_agent_id = lambda: "default"
+agent_context.resolve_file_manager_source_scope_location = (
+    lambda *args, **kwargs: None
+)
+agent_context.resolve_file_manager_workspace_dir = lambda *args, **kwargs: None
 sys.modules["swe.app.agent_context"] = agent_context
 
 agentscope_runtime = types.ModuleType("agentscope_runtime")

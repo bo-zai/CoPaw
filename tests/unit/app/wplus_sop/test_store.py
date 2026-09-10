@@ -12,6 +12,8 @@ import pytest
 from swe.app.wplus_sop.models import (
     ChatProjectionOutboxItem,
     CommandReceipt,
+    CumulativePreview,
+    ConfirmedStageSnapshot,
     EntryDetectionMode,
     EntryProposalStatus,
     EventKind,
@@ -20,9 +22,15 @@ from swe.app.wplus_sop.models import (
     RunAttempt,
     RunStatus,
     SessionProjection,
+    SessionRecord,
     SessionState,
     Stage,
     StageProposalPayload,
+    StageQueueConfirmedPayload,
+    StageReport,
+    StageReportArtifact,
+    StageReportGeneratedPayload,
+    StageReportValidationEvidence,
     StructuredInteractionEnvelope,
     WPlusEntryProposal,
 )
@@ -693,3 +701,140 @@ def test_load_preserves_minimal_legacy_memory_history_without_reopening_session(
         )
         for event in saved_and_reloaded.events
     ] == before_events
+
+
+def _report_artifacts() -> list[StageReportArtifact]:
+    return [
+        StageReportArtifact(
+            artifact_id="stage_sop_json",
+            name="stage_sop.json",
+            static_file_name="json.file",
+            static_url="https://static.example/stage_sop.json",
+            sha256="a" * 64,
+            copied_by="copy_file_to_static",
+        ),
+        StageReportArtifact(
+            artifact_id="stage_sop_md",
+            name="stage_sop.md",
+            static_file_name="md.file",
+            static_url="https://static.example/stage_sop.md",
+            sha256="b" * 64,
+            copied_by="copy_file_to_static",
+        ),
+        StageReportArtifact(
+            artifact_id="stage_sop_html",
+            name="stage_sop.html",
+            static_file_name="html.file",
+            static_url="https://static.example/stage_sop.html",
+            sha256="c" * 64,
+            copied_by="copy_file_to_static",
+        ),
+    ]
+
+
+def _report() -> StageReport:
+    return StageReport(
+        stage_id="one",
+        report_no=1,
+        revision=0,
+        artifacts=_report_artifacts(),
+        validation=StageReportValidationEvidence(
+            schema_validator="scripts/validate_stage_sop.py",
+            schema_exit_code=0,
+            renderers=("scripts/render_stage_md.py", "scripts/render_stage_sop.py"),
+        ),
+    )
+
+
+def _snapshot() -> ConfirmedStageSnapshot:
+    return ConfirmedStageSnapshot(
+        stage_id="one",
+        report_no=1,
+        revision=0,
+        artifact_sha256="d" * 64,
+    )
+
+
+def _cumulative() -> CumulativePreview:
+    return CumulativePreview(
+        preview_version=1,
+        stage_order=["one"],
+        snapshots=[_snapshot()],
+        artifacts=_report_artifacts(),
+        rendered_sha256={"stage_sop_json": "e" * 64},
+    )
+
+
+def test_legacy_store_file_without_incremental_fields_loads_with_defaults(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "wplus-sop.json"
+    record = SessionRecord(projection=_projection(), events=[_stage_event()])
+    dumped = record.model_dump(mode="json")
+    del dumped["projection"]["stage_reports"]
+    del dumped["projection"]["confirmed_snapshots"]
+    del dumped["projection"]["cumulative_preview"]
+    legacy = {
+        "schema_version": 1,
+        "entry_proposals": {},
+        "sessions": {record.projection.sop_session_id: dumped},
+        "command_index": {},
+    }
+    path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+
+    loaded = WPlusSopStore(path).get_session("sop_1")
+    assert loaded is not None
+    assert loaded.projection.stage_reports == []
+    assert loaded.projection.confirmed_snapshots == []
+    assert loaded.projection.cumulative_preview is None
+
+
+def test_commit_event_persists_incremental_projection_fields(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "wplus-sop.json"
+    store = WPlusSopStore(path)
+    report = _report()
+    snapshot = _snapshot()
+    preview = _cumulative()
+    projection = _projection().model_copy(
+        update={
+            "stages": [
+                Stage(stage_id="one", name="需求确认"),
+                Stage(stage_id="two", name="交付校验"),
+            ],
+        },
+    )
+    store.create_session(projection, command_receipt=_entry_receipt())
+    store.commit_event(
+        "sop_1",
+        expected_state_version=1,
+        event=StructuredInteractionEnvelope(
+            event_id="evt_queue_1",
+            sop_session_id="sop_1",
+            chat_id="chat_1",
+            revision=1,
+            round=0,
+            state_version=2,
+            kind=EventKind.STAGE_QUEUE_CONFIRMED,
+            payload=StageQueueConfirmedPayload(
+                stages=[
+                    Stage(stage_id="one", name="需求确认"),
+                    Stage(stage_id="two", name="交付校验"),
+                ],
+            ),
+        ),
+        next_state=SessionState.AWAITING_QUEUE_CONFIRMATION,
+        projection_changes={
+            "stage_reports": [report],
+            "confirmed_snapshots": [snapshot],
+            "cumulative_preview": preview,
+        },
+    )
+
+    reloaded = WPlusSopStore(path).get_session("sop_1")
+    assert reloaded is not None
+    assert reloaded.projection.stage_reports == [report]
+    assert reloaded.projection.confirmed_snapshots == [snapshot]
+    assert reloaded.projection.cumulative_preview == preview
+    assert reloaded.projection.state_version == 2

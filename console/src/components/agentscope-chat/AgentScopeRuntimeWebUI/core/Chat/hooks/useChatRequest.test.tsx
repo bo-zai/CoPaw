@@ -11,7 +11,7 @@ const mocks = vi.hoisted(() => {
     promise: Promise.resolve(),
     resolve: () => {},
   };
-  const streamChunks = [
+  const streamChunks: Array<{ data: string; event?: string }> = [
     {
       data: JSON.stringify({
         object: "response",
@@ -122,6 +122,8 @@ function Harness(props: {
   updateMessage: (message: unknown) => void;
   hasMessage?: (id: string) => boolean;
   onFinish: (owner: ChatRequestOwner) => void;
+  applyRecoverySnapshot?: (history: unknown, owner: ChatRequestOwner) => void;
+  recoverAfterNotFound?: (owner: ChatRequestOwner) => void;
 }) {
   hookApi = useChatRequest({
     currentQARef: props.currentQARef,
@@ -129,6 +131,8 @@ function Harness(props: {
     hasMessage: props.hasMessage,
     getCurrentSessionId: () => "chat-b",
     onFinish: props.onFinish,
+    applyRecoverySnapshot: props.applyRecoverySnapshot,
+    recoverAfterNotFound: props.recoverAfterNotFound,
   });
 
   return null;
@@ -248,6 +252,7 @@ describe("useChatRequest", () => {
       />,
     );
 
+    mocks.streamGate.resolve();
     await act(async () => {
       await hookApi.request([], undefined, createOwner());
     });
@@ -261,6 +266,69 @@ describe("useChatRequest", () => {
         }),
       },
     ]);
+    expect(onFinish).toHaveBeenCalledWith(createOwner());
+  });
+
+  it("finishes when the stream ends after terminal message frames", async () => {
+    mocks.fetch.mockResolvedValue({
+      ok: true,
+      body: {},
+    } as Response);
+    mocks.streamChunks.splice(
+      0,
+      mocks.streamChunks.length,
+      {
+        data: JSON.stringify({
+          object: "response",
+          id: "response-1",
+          status: "in_progress",
+          created_at: 1,
+          output: [],
+        }),
+      },
+      {
+        data: JSON.stringify({
+          object: "message",
+          id: "message-1",
+          role: "assistant",
+          type: "message",
+          status: "completed",
+          content: [
+            {
+              object: "content",
+              type: "text",
+              text: "hello",
+              status: "completed",
+            },
+          ],
+        }),
+      },
+    );
+    const onFinish = vi.fn();
+    const currentQARef = {
+      current: {
+        response: {
+          id: "ui-response-a",
+          msgStatus: "generating",
+          cards: [],
+        },
+        activeRequestOwner: createOwner(),
+      },
+    } as CurrentQARef;
+
+    render(
+      <Harness
+        currentQARef={currentQARef}
+        updateMessage={vi.fn()}
+        onFinish={onFinish}
+      />,
+    );
+
+    mocks.streamGate.resolve();
+    await act(async () => {
+      await hookApi.request([], undefined, createOwner());
+    });
+
     expect(onFinish).toHaveBeenCalledWith(createOwner());
   });
 
@@ -492,6 +560,135 @@ describe("useChatRequest", () => {
     );
   });
 
+  it("applies a named terminal chat snapshot without creating an error card", async () => {
+    const applyRecoverySnapshot = vi.fn();
+    mocks.streamChunks.splice(0, mocks.streamChunks.length, {
+      event: "chat.snapshot",
+      data: JSON.stringify({
+        object: "chat_snapshot",
+        chat_id: "chat-real-a",
+        msgid: "msg-2",
+        turn_status: "completed",
+        history: { messages: [{ id: "user-1", role: "user" }] },
+      }),
+    });
+    mocks.reconnect.mockResolvedValue({
+      ok: true,
+      body: {},
+      headers: new Headers(),
+    } as Response);
+
+    const currentQARef = {
+      current: {
+        response: {
+          id: "ui-response-a",
+          msgStatus: "generating",
+          cards: [],
+        },
+        activeRequestOwner: createOwner({ kind: "reconnect" }),
+      },
+    } as CurrentQARef;
+
+    const updateMessage = vi.fn();
+    const onFinish = vi.fn();
+    render(
+      <Harness
+        currentQARef={currentQARef}
+        updateMessage={updateMessage}
+        onFinish={onFinish}
+        applyRecoverySnapshot={applyRecoverySnapshot}
+      />,
+    );
+
+    await act(async () => {
+      await hookApi.reconnect("chat-a", createOwner({ kind: "reconnect" }));
+    });
+
+    expect(applyRecoverySnapshot).toHaveBeenCalledWith(
+      expect.objectContaining({ messages: [{ id: "user-1", role: "user" }] }),
+      expect.objectContaining({ msgid: "msg-2" }),
+    );
+    expect(updateMessage).not.toHaveBeenCalled();
+    expect(onFinish).not.toHaveBeenCalled();
+  });
+
+  it("uses the compatibility refresh callback for a reconnect 404", async () => {
+    const recoverAfterNotFound = vi.fn();
+    mocks.reconnect.mockResolvedValue({
+      ok: false,
+      status: 404,
+      body: {},
+      json: vi.fn(async () => ({ detail: "No running chat for this session" })),
+    } as unknown as Response);
+    const currentQARef = {
+      current: {
+        response: {
+          id: "ui-response-a",
+          msgStatus: "generating",
+          cards: [],
+        },
+        activeRequestOwner: createOwner({ kind: "reconnect" }),
+      },
+    } as CurrentQARef;
+
+    render(
+      <Harness
+        currentQARef={currentQARef}
+        updateMessage={vi.fn()}
+        onFinish={vi.fn()}
+        recoverAfterNotFound={recoverAfterNotFound}
+      />,
+    );
+
+    await act(async () => {
+      await hookApi.reconnect("chat-a", createOwner({ kind: "reconnect" }));
+    });
+
+    expect(recoverAfterNotFound).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "reconnect" }),
+    );
+  });
+
+  it("retries transient settlement responses before applying legacy errors", async () => {
+    const recoverAfterNotFound = vi.fn();
+    mocks.reconnect
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        body: {},
+        headers: new Headers({ "Retry-After": "0" }),
+      } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 404,
+        body: {},
+        headers: new Headers(),
+        json: vi.fn(async () => ({ detail: "missing" })),
+      } as unknown as Response);
+    const currentQARef = {
+      current: {
+        response: { id: "ui-response-a", msgStatus: "generating", cards: [] },
+        activeRequestOwner: createOwner({ kind: "reconnect" }),
+      },
+    } as CurrentQARef;
+
+    render(
+      <Harness
+        currentQARef={currentQARef}
+        updateMessage={vi.fn()}
+        onFinish={vi.fn()}
+        recoverAfterNotFound={recoverAfterNotFound}
+      />,
+    );
+
+    await act(async () => {
+      await hookApi.reconnect("chat-a", createOwner({ kind: "reconnect" }));
+    });
+
+    expect(mocks.reconnect).toHaveBeenCalledTimes(2);
+    expect(recoverAfterNotFound).toHaveBeenCalledOnce();
+  });
+
   it("cancels the active backend run with the owning chat identifiers", async () => {
     const abortController = new AbortController();
     const currentQARef = {
@@ -535,6 +732,55 @@ describe("useChatRequest", () => {
     });
     expect(isChatStreamAbortReason(abortController.signal.reason, "stop")).toBe(
       true,
+    );
+  });
+
+  it("uses the stream turn identity when stopping a started request", async () => {
+    const abortController = new AbortController();
+    const owner = createOwner({ chatId: null });
+    const currentQARef = {
+      current: {
+        abortController,
+        activeRequestOwner: owner,
+        response: {
+          id: "ui-response-a",
+          msgStatus: "generating",
+          cards: [],
+        },
+      },
+    } as CurrentQARef;
+    mocks.fetch.mockResolvedValue({
+      ok: true,
+      body: {},
+      headers: new Headers({
+        "X-Swe-Chatid": "chat-real-a",
+        "X-Swe-Msgid": "turn-a",
+        "X-Swe-Sessionid": "logical-a",
+      }),
+    } as Response);
+
+    render(
+      <Harness
+        currentQARef={currentQARef}
+        updateMessage={vi.fn()}
+        onFinish={vi.fn()}
+      />,
+    );
+
+    const requestPromise = hookApi.request([], undefined, owner);
+    await waitFor(() => expect(owner.msgid).toBe("turn-a"));
+    await act(async () => {
+      await hookApi.cancelActiveRequest();
+    });
+    mocks.streamGate.resolve();
+    await requestPromise;
+
+    expect(mocks.cancel).toHaveBeenCalledWith(
+      expect.objectContaining({
+        chat_id: "chat-real-a",
+        msgid: "turn-a",
+        logical_session_id: "logical-a",
+      }),
     );
   });
 
@@ -594,6 +840,85 @@ describe("useChatRequest", () => {
 
     expect(updateMessage).toHaveBeenCalledTimes(1);
     expect(onFinish).toHaveBeenCalledWith(createOwner());
+  });
+
+  it("renders approval metadata from a fast live assistant message", async () => {
+    mocks.fetch.mockResolvedValue({
+      ok: true,
+      body: {},
+    } as Response);
+    mocks.streamChunks.splice(
+      0,
+      mocks.streamChunks.length,
+      {
+        data: JSON.stringify({
+          object: "message",
+          id: "approval-message-1",
+          role: "assistant",
+          type: "message",
+          status: "in_progress",
+          content: null,
+          metadata: {
+            approval_action: {
+              requestId: "approval-1",
+              toolName: "execute_shell_command",
+              toolInput: { command: "echo ok" },
+              triggerLabel: "Tool Guard",
+              approveCommand: "/approve approval-1",
+              denyCommand: "/deny approval-1",
+            },
+          },
+        }),
+      },
+      {
+        data: JSON.stringify({
+          object: "content",
+          type: "text",
+          status: "in_progress",
+          index: 0,
+          delta: true,
+          msg_id: "approval-message-1",
+          text: "等待审批",
+        }),
+      },
+    );
+
+    const updateMessage = vi.fn();
+    const currentQARef = {
+      current: {
+        response: {
+          id: "ui-response-a",
+          role: "assistant",
+          msgStatus: "generating",
+          cards: [],
+        },
+        activeRequestOwner: createOwner(),
+      },
+    } as CurrentQARef;
+
+    render(
+      <Harness
+        currentQARef={currentQARef}
+        updateMessage={updateMessage}
+        onFinish={vi.fn()}
+      />,
+    );
+
+    const requestPromise = hookApi.request([], undefined, createOwner());
+    mocks.streamGate.resolve();
+
+    await act(async () => {
+      await requestPromise;
+    });
+
+    expect(currentQARef.current.response?.cards?.map((card) => card.code)).toEqual(
+      ["AgentScopeRuntimeResponseCard", "ApprovalAction"],
+    );
+    expect(currentQARef.current.response?.cards?.[1]?.data).toMatchObject({
+      requestId: "approval-1",
+      toolName: "execute_shell_command",
+    });
+    expect(updateMessage).toHaveBeenCalled();
   });
 
   it("places plan review before the response feedback card", async () => {

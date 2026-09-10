@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from starlette.requests import Request
 
+from swe.app.b3_headers import extract_b3_context
 from swe.app.middleware.header_passthrough import HeaderPassthroughMiddleware
 
 
@@ -18,7 +19,9 @@ def _request_with_headers(headers: list[tuple[bytes, bytes]]) -> Request:
 
 
 def test_header_passthrough_extracts_raw_b3_headers() -> None:
-    middleware = HeaderPassthroughMiddleware(app=lambda scope, receive, send: None)
+    middleware = HeaderPassthroughMiddleware(
+        app=lambda scope, receive, send: None,
+    )
     request = _request_with_headers(
         [
             (b"x-header-cookie", b"foo=bar"),
@@ -46,7 +49,9 @@ def test_header_passthrough_extracts_raw_b3_headers() -> None:
 
 
 def test_header_passthrough_canonicalizes_prefixed_b3_headers() -> None:
-    middleware = HeaderPassthroughMiddleware(app=lambda scope, receive, send: None)
+    middleware = HeaderPassthroughMiddleware(
+        app=lambda scope, receive, send: None,
+    )
     request = _request_with_headers(
         [
             (
@@ -61,3 +66,19 @@ def test_header_passthrough_canonicalizes_prefixed_b3_headers() -> None:
         "X-B3-Traceid": "8267fd70bacf497704fec30eaa353979",
         "X-B3-Spanid": "32befd146889a61a",
     }
+
+
+def test_extract_b3_context_keeps_supplied_identifiers_opaque() -> None:
+    headers = {
+        "X-B3-Traceid": "trace-id-from-frontend",
+        "X-B3-Spanid": "span-id-from-frontend",
+        "X-B3-Sampled": "1",
+    }
+
+    assert extract_b3_context(headers) == headers
+
+
+def test_extract_b3_context_returns_none_when_frontend_omits_b3_headers() -> (
+    None
+):
+    assert extract_b3_context({"X-Source-Id": "src-a"}) is None

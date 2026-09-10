@@ -12,7 +12,9 @@ ADD COLUMN template_id BIGINT NULL COMMENT '当前事件所在模板ID',
 ADD COLUMN result_id VARCHAR(128) NULL COMMENT '当前模板生成结果ID',
 ADD COLUMN event_target_id VARCHAR(255) NULL COMMENT '模块的稳定标识',
 ADD COLUMN event_target_name VARCHAR(512) NULL COMMENT '模块的展示名称',
-ADD COLUMN trace_id VARCHAR(128) NULL COMMENT '方案生成与浏览链路标识';
+ADD COLUMN trace_id VARCHAR(128) NULL COMMENT '方案生成与浏览链路标识',
+ALGORITHM=INPLACE,
+LOCK=NONE;
 
 ALTER TABLE swe_html_preview_click_events
 ADD INDEX idx_source_event_target_clicked (
@@ -33,4 +35,6 @@ ADD INDEX idx_source_template_result_clicked (
   result_id,
   clicked_at
 ),
-ADD INDEX idx_trace_clicked (trace_id, clicked_at);
+ADD INDEX idx_trace_clicked (trace_id, clicked_at),
+ALGORITHM=INPLACE,
+LOCK=NONE;

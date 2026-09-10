@@ -20,10 +20,8 @@ MCP_CARD = (
 MCP_API = CONSOLE_SRC / "api" / "modules" / "mcp.ts"
 MCP_TYPES = CONSOLE_SRC / "api" / "types" / "mcp.ts"
 LOCALE_FILES = {
-    "en": CONSOLE_SRC / "locales" / "en.json",
-    "zh": CONSOLE_SRC / "locales" / "zh.json",
-    "ja": CONSOLE_SRC / "locales" / "ja.json",
-    "ru": CONSOLE_SRC / "locales" / "ru.json",
+    file_path.stem: file_path
+    for file_path in (CONSOLE_SRC / "locales").glob("*.json")
 }
 
 

@@ -16,6 +16,7 @@ from monitor.app.services.tracing.query_service import (
     build_cron_bbk_in_filter,
     TracingQueryService,
 )
+from monitor.app.models.tracing import OverviewBranchBreakdown
 
 
 class TestBuildBbkInFilter:
@@ -88,6 +89,92 @@ class TestBuildCronBbkInFilter:
         assert len(params) == 2
         assert "100" in params
         assert "V00" in params
+
+
+class TestOverviewStatsDetail:
+    """Tests for overview payload detail levels."""
+
+    @pytest.fixture
+    def service(self):
+        """Create TracingQueryService instance with mocked overview readers."""
+        service = TracingQueryService(MagicMock())
+        service._get_total_users = AsyncMock(return_value=(10, 2, 8))
+        service._get_online_users = AsyncMock(return_value=(1, ["u-1"]))
+        service._get_token_stats = AsyncMock(
+            return_value={
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "total_tokens": 150,
+                "total_traces": 7,
+                "total_sessions": 3,
+                "avg_duration": 1200,
+            },
+        )
+        service._get_branch_breakdown = AsyncMock(
+            return_value=OverviewBranchBreakdown(),
+        )
+        service._get_total_skill_calls = AsyncMock(return_value=4)
+        service._get_customer_click_stats = AsyncMock(
+            return_value={
+                "plan_customers": 5,
+                "insight_customers": 2,
+                "phone_customers": 1,
+            },
+        )
+        service._get_model_distribution = AsyncMock(return_value=[])
+        service._get_top_tools = AsyncMock(return_value=[])
+        service._get_top_skills = AsyncMock(return_value=[])
+        service._get_mcp_stats = AsyncMock(return_value=([], []))
+        service._get_growth_stats = AsyncMock(
+            return_value={"userGrowth": 5, "planCustomersGrowth": 6},
+        )
+        return service
+
+    @pytest.mark.asyncio
+    async def test_summary_detail_skips_resource_breakdown_queries(
+        self,
+        service,
+    ):
+        """Summary overview should avoid resource ranking queries not used by cards."""
+        result = await service.get_overview_stats(
+            "source-a",
+            datetime(2026, 6, 1),
+            datetime(2026, 6, 2),
+            "100",
+            include_resource_breakdown=False,
+        )
+
+        assert result.total_users == 10
+        assert result.total_tokens == 150
+        assert result.plan_customers == 5
+        assert result.branch_breakdown == OverviewBranchBreakdown()
+        assert result.growth_stats == {
+            "userGrowth": 5,
+            "planCustomersGrowth": 6,
+        }
+        service._get_growth_stats.assert_awaited_once()
+        service._get_model_distribution.assert_not_awaited()
+        service._get_top_tools.assert_not_awaited()
+        service._get_top_skills.assert_not_awaited()
+        service._get_mcp_stats.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_default_detail_keeps_existing_resource_queries(
+        self,
+        service,
+    ):
+        """Default overview detail should remain backward compatible."""
+        await service.get_overview_stats(
+            "source-a",
+            datetime(2026, 6, 1),
+            datetime(2026, 6, 2),
+            "100",
+        )
+
+        service._get_model_distribution.assert_awaited_once()
+        service._get_top_tools.assert_awaited_once()
+        service._get_top_skills.assert_awaited_once()
+        service._get_mcp_stats.assert_awaited_once()
 
 
 class TestBuildTracesWhereClause:

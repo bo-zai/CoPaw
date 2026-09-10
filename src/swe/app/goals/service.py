@@ -101,6 +101,11 @@ class GoalService:
         self._turn_budget = turn_budget
         self._create_locks: dict[str, asyncio.Lock] = {}
         self._review_claim_locks: dict[str, asyncio.Lock] = {}
+        self._goal_locks: dict[str, asyncio.Lock] = {}
+        self._active_turn_msgids: dict[str, str] = {}
+
+    def _goal_lock(self, goal_id: str) -> asyncio.Lock:
+        return self._goal_locks.setdefault(goal_id, asyncio.Lock())
 
     async def create_goal(
         self,
@@ -210,6 +215,14 @@ class GoalService:
         goal_id: str,
         action: GoalControlAction,
     ) -> GoalSnapshot:
+        async with self._goal_lock(goal_id):
+            return await self._request_control_unlocked(goal_id, action)
+
+    async def _request_control_unlocked(
+        self,
+        goal_id: str,
+        action: GoalControlAction,
+    ) -> GoalSnapshot:
         if action == GoalControlAction.EDIT:
             raise ValueError("edit requires a complete contract")
         goal = await self._require_goal(goal_id)
@@ -268,12 +281,18 @@ class GoalService:
         notify_goal_wake(goal_id)
         return saved
 
-    async def begin_turn(self, goal_id: str) -> GoalSnapshot:
+    async def begin_turn(
+        self,
+        goal_id: str,
+        msgid: str | None = None,
+    ) -> GoalSnapshot:
         """Mark a running Main Agent turn so controls settle at its boundary."""
         goal = await self._require_goal(goal_id)
         if goal.state != GoalState.ACTIVE or goal.turn_active:
             raise GoalConflictError("goal cannot begin a turn")
         goal.turn_active = True
+        if msgid:
+            self._active_turn_msgids[goal_id] = msgid
         return await self._save(goal)
 
     async def abandon_turn(self, goal_id: str, reason: str) -> GoalSnapshot:
@@ -281,12 +300,65 @@ class GoalService:
         goal = await self._require_goal(goal_id)
         if goal.turn_active:
             goal.turn_active = False
+        self._active_turn_msgids.pop(goal_id, None)
         if goal.state == GoalState.ACTIVE:
             goal.state = GoalState.INTERRUPTED
             goal.state_reason = reason
         return await self._save(goal)
 
+    async def active_turn_matches(self, goal_id: str, msgid: str) -> bool:
+        """Check whether the current Goal turn owns the supplied message id."""
+        if not goal_id or not msgid:
+            return False
+        goal = await self._require_goal(goal_id)
+        return bool(
+            goal.state in {GoalState.ACTIVE, GoalState.WAITING}
+            and self._active_turn_msgids.get(goal_id) == msgid,
+        )
+
+    async def interrupt_turn_if_matches(
+        self,
+        goal_id: str,
+        msgid: str,
+        reason: str,
+    ) -> GoalSnapshot | None:
+        """Interrupt the exact Goal turn currently owned by a stopped Chat."""
+        async with self._goal_lock(goal_id):
+            if not goal_id or not msgid:
+                return None
+            goal = await self._require_goal(goal_id)
+            if (
+                goal.state not in {GoalState.ACTIVE, GoalState.WAITING}
+                or self._active_turn_msgids.get(goal_id) != msgid
+            ):
+                return None
+            goal.turn_active = False
+            self._active_turn_msgids.pop(goal_id, None)
+            goal.state = GoalState.INTERRUPTED
+            goal.state_reason = reason
+            return await self._save(goal)
+
     async def settle_turn(
+        self,
+        goal_id: str,
+        *,
+        decision: GoalTurnDecision,
+        next_focus: str | None = None,
+        blocker: str | None = None,
+        defer_budget_limit: bool = False,
+        wake_from_steering: bool = False,
+    ) -> GoalSnapshot:
+        async with self._goal_lock(goal_id):
+            return await self._settle_turn_unlocked(
+                goal_id,
+                decision=decision,
+                next_focus=next_focus,
+                blocker=blocker,
+                defer_budget_limit=defer_budget_limit,
+                wake_from_steering=wake_from_steering,
+            )
+
+    async def _settle_turn_unlocked(
         self,
         goal_id: str,
         *,
@@ -306,6 +378,7 @@ class GoalService:
         approval_ids = self._pending_review_approval_ids(goal)
         applied = self._apply_pending_control(goal)
         if applied == GoalControlAction.EDIT:
+            self._active_turn_msgids.pop(goal_id, None)
             saved = await self._save(goal)
             await self._supersede_review_approvals(
                 saved.goal_id,
@@ -313,6 +386,7 @@ class GoalService:
             )
             return saved
         if applied is not None:
+            self._active_turn_msgids.pop(goal_id, None)
             return await self._save(goal)
         self._apply_turn_decision(
             goal,
@@ -328,6 +402,8 @@ class GoalService:
         ):
             goal.state = GoalState.LIMITED
             goal.state_reason = "Main Agent turn budget exhausted"
+        if goal.state != GoalState.WAITING:
+            self._active_turn_msgids.pop(goal_id, None)
         return await self._save(goal)
 
     async def enforce_budget_limit(self, goal_id: str) -> GoalSnapshot:

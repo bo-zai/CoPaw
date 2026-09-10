@@ -1,6 +1,6 @@
 ---
 name: file_reader
-description: "Read and summarize text-based file types only. Prefer read_file for text formats; use execute_shell_command for type detection when needed. PDF/Office/images/archives are handled by other skills."
+description: "Read and summarize text-based files. Prefer read_file for text formats; read_file also extracts plain text from Word (.docx/.docm), Excel (.xlsx/.xlsm) and PowerPoint (.pptx/.pptm) documents automatically, and from legacy .doc when antiword is installed. PDF, images, audio, video and archives are out of scope; use execute_shell_command or dedicated skills for those."
 metadata:
   {
     "builtin_skill_version": "1.0",
@@ -36,6 +36,19 @@ Steps:
 3. For JSON/YAML, list top-level keys and important fields.
 4. For CSV/TSV, show header + first few rows, then summarize columns.
 
+## Office Documents (use read_file)
+
+`read_file` auto-detects binary Office formats by file signature and returns their text content:
+
+| Format | Notes |
+|--------|-------|
+| `.docx` / `.docm` | Paragraphs and tables extracted from `word/document.xml` |
+| `.xlsx` / `.xlsm` | One line per non-empty row, `=== Sheet: <name> ===` headers |
+| `.pptx` / `.pptm` | Text frames and tables per slide, `=== Slide N ===` headers |
+| `.doc` (legacy) | Requires `antiword` installed; otherwise convert to `.docx` first |
+
+Not supported by `read_file` (clear error returned): legacy `.xls` / `.ppt`, PDF, and generic ZIP/ODF archives. Use the `xlsx`/`docx` skills or `execute_shell_command` (pandoc, LibreOffice, pandas) for those.
+
 ## Large Logs
 
 If the file is huge, use a tail window:
@@ -51,9 +64,10 @@ Summarize the last errors/warnings and notable patterns.
 Do not handle the following in this skill (they are covered by other skills):
 
 - PDF
-- Office (docx/xlsx/pptx)
 - Images
 - Audio/Video
+- Archives (zip/tar/gz) and OpenDocument (odt/ods/odp)
+- Editing or creating Office files (use the `docx` / `xlsx` skills)
 
 ## Safety and Behavior
 

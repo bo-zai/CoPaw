@@ -4,6 +4,111 @@ This context defines the domain language for Swe's agent orchestration runtime, 
 
 ## Language
 
+**Chat History Snapshot**:
+The externally returned point-in-time representation of one Chat's persisted conversation and turn state. It is a read result, not a promise to wait for an active Answer Turn to finish.
+_Avoid_: live stream, wait-for-completion read, session-file view
+
+**Shareable Answer Turn**:
+One completed selected Answer Turn within a Chat, consisting of its user question and the assistant output belonging to that turn. A shared view may contain any non-contiguous set of Shareable Answer Turns without exposing the Chat's unselected turns; active, stopping, and failed turns are not shareable.
+_Avoid_: individual token, whole Chat, arbitrary message fragment
+
+**Permanent Share Link**:
+An opaque link that grants anonymous, read-only access to a fixed set of Shareable Answer Turns and neither expires based on time nor supports owner revocation.
+_Avoid_: live Chat link, expiring link, full-history link
+
+**Shared Conversation Snapshot**:
+The immutable representation captured when a Permanent Share Link is created. It contains only the selected Shareable Answer Turns, applies the same hidden-context redaction as the ordinary Chat history view, and is independent of later changes to the source Chat.
+_Avoid_: live projection, owner Chat clone, raw session state
+
+**Share Selection**:
+The main Chat interaction in which a user chooses at least one, and any non-contiguous set of, completed Shareable Answer Turns and creates one Permanent Share Link containing their Shared Conversation Snapshot.
+_Avoid_: sidebar Chat selection, per-message export, live sharing mode
+
+**Share Token**:
+The high-entropy opaque credential embedded in a Permanent Share Link. It is the sole locator for a Shared Conversation Snapshot and does not encode or reveal Chat, session, tenant, or user identity; each generation creates an independent token even for identical selections.
+_Avoid_: Chat ID in URL, session token, bearer login token
+
+**Read-only Share View**:
+The public presentation of a Shared Conversation Snapshot using the Chat renderer's structured display while suppressing every state-changing action. It may show the source Chat title and message times, but not owner or internal identity details.
+_Avoid_: interactive Chat page, owner session, raw debug dump
+
+**Share Access Record**:
+The audit metadata for one Permanent Share Link, including its creator, creation time, access count, and most recent access time. It does not identify anonymous viewers or duplicate the shared conversation content.
+_Avoid_: viewer identity profile, access log body copy, revocation record
+
+**Stream Attachability**:
+The condition in which an active Answer Turn still accepts an additional stream subscriber for its exact turn identity. It is distinct from a previously observed Chat History Snapshot status.
+_Avoid_: historical `running` status, reconnect hint, durable completion state
+
+**Compatible Chat API Evolution**:
+The rule for externally consumed Chat APIs: established paths, request fields, response fields, status values, successful SSE framing, and documented error meanings remain valid; new recovery capability is additive and optional.
+_Avoid_: breaking reconnect migration, Console-only protocol, silent contract replacement
+
+**Atomic Chat Recovery**:
+One recovery request for a Chat that either attaches to its exact active Answer Turn or yields that turn's terminal Chat History Snapshot. A natural completion between observation and recovery is a successful terminal result, not a missing Chat error.
+_Avoid_: GET-then-POST reconnect, stale-running retry, completion-as-404
+
+**Recovery Event Stream**:
+The single SSE response form of an Atomic Chat Recovery. It carries either the active turn's replay and live events, or one explicit terminal Chat History Snapshot event followed by normal stream completion.
+_Avoid_: JSON-or-SSE response switching, terminal recovery error, second history fetch
+
+**Terminal Chat Snapshot Event**:
+The `chat.snapshot` SSE event emitted by a Compatible Current-Recovery Mode when no active Answer Turn is selected. It contains the resolved Chat ID, selected User Question Message ID when present, and the complete terminal Chat History Snapshot, after which the stream closes normally.
+_Avoid_: empty assistant placeholder, terminal 404, second client history read
+
+**Recoverable Turn Terminal Status**:
+The durable public terminal status of the Answer Turn selected by a Terminal Chat Snapshot Event: `completed`, `stopped`, `failed`, or `null` when no turn exists. It is a business result within a successful recovery response, not an HTTP recovery error.
+_Avoid_: internal `cancelled` exposure, completion-only persistence, terminal transport failure
+
+**Answer Turn Settlement Barrier**:
+The per-Chat admission boundary from terminal-outcome selection until that outcome is durably persisted. Current recovery and a later user submission wait behind this barrier; recovery then sees the complete terminal snapshot and only afterward may a new Answer Turn begin.
+_Avoid_: pre-persistence next turn, terminal-status race, user-visible settlement conflict
+
+**Pending Settlement Recovery**:
+The failure-closed state of an Answer Turn whose terminal snapshot has not yet been durably written. The Chat retries that same write without rerunning the model and rejects recovery and new submission with retryable service unavailability; after process restart, a persisted admitted turn with no local active turn is reconciled as `failed` before the Chat resumes.
+_Avoid_: unbounded silent inconsistency, rerun-on-persist-failure, orphaned-running turn, next-turn overwrite
+
+**Current Chat Recovery**:
+The default Atomic Chat Recovery scoped by Chat ID. It selects the Chat's current active Answer Turn when one exists, otherwise its latest terminal Chat History Snapshot; the server returns the selected User Question Message ID as correlation metadata rather than requiring it as recovery input.
+_Avoid_: client-known-turn-only recovery, logical-session-only recovery, client-guessed current turn
+
+**Current Chat Recovery Linearization**:
+The point at which a Current Chat Recovery selects its result, shared with Answer Turn admission through one per-Chat coordinator lock. A recovery returns one coherent selected active turn or terminal snapshot; a concurrent later submission belongs wholly before or after that selection.
+_Avoid_: mixed-turn snapshot, post-selection implicit refresh, independently locked recovery and submission
+
+**Compatible Current-Recovery Mode**:
+The opt-in `reconnect_mode: "current"` behavior of the established Console Chat POST. It provides Current Chat Recovery while callers that omit the mode retain the established reconnect result and error semantics.
+_Avoid_: replacement recovery endpoint, changed legacy 404, implicit protocol upgrade
+
+**Recovery Mode Selection**:
+The Console Chat POST selects Compatible Current-Recovery Mode whenever `reconnect_mode` is `"current"`, with or without legacy `reconnect: true`; a request without that mode follows its established reconnect or new-submission path.
+_Avoid_: required paired flags, breaking mode migration, mode-without-reconnect rejection
+
+**Unknown Recovery Mode Tolerance**:
+Any missing, non-string, or unrecognized `reconnect_mode` is treated as absent and follows the established Console Chat POST path. Only the exact value `"current"` changes behavior.
+_Avoid_: unknown-mode validation error, third-party passthrough breakage, accidental protocol activation
+
+**Console Recovery Compatibility Fallback**:
+The Console sends both the established reconnect flag and Compatible Current-Recovery Mode, then treats a reconnect 404 as one prompt Chat history refresh rather than a failed assistant response. A returned history is applied as terminal state; only a second Chat-not-found result is presented as absence.
+_Avoid_: legacy-backend error bubble, repeated reconnect retries, 404-as-assistant-output
+
+**Compatible Recovery Locator**:
+The optional Chat ID and established session locator accepted by Compatible Current-Recovery Mode. A caller may continue to identify its current Chat through the existing session-shaped request format; an explicit Chat ID only narrows that resolution and is never a required migration field.
+When an optional Chat ID cannot be resolved or authorized, the established session locator remains eligible to resolve the caller's own Chat.
+_Avoid_: mandatory Chat-ID migration, session-locator removal, optional-ID validation failure, client-generated turn identity
+
+**Compatible Recovery Target Resolution**:
+The ordered resolution of a Compatible Recovery Locator: an authorized optional Chat ID, then an existing session-shaped value that directly identifies a Chat, then a Chat uniquely selected by logical session ID, current user, and channel. An unresolved or unauthorized optional Chat ID does not prevent session resolution; the final resolved Chat is always ownership-authorized before recovery.
+_Avoid_: mandatory locator precedence, session-only cross-user lookup, locator ambiguity, authorization-after-attach
+
+**Recovery Target Concealment**:
+The compatible recovery response rule that a missing Chat, an unresolvable locator, and an unauthorized resolved Chat are indistinguishable as `404 Chat not found`. Recovery never attaches or reveals turn state before Chat ownership authorization succeeds.
+_Avoid_: cross-user Chat oracle, attach-before-authorize, unauthorized-state disclosure
+
+**Non-blocking Chat History Read**:
+The established Chat detail read returns the latest durably committed Chat History Snapshot immediately, including `running` when an Answer Turn remains active. It does not wait for the turn or claim to contain uncommitted live stream output.
+_Avoid_: completion-waiting GET, live-token history read, stream replacement
+
 **Tenant Bootstrap**:
 The creation or repair of one tenant scope's minimum runnable directory state, including its default Agent Profile and required workspace assets. A Tenant Bootstrap completes only when that scope can load its Default Agent Profile.
 _Avoid_: directory creation, partial initialization, workspace startup
@@ -73,7 +178,7 @@ The separate creation, enablement, disablement, and deletion states of an **Agen
 _Avoid_: file-exists-is-enabled, hot-reload lifecycle, run cancellation
 
 **Skill-owned Stored SubAgent Definition**:
-A reusable **SubAgent Definition** packaged by one Skill and available for new **SubAgent Runs** only while its owning Skill is enabled in the target Agent's Skill Runtime View. Disabling or deleting that Skill prevents new runs without interrupting runs that already captured the definition; updates apply to subsequent Main Agent runs.
+A reusable **SubAgent Definition** packaged by one Skill and available for new **SubAgent Runs** only while its owning Skill is enabled in the target Agent's **Query Skill Snapshot**. Disabling or deleting that Skill prevents new runs without interrupting runs that already captured the definition and snapshot; updates apply to subsequent Main Agent runs.
 _Avoid_: skill subagent, independent skill agent, user-owned stored definition
 
 **Skill-owned Definition Package**:
@@ -89,7 +194,7 @@ One available Skill in an **Effective SubAgent Dependency Set** that the worker 
 _Avoid_: embedded SKILL.md body, bypassed Skill Toolkit registration, all-workspace Skill tools
 
 **Effective SubAgent Dependency Set**:
-The available and authorized dependency subset for one **SubAgent Run**. Skills resolve only from declared names in the parent Agent's enabled Skill Runtime View; MCPs resolve from declared names when `mcps` is present, including an empty list that disables all MCPs, otherwise from the parent Agent's enabled MCP client set. Unavailable entries are silently omitted rather than blocking the run.
+The available and authorized dependency subset for one **SubAgent Run**. Skills resolve only from declared names in the parent Agent's **Query Skill Snapshot**; MCPs resolve from declared names when `mcps` is present, including an empty list that disables all MCPs, otherwise from the parent Agent's enabled MCP client set. Unavailable entries are silently omitted rather than blocking the run.
 _Avoid_: cross-agent dependency lookup, failed dependency resolution, all-or-nothing dependency loading, inherited workspace Skills
 
 **Declared MCP Client Capability**:
@@ -179,6 +284,10 @@ _Avoid_: live marketplace binding, immutable market definition, source expert al
 **Community Expert Administrator Distribution**:
 The only community-driven update path for a Received Community Expert. A source administrator distributes a newer Community Expert Package to recipients' Default Agent Profiles; recipients do not pull updates from the community themselves, and distribution silently replaces any local received-expert modifications.
 _Avoid_: recipient-driven marketplace update, automatic update, local-edit conflict, live version tracking
+
+**Community Expert Distribution Target Selection**:
+The administrator interaction for choosing recipients of a Community Expert Distribution. It uses the same target-selection language as Application Marketplace distribution: users under selected institutions or explicitly selected users, without a separate all-users option; every target must belong to the current source scope.
+_Avoid_: expert-only target semantics, institution-only delivery, implicit full-source distribution, cross-source target, recipient self-selection
 
 **Received Community Expert Enablement**:
 The enablement rule for a Received Community Expert: a first user installation or administrator distribution enables it, while an administrator update preserves the receiving Agent Profile's existing enabled or disabled choice.
@@ -857,7 +966,7 @@ An append-only correction to an earlier answer in the current clarification hist
 _Avoid_: edited Chat message, deleted audit history, branching valid answers
 
 **W+ SOP Workspace**:
-The W+-specific CoPaw interface for conducting and reviewing one W+ SOP Clarification Session. It is a specialized view of the owning Chat, not a separate conversation or a generic interface for all skills. It is the sole answer-submission surface while the session is active. The owning Chat renders each current question batch as a read-only audit card with session status and a Return to SOP Workspace action; it must not duplicate active answer controls. Navigating away from the workspace does not pause or otherwise mutate the session: the owning Chat remains locked until the user explicitly saves and exits, completes, or terminates the session.
+The W+-specific CoPaw interface for conducting and reviewing one W+ SOP Clarification Session. It is a specialized view of the owning Chat, not a separate conversation or a generic interface for all skills. It is the sole answer-submission surface while the session is active. The owning Chat renders each current question batch as a read-only audit card with session status and a Return to SOP Workspace action; it must not duplicate active answer controls. Navigating away does not pause or mutate the session, and the normal workspace header does not expose Save and Exit; the owning Chat remains locked until the session completes or terminates.
 _Avoid_: Plan Mode, standalone chat, generic skill workspace
 
 **W+ SOP Session Control Card**:
@@ -883,6 +992,14 @@ _Avoid_: partial SOP, assumed completion, builder-ready result
 **W+ SOP Result Bundle**:
 The validated final output generated by the owning Agent after all clarification stages: `sop_spec.json`, the readable Markdown SOP, the static HTML SOP, and the template-based sanitized example-result HTML. A result is deliverable only after all four files have been validated and exposed through the platform file-delivery tool. Generation makes the bundle previewable and downloadable but does not complete the session. The user must explicitly confirm the bundle before memory review begins. The workspace states that confirmed artifacts are ready for a later explicit `wplus-skill-builder` invocation; it neither invokes nor embeds the Builder.
 _Avoid_: automatic Builder invocation, server-synthesized download, incomplete SOP bundle, handwritten delivery URL, implicit handoff
+
+**W+ SOP Stage Report**:
+The immutable JSON, Markdown, and HTML report produced for one successful pre-run of the current clarification stage. Before locking, the workspace previews the latest validated version and lets the user request more clarification or another pre-run; superseded and confirmed versions remain read-only.
+_Avoid_: final result bundle, download-only report, mutable report file
+
+**W+ SOP Cumulative Preview**:
+The JSON, Markdown, and HTML view assembled from the locked report version of every confirmed stage in queue order. It excludes the current unconfirmed report, identifies every included stage version, and is shown as supporting context only while the next stage report awaits confirmation; it is not a persistent workspace panel or the final result bundle.
+_Avoid_: final SOP, artifact button list, unversioned cumulative file
 
 **W+ SOP Authorized Memory Write**:
 The policy-checked batch Agent operation started only after the user has decided every unresolved sanitized memory candidate in one workspace submission. The server atomically binds all approved candidates and their resolved JSONL targets to one Agent run, after the prior owning-Chat run is fully idle. That Agent invokes the Miner memory-store script once per approved candidate and emits one batch result containing every appended, duplicate, or failed outcome. All-rejected batches start no Agent; failed items remain retryable in a later batch. Common W+ knowledge, anonymous user preferences, and fully sanitized SOP patterns remain separate scopes. Personalized memory exists only when the caller supplied an anonymous user scope.
@@ -1208,8 +1325,12 @@ A user-initiated Market enablement of **Unmanaged Skill Content** in the ordinar
 _Avoid_: automatic skill discovery, reconciliation registration, disabled-skill import
 
 **Skill Runtime View**:
-The current set of registered and enabled skill packages selected from a Workspace's ordinary skill directory. It excludes **Unmanaged Skill Content**, changes immediately when skill enablement changes, and gives existing Agent Runs no guarantee that earlier skill files remain available.
-_Avoid_: skill snapshot, immutable skill view, complete skill directory
+The current set of registered and enabled skill packages selected from a Workspace's ordinary skill directory. It excludes **Unmanaged Skill Content**; each query captures this view once at its start as a **Query Skill Snapshot**, and enablement or content changes affect subsequent queries rather than changing that query's selected set.
+_Avoid_: complete skill directory, live in-flight skill view
+
+**Query Skill Snapshot**:
+The immutable, query-scoped selection of effective skills, trusted metadata, resolved package locations, and content signatures captured when a query starts. It is the consistency boundary for that query: later skill lifecycle changes apply to later queries, while a missing or changed package fails closed for the affected skill instead of being silently represented by stale snapshot metadata; the query may continue without unconfirmed Workspace Skills.
+_Avoid_: global skill cache, mutable runtime list, full skill-content copy
 
 **Console Skill Selection Panel**:
 The command-style panel opened by `@` in Console chat for selecting ordered **User-Selected Skills**, including duplicates, from the current **Skill Runtime View**. A selection is represented both by an **Inline Skill Tag** in the message and by trusted structured selection context; the panel does not list built-in tools, MCP tools, or other callable runtime capabilities.
@@ -1220,11 +1341,11 @@ The visible, atomic `@` label for one **User-Selected Skill** occurrence inside 
 _Avoid_: trusted skill directive, tool call, execution proof
 
 **User-Selected Skill**:
-A **Skill Runtime View** member that a user explicitly selects for a single chat turn and remains available when that turn starts. A turn may contain repeated **User-Selected Skills**; their **Skill Use Directives** are injected in selection order after duplicate runtime identifiers are removed. Each selection records user intent as structured turn context with a readable message marker, but is not evidence that the skill actually executed.
+A **Skill Runtime View** member that a user explicitly selects for a single chat turn and that is admitted by the turn's **Query Skill Snapshot**. A turn may contain repeated **User-Selected Skills**; their **Skill Use Directives** are injected in selection order after duplicate runtime identifiers are removed. Each selection records user intent as structured turn context with a readable message marker, but is not evidence that the skill actually executed.
 _Avoid_: skill mention, forced tool call, permanently active skill, single selected skill
 
 **Explicit Skill Selection Activation**:
-The session-scoped activation of a **User-Selected Skill** after the server validates its structured selection against the current **Skill Runtime View** and resolves its readable `SKILL.md`. It loads that skill's Hooks after the current turn's `UserPromptSubmit` and `SessionStart` events, before subsequent tool calls, and persists them for the rest of the session; it does not establish **Actual Skill Use**, set a current skill, create a skill invocation trace, or prove the model read the skill document.
+The session-scoped activation of a **User-Selected Skill** after the server validates its structured selection against the turn's **Query Skill Snapshot** and resolves its readable `SKILL.md`. It loads that skill's Hooks after the current turn's `UserPromptSubmit` and `SessionStart` events, before subsequent tool calls, and persists them for the rest of the session; it does not establish **Actual Skill Use**, set a current skill, create a skill invocation trace, or prove the model read the skill document.
 _Avoid_: plain-text skill mention, filename match, automatic semantic inference, confirmed skill use
 
 **Skill Runtime Identifier**:
@@ -1274,6 +1395,10 @@ _Avoid_: runtime metadata, env/header info, credential, signed token
 **Execution Trace ID**:
 The unique identifier for one Swe execution. Spans, Subtasks, execution records, feedback, and Runtime Invocation Claims correlate through this identifier even when several executions share one external distributed trace.
 _Avoid_: B3 trace ID, batch ID, request header trace ID
+
+**Agent Trace**:
+The observability trace for one user-message execution by the Main Agent. It starts at the request's Main Agent entry point, contains that execution's agent stages, model calls, tool calls, retries, and terminal outcome, and ends when the execution finishes; a later message in the same session starts a new Agent Trace.
+_Avoid_: session trace, conversation-wide trace, SubAgent Run trace
 
 **B3 Trace ID**:
 The external distributed-tracing identifier received through B3 transport metadata. It may be shared by multiple executions in one Dispatch Batch and therefore is not an execution identity.
@@ -1356,12 +1481,20 @@ The bounded model input budget available to a Main Agent turn. A **Context Windo
 _Avoid_: token bill, monthly quota, historical usage
 
 **Persisted Context Occupancy**:
-An estimate of how much of the **Context Window** is occupied by the persisted state and fixed runtime context that would actually enter the next Main Agent model input after any completed compaction. It includes system prompt, completed compressed summary, effective history messages, and compacted tool results; it excludes unsent composer text, already-compacted raw history, and tokens already billed by previous model calls.
+An estimate of how much of the **Context Window** is occupied by the persisted state and fixed runtime context that would actually enter the next Main Agent model input after any completed compaction. It includes system prompt and summary context, active tool definitions, effective history messages, and compacted tool results; it excludes unsent composer text, already-compacted raw history, and tokens already billed by previous model calls.
 _Avoid_: token usage, usage statistics, cost usage
 
 **Tool Call Status**:
 The user-visible lifecycle state of one user-visible tool invocation during a Main Agent run. A **Tool Call Status** describes an individual tool invocation as running, successful, or failed; failed means the tool itself failed, not that the user stopped or cancelled the overall Main Agent run. The start of a tool invocation carries the running status, and the tool's returned output carries the successful or failed terminal status.
 _Avoid_: tool event status, frontend tool result, trace status
+
+**Tool Governance Status**:
+The user-visible pre-execution governance state of one tool invocation when Tool Guard requires approval, the user rejects approval, or policy blocks execution. A **Tool Governance Status** is pending approval, rejected, or blocked; it is separate from **Tool Call Status**, and none of its values means that the tool itself executed and failed. Approval returns the invocation to its ordinary **Tool Call Status** lifecycle.
+_Avoid_: tool failure, approval error, failed Tool Call Status, execution result
+
+**Tool Operation Group**:
+A user-visible presentation group for consecutive tool invocations that the Main Agent explicitly declares as one user-understandable task stage through a shared group identity and a validated display title. A **Tool Operation Group** appears when its first invocation starts, preserves any reasoning between its invocations in stream order, and moves into the completed response's execution-process disclosure as one group. It is collapsed by default, preserves every child invocation's ordinary independently expandable tool presentation plus its own **Tool Call Status** and **Tool Governance Status**, and is never inferred from timing, adjacency, or raw tool arguments.
+_Avoid_: tool batch, time-window group, assistant turn, plan step, merged tool call
 
 **Tool Output Frame**:
 A live, user-visible presentation update for textual output produced while one tool invocation is still running. A **Tool Output Frame** belongs to exactly one **Tool Call Status** lifecycle, preserves its output source when known, is ordered only within that tool invocation, is not visible to the Main Agent as model context, and is not itself the final tool result remembered by the Main Agent.
@@ -1400,7 +1533,7 @@ A failure that prevents an enabled MCP client from becoming usable by an Agent, 
 _Avoid_: MCP tool failure, optional MCP skip, successful connection log
 
 **Hook Telemetry Event**:
-A structured observability record for one Hook Runtime boundary, used to analyze hook behavior without changing the hook's runtime decision semantics. A **Hook Telemetry Event** includes the boundary-level outcome and the handler-level details that explain it, and is emitted in a log-collection-friendly shape rather than persisted as a Trace Span.
+A structured observability record for one Hook Runtime boundary, used to analyze hook behavior without changing the hook's runtime decision semantics. A **Hook Telemetry Event** includes the boundary-level outcome and the handler-level details that explain it, and is emitted in a log-collection-friendly shape rather than persisted as a Trace Span. For Stop, it also records a skipped completion gate with no handler execution.
 _Avoid_: debug log, audit record, raw hook payload, trace span
 
 **Hook Telemetry Log Message**:
@@ -1408,15 +1541,15 @@ A single-line structured application log message with a stable hook telemetry pr
 _Avoid_: global JSON logging, unstructured hook log, trace span, warning log
 
 **Hook Telemetry Emission Boundary**:
-The rule that a **Hook Telemetry Log Message** is emitted only when at least one hook handler actually runs for a Hook Runtime boundary.
-_Avoid_: unmatched hook boundary log, resolver miss telemetry
+The rule that a **Hook Telemetry Log Message** is emitted when at least one hook handler actually runs for a Hook Runtime boundary. Stop additionally emits it when its completion gate is skipped, with `handler_count: 0`, `handlers: []`, `execution_state: "skipped"`, and a stable `skipped_reason`; an executed Stop event records `execution_state: "executed"`.
+_Avoid_: untyped Stop skip log, resolver miss hidden as handler failure, raw candidate response telemetry
 
 **Hook Telemetry Correlation**:
 The relationship between a **Hook Telemetry Log Message** and the request or trace that caused it. **Hook Telemetry Correlation** should include a trace identifier when one is available, but a missing trace identifier does not make the telemetry event invalid.
 _Avoid_: mandatory trace span linkage, uncorrelated hook log
 
 **Hook Telemetry Schema**:
-The versioned JSON shape inside a **Hook Telemetry Log Message**. The schema records correlation fields, boundary-level outcome fields, and handler-level details while excluding raw hook payloads by default.
+The versioned JSON shape inside a **Hook Telemetry Log Message**. The schema records correlation fields, boundary-level outcome fields, and handler-level details while excluding raw hook payloads by default. `hook_telemetry.v1` records the Stop `execution_state` and, when skipped, the stable `skipped_reason` and safe candidate summary.
 _Avoid_: ad-hoc log fields, raw payload schema, trace span schema
 
 **Application Log Output Pipeline**:
@@ -1599,6 +1732,178 @@ _Avoid_: external channel message id, generated UI message id, response id
 The ordered message group anchored by one **User Question Message ID**, including that user question and the messages that follow it until the next user-authored question in the same Logical Chat Session. An **Answer Turn** uses the same chat-history message shape as the full conversation view.
 _Avoid_: final answer text, assistant-only bubble, latest response, answer-only slice
 
+**Stopped Answer Turn**:
+An **Answer Turn** ended by an explicit user stop request before the Main Agent produced a completed response. It remains a queryable part of the **Chat Record**, preserving the anchor user question and any assistant output produced before stopping, and it does not imply that the response completed successfully.
+_Avoid_: discarded turn, completed answer, cancelled chat record, partial hidden state
+
+**Chat Stop Request**:
+An explicit user operation that asks the current **Answer Turn** to stop. A **Chat Stop Request** is idempotent: repeating it does not duplicate messages or overwrite a completed or already stopped turn.
+_Avoid_: stream disconnect, retry submission, session deletion, message cancellation
+
+**Chat Submission Protocol Compatibility**:
+The commitment that existing Chat submission clients continue using the established `/console/chat` request contract without a new required per-turn request identifier. A User Question Message ID remains server-issued and is conveyed through the existing response metadata path.
+_Avoid_: required client request ID, third-party Chat migration, breaking submission schema, client-issued message ID
+
+**Turn-bound Chat Stop Request**:
+A **Chat Stop Request** identified by the target **User Question Message ID** as well as its Chat. It may affect only the matching active **Answer Turn**; a stale request is an idempotent no-op and cannot stop a later turn in that Chat.
+_Avoid_: chat-wide stop, delayed-stop race, replacement-turn cancellation, inferred active turn
+
+**Early Chat Stop Exception**:
+The narrowly scoped form of a **Chat Stop Request** accepted before the client has received the server-issued **User Question Message ID**. It may stop only the uniquely identified, ownership-validated startup turn for that Chat; if no unique startup turn exists, it is an idempotent no-op.
+_Avoid_: unrestricted msgid-less stop, chat-wide cancellation, guessed current turn, delayed-stop override
+
+**Chat Startup Stop Locator**:
+The ownership-scoped logical-session locator used only when a Console client has not yet received the server-issued Chat ID and User Question Message ID. It may resolve exactly one startup Answer Turn for an early stop; after response metadata is available, turn-bound identity is required.
+_Avoid_: logical session as Chat ID, permanent session-based stop, ambiguous active-chat selection, delayed-stop lookup
+
+**Chat Stop Target Resolution Order**:
+The strict matching order for a Console Chat Stop Request: a Chat ID plus User Question Message ID identifies an exact turn; a Chat ID alone invokes constrained legacy matching of that Chat's unique current run; only a request without Chat ID may use the early logical-session locator. A Message ID without Chat ID, or no locator at all, is an idempotent no-op and never triggers fuzzy resolution.
+_Avoid_: msgid-only global lookup, session fallback after Chat identity, ambiguous mixed locator, guessed active turn
+
+**Stopped Turn Stream Closure**:
+The transport behavior after a **Chat Stop Request**: the stop endpoint acknowledges asynchronous stopping, the active Chat stream closes after bounded settlement, and no new public stopped or failed SSE status is emitted. Stopped content is recovered through Chat history reads.
+_Avoid_: stopped SSE status, failure SSE status, frontend stop prompt, stream-as-record
+
+**Stopped Turn Output Freeze Boundary**:
+The atomic acceptance point of a Chat Stop Request after which ordinary display output from its Answer Turn cannot enter the stream buffer or persisted history. Display events already accepted before that point remain visible and reconnectable; stopping then closes the stream after bounded settlement without adding later normal Agent output.
+_Avoid_: post-stop token leak, retroactive buffer deletion, hidden pre-stop output, stopping SSE status
+
+**Chat Stop Protocol Compatibility**:
+The incremental compatibility rule for Console Chat Stop: the existing Chat ID remains accepted, the User Question Message ID is optional, and the established `stopped` response field remains present alongside asynchronous stop details. New callers provide the turn identity for exact stopping; legacy Chat-ID-only callers may stop only the uniquely running turn currently associated with that Chat and cannot defend against a delayed request racing with a later turn.
+_Avoid_: stop endpoint replacement, required msgid migration, removed stopped field, unrestricted legacy chat-wide cancellation
+
+**Chat Stop Idempotent No-op Response**:
+The compatible response when a Chat Stop Request does not identify an active eligible Answer Turn, including an already settled turn, a stale turn identity, or an ambiguous legacy Chat-ID-only request. It returns successful transport status with `stopped: false` and `accepted: false`, without revealing whether the referenced turn exists or why it was ineligible.
+_Avoid_: stale-stop error, target-existence disclosure, ambiguous legacy cancellation, retry-only failure
+
+**Chat Stop Authorization No-op**:
+The security-preserving treatment of a Stop request whose Chat is outside the current tenant, user, or channel ownership scope. It uses the same `200` / `stopped: false` / `accepted: false` response as other ineligible targets, while emitting a server-side security audit record and never affecting the target Chat.
+_Avoid_: cross-tenant 403 distinction, Chat existence leak, partial unauthorized stop, silent security failure
+
+**Chat Stop Acceptance**:
+The server-side acknowledgement that a validated Chat Stop Request has claimed the target Answer Turn and durably or atomically entered its `stopping` phase. Acceptance does not mean the final `INTERRUPTED` outcome or stopped-turn persistence has completed; those are settled asynchronously within the graceful interruption window.
+_Avoid_: completed-stop acknowledgement, model-finished response, persistence-success claim, transport-only receipt
+
+**Chat Stop Re-acknowledgement**:
+The idempotent response to a repeated Stop for the same Answer Turn while it remains in `stopping`. It returns the same accepted stopping state (`stopped: true`, `accepted: true`, `status: "stopping"`) without issuing another cancellation or changing terminal precedence.
+_Avoid_: duplicate cancellation, accepted=false during stopping, repeated persistence, stop escalation
+
+**Chat Stop Response Status**:
+The coarse Chat control state returned by a Stop endpoint at request acknowledgement time: `stopping` when the target turn was accepted for bounded interruption, and `idle` for an idempotent no-op. It does not expose the eventual Answer Turn terminal outcome; stopped-turn history is authoritative after settlement.
+_Avoid_: `interrupted` response guarantee, persistence result status, SSE lifecycle status, model completion status
+
+**Accepted Chat Stop Identity Echo**:
+The response rule that Stop returns the server-validated Chat ID and User Question Message ID only when it accepts that exact stopping target. An idempotent no-op or ownership-rejected request returns no target identity, preventing the response from disclosing unverified Chat or turn existence.
+_Avoid_: unvalidated identity echo, authorization oracle, stale-turn confirmation, mandatory legacy message ID
+
+**Chat Stop Graceful Interruption Window**:
+The bounded five-second interval after a **Chat Stop Request** is accepted in which the Agent, tools, approvals, and workers may cooperatively settle and persist the stopped turn. Hard task cancellation is reserved for work that remains after this window; the window is not the Agent's general interrupt timeout.
+_Avoid_: immediate hard cancel, sixty-second stop grace, unbounded graceful stop, post-stop normal output
+
+**Stopped Turn Display Boundary**:
+The history visibility rule for a **Stopped Answer Turn**: already persisted displayable tool calls, tool results, assistant output, and approval cards remain visible under the existing Chat redaction rules. Stopping does not preserve streaming-only deltas or rewrite persisted tool content; superseded approval cards expose their existing status.
+_Avoid_: hidden stopped tools, raw delta history, stop-specific redaction, rewritten tool audit
+
+**Answer Turn Query Identity**:
+The precise identity of a queryable Answer Turn: its Chat ID and User Question Message ID. A legacy logical-session lookup may locate this pair only by searching all ownership-authorized candidate Chats, never by assuming the most recently updated Chat contains the turn.
+_Avoid_: newest-chat lookup, session-only turn identity, cross-chat message inference, stale-chat 404
+
+**Answer Turn Query Status**:
+The optional top-level status returned by the Answer Turn query endpoint to describe the queried turn independently of its message list. A stopped turn returns `turn_status: "stopped"`, including when the turn contains only its admitted User Question; when assistant output exists, the same status is normalised from the stopped message metadata without changing the existing message shape.
+_Avoid_: status inferred only from assistant output, missing no-output stop, frontend notification trigger, message-schema replacement
+
+**Stopping Answer Turn Query State**:
+The transient `status: "stopping"` returned by an Answer Turn query while accepted Stop settlement remains in progress. Once the stream has closed and settlement ends, the query returns `status: "idle"`; any persisted stopped outcome is then expressed separately by `turn_status: "stopped"`.
+_Avoid_: stopped-as-running, terminal status before settlement, public stopped SSE state, query-time persistence guarantee
+
+**Chat Stop Ownership Check**:
+The authorization check that binds a **Chat Stop Request** to the current tenant, the owning user, and the Chat's channel before its target turn can be inspected or stopped. An unauthorized request cannot affect a running Answer Turn.
+_Avoid_: chat-ID-only authorization, cross-user stop, cross-channel stop, tenant-only stop authorization
+
+**Answer Turn Terminal Precedence**:
+The single terminal outcome of an **Answer Turn** under a race between normal completion and a **Chat Stop Request**. The first operation to durably establish its terminal outcome wins; a later stop cannot replace a completed outcome, and a later completion cannot replace a stopped outcome.
+_Avoid_: terminal overwrite, stop-after-complete mutation, dual terminal state, last-writer-wins outcome
+
+**Chat Deletion Arbitration**:
+The rule that Chat deletion obtains final ownership of the Chat before removing its session state and archive resources. Any active or stopping Answer Turn must be prevented from writing after deletion, so a late stop settlement cannot recreate deleted history.
+_Avoid_: delete-mapping-only removal, late persistence resurrection, delete-while-running race, orphaned stopped turn
+
+**Stopped Turn Approval Supersession**:
+The invalidation of every pending human approval belonging to a **Stopped Answer Turn**. Superseded approvals retain their audit record and visible approval history, but a later approval or denial cannot resume that Answer Turn.
+_Avoid_: approval deletion, approval replay, resumed stopped turn, hidden approval cancellation
+
+**Stopping Answer Turn**:
+An **Answer Turn** after an accepted **Chat Stop Request** and before its durable stopped outcome is known. It remains active only to complete bounded interruption and persistence work; it cannot emit further normal Agent output.
+_Avoid_: stopped answer turn, completed answer, retryable submission, idle chat
+
+**Stopping Turn Submission Gate**:
+The temporary Chat admission boundary while an **Answer Turn** is stopping. It rejects a later user question for that Chat without consuming it, until the stopped outcome has been settled durably.
+_Avoid_: queued follow-up question, attach-to-old-stream submission, concurrent answer turn, discarded follow-up
+
+**Stopping Turn Composer Lock**:
+The Console interaction rule corresponding to the **Stopping Turn Submission Gate**: after Stop acceptance, the Composer submission control remains disabled until the original Chat stream closes and the stopping phase ends. The user's unsent input remains in the Composer and can be submitted after the lock clears; no stop-specific notice is required.
+_Avoid_: discarded draft, optimistic follow-up submission, permanent disabled Composer, stop error prompt
+
+**Stopping Turn Submission Race Handling**:
+The Console treatment of a `409` rejection caused by the **Stopping Turn Submission Gate**, such as a cross-tab or near-simultaneous submit race. It leaves the user input intact, adds no local Chat history, emits no stop-specific prompt, and permits explicit resubmission after the owning Chat stream closes.
+_Avoid_: discarded concurrent draft, local phantom User Question, stopping error toast, automatic retry
+
+**Stop-while-Stream-Open UI Rule**:
+The Console rule for a Stop request whose transport acknowledgement fails or is delayed: Composer submission remains disabled while the original Chat stream is still open, Stop controls do not trigger automatic retries or user-facing errors, and the controls unlock when that stream closes. A user may issue another explicit Stop while the stream remains active.
+_Avoid_: unlock-on-request-failure, silent follow-up admission, automatic stop retry, frontend persistence error state
+
+**Stopping Turn Reconnect Boundary**:
+The stream-reconnection rule for a **Stopping Answer Turn**: a `reconnect=true` request may attach while bounded stopping is still in progress, replay buffered display events, and wait for the stream's normal closure, but it cannot resume or produce new Agent output. After stopped settlement, stream attachment ends and the persisted **Stopped Answer Turn** is read from Chat history instead.
+_Avoid_: reconnect-triggered resume, post-settlement stream replay, new output after Stop, historyless stopped turn
+
+**Client Turn Identity Capture**:
+The Console requirement to persist the server-issued `chat_id`, User Question Message ID, and logical `session_id` as soon as the Chat stream response headers arrive. Stop and reconnect use this exact tuple first; compatibility fallbacks are limited to the early pre-header window or legacy session records.
+_Avoid_: session-only Stop, client-generated message identity, late identity capture, logical-session-as-chat fallback
+
+**Stopped Turn History Refresh Policy**:
+The Console policy after a stopped Chat stream closes: do not automatically refresh or rewrite the visible Chat timeline. The persisted stopped turn is read on the next user-initiated Chat load or refresh; no frontend cache, retry, or notification is added for this purpose.
+_Avoid_: automatic post-stop reload, local stopped-turn cache, stop completion toast, forced timeline mutation
+
+**Chat-scoped Stopping UI State**:
+The Console rule that stopping affects only the Chat owning the **Stopping Answer Turn**. The user may switch to and submit in other Chats; returning to the stopping Chat retains its Composer lock until that Chat's original stream closes.
+_Avoid_: application-wide Composer lock, cross-Chat submission rejection, hidden stopping Chat, early original-Chat unlock
+
+**Explicit Chat Stop Invocation**:
+The rule that the Console Stop endpoint is invoked only by a deliberate user Stop action. Transport aborts, network loss, Chat switching, and component disposal leave the server-side Answer Turn running and eligible for normal reconnection; they are not implicit Chat Stop Requests.
+_Avoid_: disconnect-as-stop, navigation cancellation, unmount cancellation, accidental stopped turn
+
+**Stopping Turn Control-Command Gate**:
+The application of the **Stopping Turn Submission Gate** to conversation control commands such as `/clear` and `/new`. Those commands cannot change memory or checkpoint state until the stopping Answer Turn has settled.
+_Avoid_: concurrent clear, concurrent new conversation, stop-command write race, early turn-state cleanup
+
+**Stopped Turn Worker Boundary**:
+The execution boundary for workers launched by a **Stopped Answer Turn**. Chat Stop best-effort cancels the synchronously selected worker and active Background SubAgent Runs owned by that turn; already completed results remain auditable, but no worker may write to, wake, or drive the stopped turn afterward.
+_Avoid_: orphan worker continuation, post-stop result merge, Goal wake-up after stop, external-effect rollback
+
+**Persisted User Question Admission**:
+The condition that a user question has been durably accepted as the anchor of an **Answer Turn** before Main Agent execution begins. A question that cannot reach this condition does not begin an Answer Turn.
+_Avoid_: best-effort prompt cache, started-but-unsaved question, model-first submission
+
+**Stopped Turn Persistence Failure**:
+The failure to durably record the stopped outcome or its newly produced displayable messages after a **Chat Stop Request**. It does not remove a previously admitted user question; the current policy records the server-side failure without automatic retry or frontend recovery storage.
+_Avoid_: frontend failure state, retried Agent execution, recoverable frontend draft
+
+**Interrupted Runtime Restart Boundary**:
+The restart behavior for an Answer Turn interrupted by process shutdown or failure. The system does not resume or replay its Agent execution; history reflects only state that was already durable, including the admitted user question, and unresolved stop persistence is not retried.
+_Avoid_: automatic Agent resumption, replayed stopped turn, stop-persistence retry, reconstructed partial output
+
+**Stopped Turn Archive Retention**:
+The retention of a **Stopped Answer Turn** when it moves from online memory into Chat history archives. Its stopped terminal metadata remains visible in the archive, while a no-output stopped marker remains in the Chat's session state until normal Chat cleanup.
+_Avoid_: completed-only archive, statusless archived partial answer, discarded stopped turn, archive-only no-output marker
+
+**Chat Stop External-Effect Boundary**:
+The limit of a **Chat Stop Request** when a tool has already begun an external operation. It requests best-effort interruption of remaining execution but does not promise rollback of completed or in-progress external side effects.
+_Avoid_: transactional external rollback, undo guarantee, side-effect-free cancellation
+
+**Chat Stream Disconnect**:
+The loss or closure of one client connection to an active Chat stream without an explicit **Chat Stop Request**. It does not stop the current **Answer Turn**; the run remains eligible for reconnection and normal completion.
+_Avoid_: stopped answer turn, user cancellation, request failure, session termination
+
 **Logical Chat Session**:
 The stable conversation identity used to continue chat context across turns. A **Logical Chat Session** is distinct from the persisted chat record used to load or display the conversation.
 _Avoid_: chat UUID, UI session row, temporary frontend id
@@ -1620,6 +1925,10 @@ The Chat-Record-scoped durable store of messages removed by **Conversation Compa
 _Avoid_: shared daily dialog file, chat transcript, session state
 
 ## Flagged Ambiguities
+
+**Session Skill Hook Revision Boundary**:
+The boundary at which a modified, disabled, or removed Skill `hooks.json` configuration supersedes the configuration previously loaded by an existing session. One Hook event uses the configuration snapshot obtained when its dispatch begins, while a Handler already executing remains allowed to finish. A cached file-version marker determines whether the configuration must be read and validated again. Handler-script content changes do not themselves revise the configuration. An unreadable, invalid, or disabled current configuration withdraws that Skill's Hooks for later event dispatches rather than retaining a prior configuration. A Skill whose configuration is restored to a valid enabled state resumes its Hooks at a later event dispatch without requiring another Skill selection. A changed Handler does not retain its prior one-time execution record, while an unchanged Handler does. Session state converges lazily when each activated Skill next reaches a Hook event rather than through a bulk session rewrite.
+_Avoid_: handler interruption, mid-dispatch revision, session-end-only activation, per-event full configuration read, script-content revision, stale Hook source, invalid-config fallback, reselection to restore, bulk session rewrite, stale one-time record
 
 **"Create SubAgent"**:
 Resolved to distinguish two cases: starting work creates a **SubAgent Run**, while a Main Agent may also supply a **Run-scoped SubAgent Definition** for that single run. Creating an **Agent-owned Stored SubAgent Definition** occurs only through the expert configuration center.
@@ -1898,7 +2207,7 @@ Resolved as exposing absence for **File Read Truncation** as inheriting the hist
 Resolved as limited to the Source System Configuration page and runtime resolution for current user-facing controls. The Agent configuration page no longer exposes historical tool-result compaction controls, while existing Agent runtime configuration remains available as inherited baseline behavior.
 
 **"Current Session Context Usage"**:
-Resolved as **Persisted Context Occupancy**, meaning the estimated persisted session context divided by the configured **Context Window**. It excludes the current unsent composer text and does not mean cumulative token usage across completed calls.
+Resolved as **Persisted Context Occupancy**, meaning the estimated persisted session context divided by the configured **Context Window**. Its user-facing breakdown is System Context, Active Tool Definitions, and Online Conversation Messages. It excludes the current unsent composer text and does not mean cumulative token usage across completed calls.
 
 **"Context Window Capacity"**:
 Resolved as the Main Agent running configuration `max_input_length`, not provider-reported model metadata. The indicator follows Swe's runtime budget because compaction and fit checks are governed by that configuration.
@@ -2163,6 +2472,10 @@ _Avoid_: unbounded directory index, whole-directory search at request time, sour
 The single completion lifecycle event for every candidate Assistant Response. Each configured handler runs once and may perform its own attempt-recording or notification work. Its merged decision approves or blocks completion.
 _Avoid_: BeforeStop hook, observation-only stop hook
 
+**Candidate Assistant Response**:
+A newly recorded `assistant` message in the current turn with a non-empty **Assistant Response Text Projection** and no `tool_use` block. Reasoning and passive media blocks do not disqualify it, but are excluded from the Hook input. Normal completion and **Goal Finalization Candidate Assistant Response** use this same selection rule.
+_Avoid_: tool request, reasoning-inclusive Hook input, pure-text-only message requirement, earlier-turn message
+
 **Stop Decision**:
 The only valid completion decision from a Stop Hook: `allow` approves the candidate Assistant Response and `block` rejects that completion attempt. An explicit `block` may schedule a bounded automatic follow-up Agent turn; if any matched handler blocks, the merged decision blocks.
 _Avoid_: deny, stop, implicit retry
@@ -2176,8 +2489,8 @@ The non-compatible removal of the `BeforeStop` event. Configuration must use `St
 _Avoid_: BeforeStop compatibility alias, automatic event translation
 
 **Stop Trigger**:
-The boundary at which a normal candidate Assistant Response is about to complete a request. Tool-hook terminal-stop paths and turns without a candidate Assistant Response skip Stop.
-_Avoid_: tool termination audit, no-output completion hook
+The boundary at which a **Candidate Assistant Response** is about to complete a request. A Goal invokes it once for each Goal Finalization candidate; its internal execution turns never invoke it. Tool-hook terminal-stop paths, Finalization Fallback, and turns without a candidate Assistant Response skip Stop.
+_Avoid_: tool termination audit, per-turn Goal hook, fallback completion hook
 
 ## New-session capability language
 
@@ -2525,6 +2838,10 @@ _Avoid_: immediate turn interruption, discarded turn result, concurrent transiti
 When more than one Goal Control Command is pending at a Main Agent turn's settlement boundary, the Goal Runtime applies only the highest-precedence command: `CANCEL`, then Direct Goal Edit, then `PAUSE`, then `RESUME`. Lower-precedence commands remain auditable as superseded and cause no intermediate state transition.
 _Avoid_: command race, sequential conflicting transition, last-write-wins control
 
+**Goal Stop Competition Rule**:
+The outcome when a Chat Stop Request races an explicit Goal Monitor control for the same active Goal turn. A Goal Monitor cancellation that first durably establishes `CANCELLED` prevails; otherwise Chat Stop ends the current Answer Turn as stopped and transitions the Goal to `INTERRUPTED`. Pause, Direct Goal Edit, and Resume do not replace the stopped interruption outcome, but remain subject to their normal later lifecycle rules.
+_Avoid_: stop-as-cancel, interrupted-then-cancelled overwrite, pause-over-stop, edit-over-stop
+
 **Goal Turn Settlement Boundary**:
 The point after a Main Agent naturally finishes its current reasoning loop and any tool call it has already begun, when the Goal Runtime persists its result and applies pending Goal Control Commands. The first phase does not preempt an executing tool or promise stronger cancellation than the ordinary runtime provides.
 _Avoid_: forced tool termination, immediate control transition, rollback guarantee
@@ -2596,6 +2913,70 @@ _Avoid_: legacy Proposed Plan mapping, inferred Contract, user-approved step lis
 **Goal Contract Draft**:
 The proposed pre-confirmation form of a Goal Contract, containing the objective, Completion Criteria with deterministic verification definitions, Constraints, and Autonomy Boundary. User confirmation makes it the active Contract for a new Goal or Goal Revision.
 _Avoid_: accepted execution plan, mutable task list, implicit Goal
+
+**Goal Contract Draft Execution Summary**:
+The read-only, immediately derived overview within an editable Goal Contract Draft. It summarizes the current objective, Completion Criteria count, Constraint counts, and Autonomy Boundary presence; it is not a Contract field and is never independently stored or confirmed.
+_Avoid_: editable summary, persisted proposal field, separate contract description
+
+**Goal Contract Draft Detail View**:
+The temporary expanded or collapsed presentation of an editable Goal Contract Draft. A newly received Draft starts expanded; validation failures keep it expanded so the invalid field remains actionable. Its visibility is not stored as Goal state or Contract data.
+_Avoid_: persisted user preference, contract lifecycle state, collapsed validation error
+
+**Goal Contract Draft Composer Card**:
+The compact, blocking Goal Contract Draft presentation that temporarily replaces the Chat Composer. It adopts the Draft's sectioned visual language without becoming an independent full-page workflow: its Detail View scrolls within a bounded height so the existing conversation remains visible.
+_Avoid_: standalone Draft page, timeline message, cloned page shell, full-height Composer replacement
+
+**Goal Contract Draft Detail Toggle**:
+The dedicated accessible button that controls the Draft Detail View. It is the only collapse/expand trigger, exposes `aria-expanded`, uses explicit expanded/collapsed labels, and supports Enter or Space keyboard activation.
+_Avoid_: clickable summary surface, hidden toggle semantics, pointer-only disclosure
+
+**Goal Contract Draft Local Edit**:
+An unconfirmed edit held only in the current Goal Contract Draft card. It does not create or alter a Goal and is discarded when the page or card is left; the Draft must disclose this before confirmation.
+_Avoid_: saved draft, server-side proposal revision, resumable pre-confirmation contract
+
+**Goal Contract Draft Exit**:
+The explicit return from a Draft card to ordinary message editing. It never creates a Goal; when Unconfirmed Changes exist, the user must confirm their discard before the card closes.
+_Avoid_: implicit confirmation, silent discard, Contract cancellation
+
+**Goal Contract Draft Navigation Loss**:
+The intentional loss of a Local Edit when the user refreshes, closes, or navigates away from a Draft outside its explicit Exit. The Console does not install a browser-level unsaved-change warning because the Draft has no durable save or restoration path.
+_Avoid_: browser-level draft confirmation, false recovery promise, persisted local edit
+
+**Goal Contract Draft Validation Feedback**:
+The pre-confirmation feedback for an invalid Goal Contract Draft. Confirmation validates every Contract field, keeps the Detail View expanded, focuses the first invalid field, and presents both that field's reason and an aggregate count of unresolved errors; invalid editing remains possible.
+_Avoid_: silent rejected confirmation, summary-only error, locked invalid Draft
+
+**Goal Contract Draft JSON Formatting**:
+The user-triggered readability action for the Completion Criteria editor. Valid JSON may be rewritten with stable two-space indentation; invalid JSON remains unchanged and reports its parse location, while semantic fields are not repaired automatically.
+_Avoid_: silent auto-fix, semantic normalization, criteria mutation by formatting
+
+**Goal Contract Draft Character Boundary**:
+The visible pre-confirmation character limit that matches the Goal Contract model: Objective and Autonomy Boundary each allow up to 4000 characters. The Completion Criteria editor is governed by its actual structured-field limits rather than a presentation-only short limit.
+_Avoid_: mockup character limit, client-only truncation, inconsistent Contract validation
+
+**Goal Contract Confirmation Handoff**:
+The transient state after a valid Draft is submitted: the Draft becomes non-editable while its Goal is created, then the user receives confirmation that execution is starting before the existing Goal runtime surface takes over.
+_Avoid_: editable submission, silent card disappearance, separate manual start step
+
+**Goal Contract Confirmation Success State**:
+The card-local success feedback in a Goal Contract Confirmation Handoff. It replaces the Draft actions briefly before the existing Goal runtime surface takes over and does not use a global notification.
+_Avoid_: global confirmation toast, disappearing confirmation, manually dismissed success state
+
+**Unconfirmed Goal Contract Draft Change**:
+A Local Edit whose current Draft differs from its received proposal. Its Execution Summary reflects the changed values immediately and identifies the Draft as unconfirmed even when its Detail View is collapsed.
+_Avoid_: stale summary, saved contract, hidden unconfirmed change
+
+**Goal Contract Draft Change Equivalence**:
+The normalization rule for determining whether a Draft has an Unconfirmed Change: Objective and Autonomy Boundary compare after trim, valid Completion Criteria JSON compares as structured content, and Constraint entries compare in their entered order after per-line trim. Reverting to an equivalent original Contract removes the change marker.
+_Avoid_: formatting-only change, whitespace-only change, unordered constraint equivalence
+
+**Goal Contract Draft Constraint Pair**:
+The paired editable presentation of a Draft's `must_preserve` and `must_not_do` Constraint lists. The pair is displayed side by side when space permits and stacks on narrow screens without changing either list's independent meaning.
+_Avoid_: merged constraint list, reordered constraint semantics, desktop-only layout
+
+**Empty Goal Contract Draft Constraint**:
+The visible optional state of either Constraint list in a Goal Contract Draft. The editable field remains available with an empty-state prompt, while the Execution Summary identifies the corresponding Constraint as not set.
+_Avoid_: omitted constraint field, required empty constraint, hidden optional state
 
 **Editable Goal Proposal**:
 The pre-creation Goal-ready Proposal state in which the user may directly edit every Goal Contract Draft field: objective, Completion Criteria and their verification definitions, Constraints, and Autonomy Boundary. Edits are revalidated and reconfirmed as one proposal; they do not create a Goal until confirmation succeeds. The Initial Execution Plan remains private to the Main Agent.
@@ -2685,9 +3066,21 @@ _Avoid_: final answer, Agent-declared completion, unverified success message
 The final short, read-only and tool-free Main Agent turn started after every required Verification Run passes, or when a Goal request must close in a non-active state. It produces the formal Chat response and ends the Goal Chat Stream; it neither advances the Goal nor consumes the Goal Turn Budget.
 _Avoid_: pre-verification final answer, Goal Runtime-authored delivery, budgeted execution turn, failed-verification completion
 
+**Goal Finalization Candidate Assistant Response**:
+The visible text produced by a **Goal Finalization Turn** for formal Chat delivery. It is one **Candidate Assistant Response** and is evaluated by the **Stop Hook** exactly once before the Goal Chat Stream closes; internal Goal turns are not Candidate Assistant Responses. A Stop block may request only a tool-free Finalization retry. Those retries consume the existing `max_stop_turns` limit in their own Finalization-local counter, never reopen Goal execution or verification, and never consume the Goal Turn Budget.
+_Avoid_: per-turn Goal Stop, Goal Runtime status message, Goal-budgeted retry, execution-turn retry
+
+**Assistant Response Text Projection**:
+The ordered visible text extracted from a Candidate Assistant Response for a Stop Hook. It excludes reasoning and media content while allowing a message that also contains passive media to remain a Candidate Assistant Response.
+_Avoid_: reasoning-inclusive response, media payload, pure-text-only message requirement
+
+**Text-preserving Stop Transformation**:
+A Stop output transformation that replaces only an **Assistant Response Text Projection** while preserving every non-text block of its Candidate Assistant Response. The complete replacement is written into the first `text` block, later `text` blocks are emptied, and non-text blocks retain their original content and order. The transformer cannot inspect, replace, suppress, or reorder reasoning or passive media content.
+_Avoid_: media transformation, whole-message replacement, transformer-visible reasoning, inferred multi-block replacement mapping
+
 **Finalization Fallback**:
-The fixed minimal system response emitted when a Goal Finalization Turn cannot produce text because of a model or infrastructure failure. The Goal Runtime closes the current request without retrying or changing the persisted Goal state; the user can inspect the authoritative Goal Monitor Summary.
-_Avoid_: fabricated Agent conclusion, finalization retry loop, implicit Goal transition
+The fixed minimal system response emitted when a Goal Finalization Turn cannot produce text because of a model or infrastructure failure. It is not a **Goal Finalization Candidate Assistant Response** and does not invoke a Stop Hook; the runtime records the gate skip as `finalization_fallback`, closes the current request without retrying or changing the persisted Goal state, and directs the user to the authoritative Goal Monitor Summary.
+_Avoid_: fabricated Agent conclusion, fallback Stop transformation, finalization retry loop, implicit Goal transition
 
 **Goal Mode Exclusivity**:
 The Composer and runtime rule that Goal Mode cannot coexist with Plan Mode or Explicit Expert Selection. Entering Goal Mode clears those selections; a non-terminal Goal prevents switching to them until the Goal is released, while Goal-owned Background SubAgent delegation remains available under existing rules.
@@ -2724,6 +3117,82 @@ _Avoid_: long-held paused connection, reconnect auto-resume, terminal-only closu
 **Internal Goal Turn Boundary**:
 The intercepted normal-completion signal from a Main Agent turn while Goal Mode remains in control. The runtime settles the turn and may continue, wait, verify, or finalize without emitting a terminal Chat completion event; only the Goal Finalization Turn completes the frontend response stream.
 _Avoid_: per-turn SSE completion, hidden loop recursion, duplicate assistant response
+
+**安全策略最终一致窗口**:
+安全策略写入共享配置文件后，各应用实例通过独立的文件轮询发现并加载新版本所允许的最长时间。本项目约定轮询周期为 30 秒；保存请求所在实例立即加载，其他实例最迟在下一次轮询时加载。轮询或加载失败时，实例继续使用最近一次成功加载的规则并静默重试。
+_Avoid_: 瞬时全局生效、严格同步提交、失败时清空规则
+
+**安全策略调用边界**:
+Tool Guard 在一次工具调用开始后固定使用该调用已选定的规则快照；策略 reload 只影响之后开始的工具调用，不中断或重判正在执行的调用。
+_Avoid_: 中途切换规则、强制终止工具调用、回溯重判
+
+**配置原子写入**:
+所有通过公共配置写入口保存的配置都以同目录临时文件完成写入后再原子替换目标文件，使读取方只能看到完整的旧版本或完整的新版本。
+_Avoid_: 直接截断目标文件、读取半写入 JSON、仅安全策略专用的写入语义
+
+**安全策略实例状态**:
+每个应用实例仅在内存中维护其最近一次成功加载的安全策略文件指纹；该状态不对外暴露、不记录日志，不参与策略决策或跨实例协调。
+_Avoid_: 以单实例状态宣称全局已生效、失败即覆盖有效规则、依赖中心化通知状态
+
+**安全策略轮询周期**:
+所有应用实例使用固定的 30 秒共享配置轮询周期，不通过环境变量或实例级配置覆盖，以保持各实例的一致传播上限。
+_Avoid_: 实例间不同轮询周期、动态缩短或延长传播承诺、依赖外部调度器
+
+**模型配置**:
+绑定到一个具体可选模型的生成行为参数与能力边界，包括采样参数以及输入、输出长度限制。Provider 下的每个模型各自拥有模型配置；模型配置不同于 Provider 连接配置，并在切换激活模型时随模型生效。
+_Avoid_: Provider 级默认参数、Agent Profile 模型配置、连接凭据
+
+**模型配置字典**:
+Provider 配置中按模型 ID 索引的持久化配置集合。它与 Provider 的模型目录分离，模型发现或目录刷新不得覆盖已有同 ID 配置。
+_Avoid_: 混入模型目录元数据、Provider 全局生成参数、激活模型专属配置
+
+**模型配置删除联动**:
+删除一个可删除的自定义模型时，Provider 必须同时删除该模型 ID 对应的模型配置。内置模型不可删除，其配置不会因模型目录操作移除。
+_Avoid_: 无主模型配置、删除后保留参数、内置模型清理
+
+**模型配置覆盖范围**:
+一个模型配置适用于该租户中所有选择该模型的调用入口，包括 Chat、SubAgent、Cron、Hook 与内部摘要。快照执行仍使用其已选择模型对应的配置。
+_Avoid_: 仅 Chat 生效、入口专属参数、Provider 级回退参数
+
+**模型配置分发**:
+供应商全量分发复制完整的模型配置字典；激活模型分发复制被激活模型对应的配置。目标租户据此获得与源租户一致的模型调用行为。
+_Avoid_: 只分发模型目录、只分发激活槽位、丢失调用参数的分发
+
+**模型配置即时生效边界**:
+聊天界面对模型配置的修改立即持久化，并从下一次模型调用开始生效；已开始的流式响应固定使用其启动时的配置快照。
+_Avoid_: 中途重配当前响应、仅页面内暂存、等待会话结束才生效
+
+**模型输入长度限制**:
+一个模型可接受的最大输入 token 数，也是该模型运行时的上下文预算。它优先于 Agent 级默认上下文预算；未设置时使用 Agent 级默认值。
+_Avoid_: Provider API 的 `max_input_length` 请求参数、字符数限制、输出 token 上限
+
+**模型输出长度限制**:
+一个模型单次响应允许生成的最大输出 token 数，是每次模型调用的硬上限。它由 Provider 适配层转换为目标 API 的对应字段，不要求调用方感知 Provider 差异。
+_Avoid_: 软提示长度、字符数限制、上下文总长度
+
+**模型参数校验**:
+`temperature` 为非负数，`top_p` 位于 0 至 1，`top_k` 为非负整数，输入与输出长度为正整数；思考强度支持列表仅含去重后的 `low`、`high`、`max`，当前强度为空或属于该列表。
+_Avoid_: `Temprature` 拼写字段、无界采样参数、未声明强度透传
+
+**模型思考能力声明**:
+模型配置中对 `enable_thinking` 与 `reasoning_effort` 的支持情况及当前选择的声明。它属于一个租户下的具体模型，并由聊天界面选择后用于实际模型调用。
+_Avoid_: 用户级思考偏好、Provider 能力猜测、一次性请求参数
+
+**思考强度支持列表**:
+模型配置中声明该模型支持的 `reasoning_effort` 等级集合。空列表表示不支持该参数；非空列表同时表达支持能力与可选等级。
+_Avoid_: 独立的 reasoning_effort 支持开关、运行时已选等级、Provider 全局等级
+
+**思考开关支持声明**:
+模型配置中的布尔能力声明，表示模型是否接受 `enable_thinking` 请求参数。仅声明支持时，聊天界面才展示会话思考开关。
+_Avoid_: 默认启用思考、会话思考偏好、思考强度支持列表
+
+**独立思考能力**:
+`enable_thinking` 支持声明与思考强度支持列表相互独立；模型可支持其中任一项。运行时只发送该模型声明支持且已配置的字段。
+_Avoid_: 强制成对支持、未声明参数透传、Provider 统一能力假设
+
+**思考参数联动**:
+对于声明支持 `enable_thinking` 的模型，只有当前思考开关开启且其配置声明支持所选等级时，运行时请求才携带 `reasoning_effort`；关闭思考会清空并停止发送当前等级。仅声明支持思考强度、未声明开关的 reasoning-only 模型，不显示思考开关，并直接发送其已配置的等级。
+_Avoid_: 关闭思考仍发送强度、用户级固定强度、未声明等级透传
 
 ## Example Dialogue
 
@@ -2770,3 +3239,11 @@ Domain Expert: "No. It receives only Skills and MCP clients named in its Definit
 Developer: "May the reviewer edit a file?"
 
 Domain Expert: "Only when its inherited built-in tool set remains permitted by its allow/deny settings and by the parent Agent's Tool Guard and approval policy. A background run never waits for a new approval."
+
+Developer: "What exactly does a shared Chat link expose?"
+
+Domain Expert: "It exposes a Shared Conversation Snapshot made from at least one completed Shareable Answer Turn. The snapshot is fixed at creation, uses the ordinary Chat history redaction rules, and is rendered through a Read-only Share View."
+
+Developer: "Can the owner revoke or expire the link?"
+
+Domain Expert: "No. It is a Permanent Share Link: every generation creates a new opaque Share Token, and the link remains valid without time expiry or owner revocation."

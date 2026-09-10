@@ -50,6 +50,8 @@ class SessionState(str, Enum):
     EXECUTING_TRIAL = "ExecutingTrial"
     AWAITING_TRIAL_FEEDBACK = "AwaitingTrialFeedback"
     AWAITING_STAGE_CONFIRMATION = "AwaitingStageConfirmation"
+    GENERATING_STAGE_REPORT = "GeneratingStageReport"
+    REFRESHING_CUMULATIVE = "RefreshingCumulative"
     FINALIZING_OUTPUTS = "FinalizingOutputs"
     OUTPUT_REVIEW = "OutputReview"
     MEMORY_REVIEW = "MemoryReview"
@@ -92,6 +94,9 @@ class EventKind(str, Enum):
     TRIAL_FEEDBACK_ACCEPTED = "trial_feedback_accepted"
     STAGE_CONFIRMATION_REQUIRED = "stage_confirmation_required"
     STAGE_CONFIRMED = "stage_confirmed"
+    STAGE_REPORT_GENERATED = "stage_report_generated"
+    STAGE_REPORT_GENERATION_FAILED = "stage_report_generation_failed"
+    CUMULATIVE_REFRESHED = "cumulative_refreshed"
     REVISION_APPLIED = "revision_applied"
     SOP_RESULT = "sop_result"
     MEMORY_CANDIDATES = "memory_candidates"
@@ -749,6 +754,107 @@ class FinalSopResult(StrictModel):
         return self
 
 
+class StageReportArtifact(StrictModel):
+    artifact_id: Literal["stage_sop_json", "stage_sop_md", "stage_sop_html"]
+    name: Literal["stage_sop.json", "stage_sop.md", "stage_sop.html"]
+    static_file_name: str
+    static_url: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    copied_by: Literal["copy_file_to_static"]
+
+    @model_validator(mode="after")
+    def _validate_artifact_identity(self) -> "StageReportArtifact":
+        expected_name = {
+            "stage_sop_json": "stage_sop.json",
+            "stage_sop_md": "stage_sop.md",
+            "stage_sop_html": "stage_sop.html",
+        }[self.artifact_id]
+        if self.name != expected_name:
+            raise ValueError("artifact id and logical name must match")
+        if (
+            not self.static_file_name.strip()
+            or "/" in self.static_file_name
+            or "\\" in self.static_file_name
+            or self.static_file_name in {".", ".."}
+        ):
+            raise ValueError("static_file_name must be a basename")
+        if not self.static_url.strip():
+            raise ValueError("static_url is required")
+        return self
+
+
+class StageReportValidationEvidence(StrictModel):
+    schema_validator: Literal["scripts/validate_stage_sop.py"]
+    schema_exit_code: Literal[0]
+    renderers: tuple[
+        Literal["scripts/render_stage_md.py"],
+        Literal["scripts/render_stage_sop.py"],
+    ]
+
+
+class StageReport(StrictModel):
+    """One stage's three-format report for a successful trial run.
+
+    report_no counts successful pre-runs within the current session
+    revision. Revisions are limited to the current unconfirmed stage and
+    restart the count; confirmed reports remain read-only. superseded_by
+    points at the newer report_no that replaced this version; None marks
+    the latest.
+    """
+
+    stage_id: str
+    report_no: int = Field(ge=1)
+    revision: int = Field(default=0, ge=0)
+    created_at: datetime = Field(default_factory=utc_now)
+    superseded_by: int | None = Field(default=None, ge=1)
+    artifacts: list[StageReportArtifact] = Field(default_factory=list)
+    validation: StageReportValidationEvidence
+
+    @model_validator(mode="after")
+    def _validate_report(self) -> "StageReport":
+        if self.superseded_by is not None and self.superseded_by <= self.report_no:
+            raise ValueError("superseded_by must be a newer report_no")
+        required = {"stage_sop_json", "stage_sop_md", "stage_sop_html"}
+        actual = {artifact.artifact_id for artifact in self.artifacts}
+        if len(self.artifacts) != 3 or actual != required:
+            raise ValueError("stage report requires three artifacts")
+        return self
+
+
+class ConfirmedStageSnapshot(StrictModel):
+    """A stage version locked by user confirmation (R6) and eligible for the
+    cumulative SOP (R9). Ordered by stage sequence, not by confirmation time."""
+
+    stage_id: str
+    report_no: int = Field(ge=1)
+    revision: int = Field(default=0, ge=0)
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    confirmed_at: datetime = Field(default_factory=utc_now)
+
+
+class CumulativePreview(StrictModel):
+    """Deterministic assembly of confirmed stage snapshots (design D1/D2)."""
+
+    preview_version: int = Field(ge=1)
+    stage_order: list[str] = Field(min_length=1)
+    snapshots: list[ConfirmedStageSnapshot] = Field(min_length=1)
+    artifacts: list[StageReportArtifact] = Field(default_factory=list)
+    rendered_sha256: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_cumulative(self) -> "CumulativePreview":
+        snapshot_ids = [snapshot.stage_id for snapshot in self.snapshots]
+        if snapshot_ids != self.stage_order:
+            raise ValueError("snapshots must follow stage_order exactly")
+        if len(snapshot_ids) != len(set(snapshot_ids)):
+            raise ValueError("stage_order must be unique")
+        required = {"stage_sop_json", "stage_sop_md", "stage_sop_html"}
+        actual = {artifact.artifact_id for artifact in self.artifacts}
+        if len(self.artifacts) != 3 or actual != required:
+            raise ValueError("cumulative preview requires three artifacts")
+        return self
+
+
 class StageProposalPayload(StageQueue):
     stages: list[Stage] = Field(min_length=2, max_length=4)
 
@@ -844,6 +950,22 @@ class StageConfirmedPayload(StrictModel):
     stage_id: str
     next_stage_id: str | None = None
     is_final_stage: bool = False
+    confirmed_report_no: int | None = Field(default=None, ge=1)
+
+
+class StageReportGeneratedPayload(StrictModel):
+    report: StageReport
+
+
+class StageReportGenerationFailedPayload(StrictModel):
+    stage_id: str
+    error_code: str
+    summary: str
+    last_stable_report_no: int | None = Field(default=None, ge=1)
+
+
+class CumulativeRefreshedPayload(StrictModel):
+    preview: CumulativePreview
 
 
 class RevisionAppliedPayload(StrictModel):
@@ -961,6 +1083,9 @@ EventPayload: TypeAlias = (
     | SessionStateChangedPayload
     | RecoverableFailurePayload
     | TerminationSummaryPayload
+    | StageReportGeneratedPayload
+    | StageReportGenerationFailedPayload
+    | CumulativeRefreshedPayload
 )
 
 
@@ -978,6 +1103,9 @@ _PAYLOAD_MODELS: dict[EventKind, type[StrictModel]] = {
     EventKind.TRIAL_FEEDBACK_ACCEPTED: TrialFeedbackAcceptedPayload,
     EventKind.STAGE_CONFIRMATION_REQUIRED: StageConfirmationRequiredPayload,
     EventKind.STAGE_CONFIRMED: StageConfirmedPayload,
+    EventKind.STAGE_REPORT_GENERATED: StageReportGeneratedPayload,
+    EventKind.STAGE_REPORT_GENERATION_FAILED: StageReportGenerationFailedPayload,
+    EventKind.CUMULATIVE_REFRESHED: CumulativeRefreshedPayload,
     EventKind.REVISION_APPLIED: RevisionAppliedPayload,
     EventKind.SOP_RESULT: SopResultPayload,
     EventKind.MEMORY_CANDIDATES: MemoryCandidatesPayload,
@@ -1232,6 +1360,9 @@ class SessionProjection(_IdentifiedModel):
     trial_result_lists: list[ResultObjectList] = Field(default_factory=list)
     trial_feedback: list[str] = Field(default_factory=list)
     final_result: FinalSopResult | None = None
+    stage_reports: list[StageReport] = Field(default_factory=list)
+    confirmed_snapshots: list[ConfirmedStageSnapshot] = Field(default_factory=list)
+    cumulative_preview: CumulativePreview | None = None
     memory_candidates: list[MemoryCandidate] = Field(default_factory=list)
     active_memory_candidate_id: str | None = None
     active_memory_candidate_ids: list[str] = Field(default_factory=list)
@@ -1249,6 +1380,7 @@ class SessionProjection(_IdentifiedModel):
         self._validate_stage_ids()
         self._validate_pause_state()
         self._validate_memory_candidate_consistency()
+        self._validate_stage_report_consistency()
         return self
 
     def _validate_stage_ids(self) -> None:
@@ -1289,6 +1421,48 @@ class SessionProjection(_IdentifiedModel):
             and self.resume_state is not SessionState.WRITING_MEMORY
         ):
             raise ValueError("active memory candidate requires WritingMemory")
+
+    def _validate_stage_report_consistency(self) -> None:
+        stage_ids = [stage.stage_id for stage in self.stages]
+        stage_ids_set = set(stage_ids)
+        report_keys = {
+            (report.stage_id, report.revision, report.report_no)
+            for report in self.stage_reports
+        }
+        for report in self.stage_reports:
+            if report.stage_id not in stage_ids_set:
+                raise ValueError("stage report must reference the stage queue")
+        snapshots = self.confirmed_snapshots
+        if len(snapshots) > len(stage_ids):
+            raise ValueError("confirmed snapshots cannot exceed stage count")
+        if any(
+            snapshot.stage_id != stage_ids[index]
+            for index, snapshot in enumerate(snapshots)
+        ):
+            raise ValueError(
+                "confirmed snapshots must follow the stage queue order as a prefix",
+            )
+        for snapshot in snapshots:
+            if (
+                snapshot.stage_id,
+                snapshot.revision,
+                snapshot.report_no,
+            ) not in report_keys:
+                raise ValueError(
+                    "confirmed snapshot must reference an existing stage report",
+                )
+        if self.cumulative_preview is not None:
+            preview = self.cumulative_preview
+            if preview.stage_order != [
+                snapshot.stage_id for snapshot in snapshots
+            ]:
+                raise ValueError(
+                    "cumulative preview stage_order must match confirmed snapshots",
+                )
+            if preview.snapshots != snapshots:
+                raise ValueError(
+                    "cumulative preview snapshots must match confirmed snapshots",
+                )
 
     @property
     def chat_id(self) -> str:
@@ -1433,18 +1607,32 @@ _MAIN_TRANSITIONS: dict[SessionState, frozenset[SessionState]] = {
     ),
     SessionState.GENERATING_TRIAL: frozenset({SessionState.EXECUTING_TRIAL}),
     SessionState.EXECUTING_TRIAL: frozenset(
-        {SessionState.AWAITING_TRIAL_FEEDBACK},
+        {
+            SessionState.AWAITING_TRIAL_FEEDBACK,
+            SessionState.GENERATING_STAGE_REPORT,
+        },
+    ),
+    SessionState.GENERATING_STAGE_REPORT: frozenset(
+        {SessionState.AWAITING_STAGE_CONFIRMATION},
     ),
     SessionState.AWAITING_TRIAL_FEEDBACK: frozenset(
         {
             SessionState.GENERATING_QUESTIONS,
             SessionState.GENERATING_TRIAL,
             SessionState.AWAITING_STAGE_CONFIRMATION,
+            SessionState.GENERATING_STAGE_REPORT,
         },
     ),
     SessionState.AWAITING_STAGE_CONFIRMATION: frozenset(
         {
             SessionState.GENERATING_TRIAL,
+            SessionState.GENERATING_QUESTIONS,
+            SessionState.REFRESHING_CUMULATIVE,
+            SessionState.FINALIZING_OUTPUTS,
+        },
+    ),
+    SessionState.REFRESHING_CUMULATIVE: frozenset(
+        {
             SessionState.GENERATING_QUESTIONS,
             SessionState.FINALIZING_OUTPUTS,
         },
@@ -1469,6 +1657,8 @@ _GENERATING_STATES = frozenset(
         SessionState.GENERATING_QUESTIONS,
         SessionState.GENERATING_TRIAL,
         SessionState.EXECUTING_TRIAL,
+        SessionState.GENERATING_STAGE_REPORT,
+        SessionState.REFRESHING_CUMULATIVE,
         SessionState.FINALIZING_OUTPUTS,
         SessionState.WRITING_MEMORY,
     },

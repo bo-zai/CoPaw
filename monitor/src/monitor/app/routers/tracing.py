@@ -28,7 +28,6 @@ from ..models.tracing import (
     ModelOutputRequest,
     MCPSummary,
     TaskStatusSummary,
-    DepthSummary,
     ExtractCustomerNamesRequest,
     ExtractCustomerNamesResponse,
     InputTokensMismatchItem,
@@ -150,6 +149,14 @@ async def get_overview(
         description="开始日期 (YYYY-MM-DD)",
     ),
     end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
+    detail: Literal["full", "summary"] = Query(
+        "full",
+        description="返回明细级别；summary 跳过页面不展示的资源排行数据",
+    ),
+    time_range: Literal["day", "week", "month", "custom"] = Query(
+        "day",
+        description="环比时间粒度",
+    ),
 ) -> OverviewStats:
     """获取运营概览统计.
 
@@ -172,6 +179,8 @@ async def get_overview(
         start,
         end,
         bbk_ids,
+        include_resource_breakdown=detail == "full",
+        time_range=time_range,
     )
 
 
@@ -760,50 +769,6 @@ async def get_channel_distribution(
     return await service.get_channel_distribution(actual_source_id, start, end)
 
 
-# ===== 环比增长 =====
-
-
-@router.get("/growth-stats", response_model=dict)
-async def get_growth_stats(
-    request: Request,
-    start_date: str = Query(..., description="开始日期 (YYYY-MM-DD)"),
-    end_date: str = Query(..., description="结束日期 (YYYY-MM-DD)"),
-    time_range: str = Query(
-        "day",
-        description="时间范围: day, week, month, custom",
-    ),
-    bbk_ids: Optional[str] = Query(None, description="分行ID筛选"),
-) -> dict:
-    """获取运营看板环比指标。
-
-    口径说明：
-    - 该接口返回的是当前统计窗口相对上一对比窗口的环比结果。
-    - 分行维度通过 bbk_ids 过滤。
-    - time_range 只决定上一对比窗口的回溯长度，不改变当前窗口
-      的起止日期输入。
-    - 返回字段的业务口径由服务层统一定义，供总览卡片和使用深度卡片
-      复用，避免前端自行推导环比口径。
-    """
-    actual_source_id = _get_source_id_from_header(request)
-    service = TracingQueryService.get_instance()
-
-    start = _parse_date(start_date, "start_date")
-    end = _parse_date(end_date, "end_date", add_day=True)
-    if start is None or end is None:
-        raise HTTPException(
-            status_code=400,
-            detail="start_date and end_date are required",
-        )
-
-    return await service.get_growth_stats(
-        actual_source_id,
-        start,
-        end,
-        time_range,
-        bbk_ids,
-    )
-
-
 # ===== 日趋势 =====
 
 
@@ -1168,35 +1133,6 @@ async def get_error_list(
         page_size,
     )
     return result
-
-
-# ===== 使用深度统计 =====
-
-
-@router.get("/depth/summary", response_model=DepthSummary)
-async def get_depth_summary(
-    request: Request,
-    start_date: Optional[str] = Query(
-        None,
-        description="开始日期 (YYYY-MM-DD)",
-    ),
-    end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
-    bbk_ids: Optional[str] = Query(None, description="分行ID筛选"),
-) -> DepthSummary:
-    """获取使用深度汇总统计."""
-    actual_source_id = _get_source_id_from_header(request)
-    service = TracingQueryService.get_instance()
-
-    start = _parse_date(start_date, "start_date")
-    end = _parse_date(end_date, "end_date", add_day=True)
-
-    summary = await service.get_depth_summary(
-        actual_source_id,
-        start,
-        end,
-        bbk_ids,
-    )
-    return summary
 
 
 # ===== Model Output 写入 =====

@@ -13,5 +13,6 @@ window.__env__ = {
   systemSect: '',
   responseFeedbackUserWhitelist: ["*"], // 回答反馈卡片白名单，"*"表示全员开放
   voiceRecorderUserWhitelist: ["*"], // 语音录制按钮白名单，"*"表示全员开放
+  directAccessUserWhitelist: [], // 顶层窗口直接访问白名单；空数组表示全部拒绝，不支持"*"
   chatSessionPageSize: 100, // 聊天历史分页大小，未配置或非法时默认100
 };

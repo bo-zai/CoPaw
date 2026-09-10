@@ -32,6 +32,9 @@ class BlockedSkillRecord:
     findings: list[dict[str, Any]] = field(default_factory=list)
     content_hash: str = ""
     action: str = "blocked"
+    source_id: str = ""
+    user_id: str = ""
+    bbk_id: str = ""
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     def to_dict(self) -> dict[str, Any]:
@@ -44,6 +47,9 @@ class BlockedSkillRecord:
             "findings": self.findings,
             "content_hash": self.content_hash,
             "action": self.action,
+            "source_id": self.source_id,
+            "user_id": self.user_id,
+            "bbk_id": self.bbk_id,
         }
 
 
@@ -90,9 +96,8 @@ class SkillScanHistoryStore:
             )
 
     async def initialize(self) -> None:
-        """Create the history table and ordering index idempotently."""
+        """Validate that the externally-managed history store is available."""
         self._require_available()
-        await self.db.execute(_CREATE_TABLE)
 
     async def insert(self, record: BlockedSkillRecord) -> None:
         """Persist one scan alert."""
@@ -107,6 +112,9 @@ class SkillScanHistoryStore:
                 json.dumps(record.findings, ensure_ascii=False),
                 record.content_hash,
                 record.action,
+                record.source_id,
+                record.user_id,
+                record.bbk_id,
             ),
         )
 
@@ -115,16 +123,20 @@ class SkillScanHistoryStore:
         *,
         page: int,
         page_size: int,
+        source_id: str,
     ) -> SkillScanHistoryPage:
         """Return one newest-first page and the total record count."""
         self._require_available()
         try:
-            count_row = await self.db.fetch_one(_COUNT_RECORDS, ())
+            count_row = await self.db.fetch_one(
+                _COUNT_RECORDS_BY_SOURCE,
+                (source_id,),
+            )
             total = int(count_row.get("total", 0)) if count_row else 0
             offset = (page - 1) * page_size
             rows = await self.db.fetch_all(
-                _LIST_RECORDS,
-                (page_size, offset),
+                _LIST_RECORDS_BY_SOURCE,
+                (source_id, page_size, offset),
             )
         except Exception as exc:
             raise SkillScanHistoryStoreUnavailable(
@@ -416,51 +428,41 @@ def _row_to_record(row: dict[str, Any]) -> BlockedSkillRecord:
         findings=findings,
         content_hash=str(row.get("content_hash") or ""),
         action=str(row.get("action") or "blocked"),
+        source_id=str(row.get("source_id") or ""),
+        user_id=str(row.get("user_id") or ""),
+        bbk_id=str(row.get("bbk_id") or ""),
     )
 
-
-_CREATE_TABLE = f"""
-    CREATE TABLE IF NOT EXISTS {_TABLE} (
-        id CHAR(36) NOT NULL,
-        skill_name VARCHAR(255) NOT NULL,
-        blocked_at DATETIME(6) NOT NULL,
-        max_severity VARCHAR(16) NOT NULL,
-        findings_json MEDIUMTEXT NOT NULL,
-        content_hash CHAR(64) NOT NULL DEFAULT '',
-        action VARCHAR(16) NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (id),
-        INDEX idx_swe_skill_scan_history_order (blocked_at, id),
-        INDEX idx_swe_skill_scan_history_skill_action_order (
-            skill_name, action, blocked_at, id
-        )
-    )
-"""
 
 _INSERT_RECORD = f"""
     INSERT INTO {_TABLE} (
         id, skill_name, blocked_at, max_severity,
-        findings_json, content_hash, action
+        findings_json, content_hash, action,
+        source_id, user_id, bbk_id
     )
-    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
 
-_COUNT_RECORDS = f"SELECT COUNT(*) AS total FROM {_TABLE}"
+_COUNT_RECORDS_BY_SOURCE = f"""
+    SELECT COUNT(*) AS total FROM {_TABLE}
+    WHERE source_id = %s
+"""
 
 _GET_LATEST_WARNING = f"""
     SELECT
         id, skill_name, blocked_at, max_severity,
-        findings_json, content_hash, action
+        findings_json, content_hash, action, source_id, user_id, bbk_id
     FROM {_TABLE}
     WHERE skill_name = %s AND action = 'warned' AND blocked_at >= %s
     ORDER BY blocked_at DESC, id DESC
     LIMIT 1
 """
 
-_LIST_RECORDS = f"""
+_LIST_RECORDS_BY_SOURCE = f"""
     SELECT id, skill_name, blocked_at, max_severity,
-           findings_json, content_hash, action
+           findings_json, content_hash, action, source_id, user_id, bbk_id
     FROM {_TABLE}
+    WHERE source_id = %s
     ORDER BY blocked_at DESC, id DESC
     LIMIT %s OFFSET %s
 """

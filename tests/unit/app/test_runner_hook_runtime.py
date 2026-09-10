@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -18,6 +18,8 @@ from swe.agents.hook_runtime.models import (
     HookMatcherGroupConfig,
     HookSessionState,
     HookSessionOverlay,
+    MonitoredSkillHookSource,
+    SkillHookFileVersion,
     AdditionalContext,
     MergedHookResult,
     StopHookExecutionResult,
@@ -303,6 +305,22 @@ def test_hook_config_enabled_accepts_loaded_skill_sources() -> None:
     assert _hook_config_enabled(HookConfig(), _agent_config(), state)
 
 
+def test_hook_config_enabled_accepts_monitored_skill_sources() -> None:
+    state = HookSessionState(
+        monitored_skill_sources=[
+            MonitoredSkillHookSource(
+                source_id="skill:xlsx",
+                skill_name="xlsx",
+                skill_root="/workspace/skills/xlsx",
+                source_path="/workspace/skills/xlsx/hooks/hooks.json",
+                file_version=SkillHookFileVersion(exists=False),
+            ),
+        ],
+    )
+
+    assert _hook_config_enabled(HookConfig(), _agent_config(), state)
+
+
 @pytest.mark.asyncio
 async def test_create_session_skill_detector_loads_skill_hooks(
     tmp_path,
@@ -437,6 +455,89 @@ async def test_create_session_skill_detector_loads_http_skill_hooks_without_appr
     )
     assert handler.id == "skill:xlsx:notify"
     assert handler.url == "https://hooks.example.test/skill"
+
+
+@pytest.mark.asyncio
+async def test_session_detector_skips_hooks_changed_after_snapshot(
+    tmp_path,
+) -> None:
+    from swe.agents.skills_manager import _build_signature
+
+    skill_root = tmp_path / "skills" / "xlsx"
+    (skill_root / "hooks").mkdir(parents=True)
+    hooks_path = skill_root / "hooks" / "hooks.json"
+    hooks_path.write_text('{"enabled": true, "events": {}}', encoding="utf-8")
+    signature = _build_signature(skill_root)
+    state = HookSessionState()
+
+    detector = _create_session_skill_detector(
+        workspace_dir=tmp_path,
+        tenant_id="tenant-a",
+        user_id="user-1",
+        session_id="session-1",
+        channel="console",
+        source_id="source-1",
+        enabled_skills=["xlsx"],
+        skill_metadata={"xlsx": {"description": "spreadsheet"}},
+        skill_dirs={"xlsx": skill_root},
+        skill_signatures={"xlsx": signature},
+        get_hook_state=lambda: state,
+        set_hook_state=lambda new_state: None,
+        approved_http_urls=set(),
+    )
+    hooks_path.write_text('{"enabled": false, "events": {}}', encoding="utf-8")
+
+    await detector.start_skill(
+        "xlsx",
+        trigger_tool="user_message",
+        trigger_reason="declared",
+        load_hooks=True,
+    )
+
+    assert not state.loaded_skill_sources
+
+
+@pytest.mark.asyncio
+async def test_skill_detector_monitors_initially_invalid_skill_hooks(
+    tmp_path,
+) -> None:
+    skill_root = tmp_path / "skills" / "xlsx"
+    (skill_root / "hooks").mkdir(parents=True)
+    (skill_root / "hooks" / "hooks.json").write_text(
+        "{",
+        encoding="utf-8",
+    )
+    state = HookSessionState()
+
+    def get_state() -> HookSessionState:
+        return state
+
+    def set_state(new_state: HookSessionState) -> None:
+        nonlocal state
+        state = new_state
+
+    detector = _create_session_skill_detector(
+        workspace_dir=tmp_path,
+        tenant_id="tenant-a",
+        user_id="user-1",
+        session_id="session-1",
+        channel="console",
+        source_id="source-1",
+        enabled_skills=["xlsx"],
+        get_hook_state=get_state,
+        set_hook_state=set_state,
+        approved_http_urls=set(),
+    )
+
+    await detector.start_skill(
+        "xlsx",
+        trigger_tool="user_message",
+        trigger_reason="declared",
+        load_hooks=True,
+    )
+
+    assert state.monitored_skill_sources[0].skill_name == "xlsx"
+    assert state.loaded_skill_sources == []
 
 
 @pytest.mark.asyncio
@@ -1359,7 +1460,7 @@ async def test_build_lazy_mcp_clients_defers_client_creation_until_discovery(
 
 
 @pytest.mark.asyncio
-async def test_build_lazy_mcp_clients_never_forwards_user_headers_to_marketplace(
+async def test_build_lazy_mcp_clients_forwards_all_user_headers_to_marketplace(
     monkeypatch,
 ) -> None:
     import swe.app.runner.runner as runner_module
@@ -1390,12 +1491,53 @@ async def test_build_lazy_mcp_clients_never_forwards_user_headers_to_marketplace
         ),
         tenant_id="tenant-a",
         user_id="user-a",
-        passthrough_headers={"Authorization": "Bearer user-token"},
+        passthrough_headers={
+            "Authorization": "Bearer user-token",
+            "cookie": "sid=abc",
+            "X-B3-Traceid": "trace-1",
+        },
     )
 
     await clients[0].list_tools()
 
-    assert create_client.await_args.args[1] is None
+    assert create_client.await_args.args[1] == {
+        "Authorization": "Bearer user-token",
+        "cookie": "sid=abc",
+        "X-B3-Traceid": "trace-1",
+    }
+
+
+def test_build_lazy_mcp_clients_ignores_filtered_sandbox_auth_in_discovery_key():
+    import swe.app.runner.runner as runner_module
+    from swe.config.config import MCPClientConfig, MCPConfig
+
+    def build_client(auth_header: str):
+        return runner_module._build_lazy_mcp_clients(
+            MCPConfig(
+                clients={
+                    "market": MCPClientConfig(
+                        name="market",
+                        transport="streamable_http",
+                        url=(
+                            "https://mcpmarket-sandbox.platform.cmbchina.cn"
+                            "/mcp"
+                        ),
+                        source="marketplace:mcp-1",
+                    ),
+                },
+            ),
+            tenant_id="tenant-a",
+            user_id="user-a",
+            passthrough_headers={
+                "Authorization": auth_header,
+                "cookie": "sid=abc",
+            },
+        )[0]
+
+    client_a = build_client("Bearer token-a")
+    client_b = build_client("Bearer token-b")
+
+    assert client_a._discovery_key == client_b._discovery_key
 
 
 @pytest.mark.asyncio
@@ -1857,6 +1999,27 @@ def test_stop_transformer_handles_text_block_assistant_response() -> None:
     assert msg.content == [{"type": "text", "text": "final block text"}]
 
 
+def test_stop_transformer_projects_thinking_and_text_response() -> None:
+    agent = _FakeAgent()
+    msg = Msg(
+        name="Friday",
+        role="assistant",
+        content=[
+            {"type": "thinking", "thinking": "hidden"},
+            {"type": "text", "text": "visible"},
+        ],
+    )
+    agent.memory.content.append((msg, []))
+
+    assert _is_bufferable_assistant_text(msg) is True
+    assert _extract_assistant_response(agent) == "visible"
+    assert _replace_assistant_response(agent, "final") is True
+    assert msg.content == [
+        {"type": "thinking", "thinking": "hidden"},
+        {"type": "text", "text": "final"},
+    ]
+
+
 def test_stop_transformer_extract_ignores_live_assistant_events() -> None:
     agent = _FakeAgent()
     candidate = Msg(name="Friday", role="assistant", content="final candidate")
@@ -1885,7 +2048,8 @@ def test_stop_transformer_keeps_live_assistant_events_unbuffered(
     assert _is_bufferable_assistant_text(msg) is False
 
 
-def test_stop_transformer_keeps_mixed_media_message_unbuffered() -> None:
+def test_stop_transformer_projects_text_with_passive_media() -> None:
+    agent = _FakeAgent()
     msg = Msg(
         name="Friday",
         role="assistant",
@@ -1894,8 +2058,33 @@ def test_stop_transformer_keeps_mixed_media_message_unbuffered() -> None:
             {"type": "image", "url": "https://example.com/image.png"},
         ],
     )
+    agent.memory.content.append((msg, []))
+
+    assert _is_bufferable_assistant_text(msg) is True
+    assert _extract_assistant_response(agent) == "caption"
+    assert _replace_assistant_response(agent, "final caption") is True
+    assert msg.content == [
+        {"type": "text", "text": "final caption"},
+        {"type": "image", "url": "https://example.com/image.png"},
+    ]
+
+
+def test_stop_transformer_rejects_tool_use_message() -> None:
+    agent = _FakeAgent()
+    msg = Msg(
+        name="Friday",
+        role="assistant",
+        content=[
+            {"type": "thinking", "thinking": "hidden"},
+            {"type": "text", "text": "will use a tool"},
+            {"type": "tool_use", "name": "read_file", "input": {}},
+        ],
+    )
+    agent.memory.content.append((msg, []))
 
     assert _is_bufferable_assistant_text(msg) is False
+    assert _extract_assistant_response(agent) == ""
+    assert _replace_assistant_response(agent, "final") is False
 
 
 @pytest.mark.asyncio
@@ -2586,6 +2775,48 @@ async def test_emit_stop_hook_respects_active_guard(
 
     assert result is None
     emit_hook.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stop_skip_emits_hook_telemetry_without_response_plaintext(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    runner = AgentRunner(agent_id="test-agent", workspace_dir=tmp_path)
+    messages: list[str] = []
+    monkeypatch.setattr(
+        "swe.agents.hook_runtime.runtime.logger.info",
+        lambda message, *args: messages.append(message % args),
+    )
+    result = await runner._emit_stop_hook_if_needed(
+        request=SimpleNamespace(
+            trace_id="trace-1",
+            channel_meta={"turn_id": "turn-1"},
+        ),
+        runtime=SimpleNamespace(
+            tenant_hooks=HookConfig(),
+            agent_config=_agent_config(),
+            hook_overlay=HookSessionOverlay(),
+        ),
+        plan=SimpleNamespace(original_user_message="hello"),
+        outcome=_QueryTurnOutcome(),
+    )
+
+    assert result is None
+    messages = [
+        message
+        for message in messages
+        if message.startswith("HOOK_TELEMETRY ")
+    ]
+    assert len(messages) == 1
+    payload = json.loads(messages[0].removeprefix("HOOK_TELEMETRY "))
+    assert payload["schema"] == "hook_telemetry.v1"
+    assert payload["hook_event_name"] == "Stop"
+    assert payload["execution_state"] == "skipped"
+    assert payload["skipped_reason"] == "empty_assistant_response"
+    assert payload["handler_count"] == 0
+    assert payload["handlers"] == []
+    assert "hello" not in json.dumps(payload)
 
 
 @pytest.mark.asyncio

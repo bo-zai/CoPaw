@@ -33,7 +33,7 @@ def test_build_skill_use_directives_keeps_first_effective_readable_name(
 
     assert [directive.name for directive in directives] == ["second", "first"]
     assert directives[0].path == tmp_path / "skills" / "second" / "SKILL.md"
-    assert "<SKILL-USE-V1>" in directives[0].render()
+    assert "<SKILL-USE>" in directives[0].render()
     assert (
         "<description>Second guidance</description>" in directives[0].render()
     )

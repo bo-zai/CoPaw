@@ -335,6 +335,22 @@ class MemoryCompactionHook:
         )
         return None
 
+    @staticmethod
+    async def _count_projected_tokens(
+        token_counter: Any,
+        messages: list[Msg],
+        fixed_text: str,
+    ) -> int:
+        """Count online messages and fixed prompt context independently."""
+        message_tokens = await token_counter.count(
+            messages=[message.to_dict() for message in messages],
+        )
+        fixed_text_tokens = await token_counter.count(
+            messages=[],
+            text=fixed_text,
+        )
+        return message_tokens + fixed_text_tokens
+
     async def _compact_tool_results_if_enabled(
         self,
         messages: list[Msg],
@@ -534,9 +550,10 @@ class MemoryCompactionHook:
                 # a tool_use/tool_result transaction at the candidate edge.
                 candidate_messages = candidate_messages[:-1]
 
-            projected_tokens = await token_counter.count(
-                messages=messages,
-                text=(agent.sys_prompt or "")
+            projected_tokens = await self._count_projected_tokens(
+                token_counter,
+                messages,
+                (agent.sys_prompt or "")
                 + (memory.get_compressed_summary() or ""),
             )
 
@@ -544,9 +561,10 @@ class MemoryCompactionHook:
                 refreshed_messages = await memory.get_memory(
                     prepend_summary=False,
                 )
-                return await token_counter.count(
-                    messages=refreshed_messages,
-                    text=(agent.sys_prompt or "")
+                return await self._count_projected_tokens(
+                    token_counter,
+                    refreshed_messages,
+                    (agent.sys_prompt or "")
                     + (memory.get_compressed_summary() or ""),
                 )
 

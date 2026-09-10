@@ -1,7 +1,15 @@
-import { act, cleanup, render, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HtmlPreviewTrackingProvider } from "../HtmlPreviewTrackingContext";
+import FilePreviewDrawer from "../FilePreviewDrawer";
 import FilePreviewModal from "./index";
 
 type AttachHtmlPreviewClickTracker =
@@ -57,8 +65,60 @@ vi.mock("../Markdown", () => ({
 }));
 
 vi.mock("antd", () => ({
-  Modal: ({ open, children }: { open: boolean; children: ReactNode }) =>
-    open ? <div data-testid="modal">{children}</div> : null,
+  Button: ({
+    children,
+    onClick,
+    "aria-label": ariaLabel,
+  }: {
+    children?: ReactNode;
+    onClick?: () => void;
+    "aria-label"?: string;
+  }) => (
+    <button type="button" onClick={onClick} aria-label={ariaLabel}>
+      {children}
+    </button>
+  ),
+  Modal: ({
+    open,
+    children,
+    title,
+  }: {
+    open: boolean;
+    children: ReactNode;
+    title?: ReactNode;
+  }) =>
+    open ? (
+      <div data-testid="preview-modal">
+        {title}
+        {children}
+      </div>
+    ) : null,
+  Drawer: ({
+    open,
+    children,
+    title,
+    extra,
+    mask,
+    placement,
+  }: {
+    open: boolean;
+    children: ReactNode;
+    title?: ReactNode;
+    extra?: ReactNode;
+    mask?: boolean;
+    placement?: string;
+  }) =>
+    open ? (
+      <aside
+        data-testid="preview-drawer"
+        data-mask={String(mask)}
+        data-placement={placement}
+      >
+        {title}
+        {extra}
+        {children}
+      </aside>
+    ) : null,
   Spin: ({ tip }: { tip?: string }) => <div>{tip || "loading"}</div>,
   Tooltip: ({ children }: { children: ReactNode }) => <>{children}</>,
   message: {
@@ -68,6 +128,7 @@ vi.mock("antd", () => ({
 }));
 
 vi.mock("@ant-design/icons", () => ({
+  ArrowLeftOutlined: () => <span data-testid="back-icon" />,
   FullscreenOutlined: () => <span data-testid="fullscreen-icon" />,
 }));
 
@@ -116,6 +177,42 @@ afterEach(() => {
 });
 
 describe("FilePreviewModal HTML preview recording", () => {
+  it("renders a non-blocking right-side preview drawer with the file name", () => {
+    render(
+      <FilePreviewDrawer
+        open
+        onClose={vi.fn()}
+        fileUrl="https://example.test/report.zip"
+        fileName="季度经营分析报告.zip"
+      />,
+    );
+
+    const drawer = screen.getByTestId("preview-drawer");
+    expect(drawer).toHaveAttribute("data-mask", "false");
+    expect(drawer).toHaveAttribute("data-placement", "right");
+    expect(drawer).toHaveTextContent("季度经营分析报告.zip");
+    expect(document.documentElement).toHaveClass(
+      "copaw-file-preview-drawer-open",
+    );
+  });
+
+  it("keeps the shared preview modal as the default presentation", () => {
+    render(
+      <FilePreviewModal
+        open
+        onClose={vi.fn()}
+        fileUrl="https://example.test/report.html"
+        fileName="定时任务报告.html"
+      />,
+    );
+
+    expect(screen.getByTestId("preview-modal")).toBeInTheDocument();
+    expect(screen.queryByTestId("preview-drawer")).not.toBeInTheDocument();
+    expect(document.documentElement).not.toHaveClass(
+      "copaw-file-preview-drawer-open",
+    );
+  });
+
   it("records normal task auto-preview clicks and list snapshots", async () => {
     render(
       <HtmlPreviewTrackingProvider
@@ -230,6 +327,91 @@ describe("FilePreviewModal HTML preview recording", () => {
         "https://example.test/report[auto-preview].html?resultId=result-1&templateId=1",
       listName: "report[auto-preview].html",
       defaultCustomerInfo: { customer_id: "CUST-001", name: "张三" },
+    });
+  });
+
+  it("replaces the workspace preview for nested links without changing the default stack mode", async () => {
+    render(
+      <FilePreviewModal
+        open
+        onClose={vi.fn()}
+        fileUrl="https://example.test/report[auto-preview].html?resultId=result-1&templateId=1"
+        fileName="report[auto-preview].html"
+        enableClickTracking
+        presentation="workspace"
+        nestedPreviewMode="replace"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(document.querySelectorAll("iframe")).toHaveLength(1);
+    });
+    const trackerParams = getLatestTrackerParams();
+
+    await act(async () => {
+      trackerParams.onOpenNestedPreview({
+        fileUrl:
+          "https://example.test/nested-plan.html?resultId=result-2&templateId=2",
+        fileName: "nested-plan.html",
+        listKey:
+          "https://example.test/report[auto-preview].html?resultId=result-1&templateId=1",
+        listName: "report[auto-preview].html",
+        customerInfo: null,
+        custUid: "",
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTitle("nested-plan.html")).toBeInTheDocument();
+      expect(
+        screen.queryByTitle("report[auto-preview].html"),
+      ).not.toBeInTheDocument();
+      expect(document.querySelectorAll("iframe")).toHaveLength(1);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "返回上一级预览" }));
+
+    await waitFor(() => {
+      expect(
+        screen.getByTitle("report[auto-preview].html"),
+      ).toBeInTheDocument();
+      expect(screen.queryByTitle("nested-plan.html")).not.toBeInTheDocument();
+      expect(document.querySelectorAll("iframe")).toHaveLength(1);
+    });
+  });
+
+  it("keeps nested previews stacked when no replacement mode is requested", async () => {
+    render(
+      <FilePreviewModal
+        open
+        onClose={vi.fn()}
+        fileUrl="https://example.test/report[auto-preview].html?resultId=result-1&templateId=1"
+        fileName="report[auto-preview].html"
+        enableClickTracking
+      />,
+    );
+
+    await waitFor(() => {
+      expect(document.querySelectorAll("iframe")).toHaveLength(1);
+    });
+    const trackerParams = getLatestTrackerParams();
+
+    await act(async () => {
+      trackerParams.onOpenNestedPreview({
+        fileUrl:
+          "https://example.test/nested-plan.html?resultId=result-2&templateId=2",
+        fileName: "nested-plan.html",
+        listKey:
+          "https://example.test/report[auto-preview].html?resultId=result-1&templateId=1",
+        listName: "report[auto-preview].html",
+        customerInfo: null,
+        custUid: "",
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("preview-modal")).toHaveLength(2);
+      expect(document.querySelectorAll("iframe")).toHaveLength(2);
     });
   });
 

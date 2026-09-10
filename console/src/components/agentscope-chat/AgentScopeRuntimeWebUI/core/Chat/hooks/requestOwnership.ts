@@ -4,6 +4,7 @@ export interface ChatRequestOwner {
   sessionId: string;
   logicalSessionId: string;
   chatId: string | null;
+  msgid?: string | null;
 }
 
 export function createChatRequestOwner(

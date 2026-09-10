@@ -5,15 +5,19 @@ import {
   IAgentScopeRuntimeWebUIOptions,
   type IAgentScopeRuntimeWebUISenderOptions,
   type IAgentScopeRuntimeWebUIRef,
+  type IChatInputProps,
   useChatAnywhereSessions,
   useChatAnywhereSessionsState,
 } from "@/components/agentscope-chat";
 import AgentScopeRuntimeRequestCard from "@/components/agentscope-chat/AgentScopeRuntimeWebUI/core/AgentScopeRuntime/Request/Card";
 import AgentScopeRuntimeResponseCard from "@/components/agentscope-chat/AgentScopeRuntimeWebUI/core/AgentScopeRuntime/Response/Card";
 import ConversationCompactionBoundary from "./components/ConversationCompactionBoundary";
+import ContextUsageIndicator from "./components/ContextUsageIndicator";
+import { useContextUsageController } from "./components/ContextUsageIndicator/useContextUsageController";
 // ==================== 组件引入方式变更结束 ====================
 import {
   Children,
+  cloneElement,
   useCallback,
   useEffect,
   useMemo,
@@ -79,6 +83,8 @@ import styles from "./index.module.less";
 import { Form } from "@agentscope-ai/design";
 // import ChatActionGroup from "./components/ChatActionGroup";
 import ChatHeaderTitle from "./components/ChatHeaderTitle";
+import ChatActionGroup from "./components/ChatActionGroup";
+import { ChatShareSelectionProvider } from "./chatShareContext";
 import ChatSessionInitializer from "./components/ChatSessionInitializer";
 import SubAgentRunMonitor from "./components/SubAgentRunMonitor";
 import GoalMonitor from "./components/GoalMonitor";
@@ -131,10 +137,7 @@ import { emit } from "@/components/agentscope-chat/AgentScopeRuntimeWebUI/core/C
 
 import RuntimeRequestCard from "./components/RuntimeRequestCard";
 import { FOLLOW_UP_SUBMIT_FAILED_EVENT } from "@/components/agentscope-chat/AgentScopeRuntimeWebUI/core/Chat/hooks/followUpSubmit";
-import {
-  createChatStreamAbortReason,
-  shouldStopBackendForFetchAbort,
-} from "@/components/agentscope-chat/AgentScopeRuntimeWebUI/core/Chat/hooks/abortReasons";
+import { createChatStreamAbortReason } from "@/components/agentscope-chat/AgentScopeRuntimeWebUI/core/Chat/hooks/abortReasons";
 import RuntimeResponseCard, {
   RuntimeResponseFeedbackCard,
 } from "./components/RuntimeResponseCard";
@@ -159,7 +162,7 @@ import {
   type PlanModeSessionLike,
 } from "./planMode";
 import FileManager from "./components/FileManager";
-import { AutoPreviewHtmlProvider } from "@/components/agentscope-chat/AutoPreviewHtmlContext";
+import { ChatAutoPreviewHtmlProvider as AutoPreviewHtmlProvider } from "@/components/agentscope-chat/ChatAutoPreviewHtmlProvider";
 import { HtmlPreviewTrackingProvider } from "@/components/agentscope-chat/HtmlPreviewTrackingContext";
 import { ChatContentOnlyProvider } from "@/components/agentscope-chat/ChatContentOnlyContext";
 import type {
@@ -196,6 +199,7 @@ import { isChatTaskProgressEnabled } from "./taskProgressConfig";
 import GlobalVoiceRecorder from "@/components/GlobalVoiceRecorder";
 import { shouldShowGlobalVoiceRecorder } from "@/components/GlobalVoiceRecorder/presentation";
 import { shouldRouteGoalRequestAsSteering } from "./goalSteeringRouting";
+import { FilePreviewPresentationProvider } from "@/components/agentscope-chat/FilePreviewPresentationContext";
 
 const CHAT_ATTACHMENT_MAX_MB = 10;
 const TASK_RUNNING_POLL_MS = 30_000;
@@ -702,8 +706,10 @@ export default function ChatPage() {
   messageRef.current = message;
   const composerInputState = useChatAnywhereInput((value) => ({
     disabled: Boolean(value.disabled),
+    loading: Boolean(value.loading),
   }));
   const composerDisabled = Boolean(composerInputState.disabled);
+  const composerLoading = Boolean(composerInputState.loading);
   const [taskEditForm] = Form.useForm<CronJobSpecOutput>();
   const [editingTask, setEditingTask] = useState<CronJobSpecOutput | null>(
     null,
@@ -715,6 +721,15 @@ export default function ChatPage() {
     setSessionLoading,
     currentSessionId: activeSessionId,
   } = useChatAnywhereSessionsState();
+  const contextUsageChatId = chatId
+    ? sessionApi.getChatIdForSession(chatId)
+    : activeSessionId
+    ? sessionApi.getChatIdForSession(activeSessionId)
+    : null;
+  const contextUsage = useContextUsageController(
+    contextUsageChatId,
+    composerLoading,
+  );
 
   useEffect(() => {
     setSelectedContextReferences([]);
@@ -1993,11 +2008,8 @@ export default function ChatPage() {
       // has been submitted so aborts/network failures cannot leave stale UI
       // state for the next turn.
       setSelectedExpertId(null);
-      if (goalModeEnabled) {
-        setGoalModeEnabled(false);
-      }
+      setSubAgentMonitorResetKey((value) => value + 1);
       try {
-        setSubAgentMonitorResetKey((value) => value + 1);
         const response = await fetch(getApiUrl("/console/chat"), {
           method: "POST",
           headers,
@@ -2010,23 +2022,6 @@ export default function ChatPage() {
         }
 
         return response;
-      } catch (error) {
-        if (shouldStopBackendForFetchAbort(error, timeoutSignal.signal)) {
-          const backendChatId = resolveRequestChatId(
-            {
-              session_id: data.session_id,
-              logical_session_id: data.logical_session_id,
-              chat_id: data.chat_id,
-            },
-            requestBody.session_id,
-          );
-          if (backendChatId) {
-            chatApi.stopChat(backendChatId).catch((err) => {
-              console.error("Failed to stop chat after timeout:", err);
-            });
-          }
-        }
-        throw error;
       } finally {
         timeoutSignal.cleanup();
       }
@@ -2201,6 +2196,7 @@ export default function ChatPage() {
     const senderConfig = i18nConfig.sender as
       | IAgentScopeRuntimeWebUISenderOptions
       | undefined;
+    const contextUsageIndicator = <ContextUsageIndicator {...contextUsage} />;
     const senderPrefixNodes = Children.toArray([
       activePlanModeControl,
       activeGoalModeControl,
@@ -2353,8 +2349,8 @@ export default function ChatPage() {
             <ChatHeaderTitle />
             <span style={{ flex: 1 }} />
             {!isContentOnly && <FileManager />}
+            {!isContentOnly && <ChatActionGroup chatId={chatId} />}
             {!isContentOnly && <ModelSelector />}
-            {/* <ChatActionGroup /> */}
           </>
         ),
       },
@@ -2381,6 +2377,7 @@ export default function ChatPage() {
               <>
                 {activePlanModeControl}
                 {activeGoalModeControl}
+                {contextUsageIndicator}
               </>
             }
             onSubmit={(data) => onSubmit(data)}
@@ -2404,7 +2401,14 @@ export default function ChatPage() {
         ),
         renderComposer: (defaultComposer) => (
           <ActivePlanInteractionComposer
-            defaultComposer={defaultComposer}
+            defaultComposer={cloneElement<IChatInputProps>(defaultComposer, {
+              actions: (defaultActions) => (
+                <div className={styles.composerActions}>
+                  {contextUsageIndicator}
+                  {defaultActions}
+                </div>
+              ),
+            })}
             onContinueModifying={handleContinueModifyingPlan}
             onPlanModeDecision={handlePlanModeDecision}
           />
@@ -2412,7 +2416,7 @@ export default function ChatPage() {
         quickMenuItems: planModeQuickMenuItems,
         prefix:
           senderPrefixNodes.length > 0 ? <>{senderPrefixNodes}</> : undefined,
-        allowSpeech: false,
+        allowSpeech: true,
         attachments: {
           accept: CHAT_ATTACHMENT_ACCEPT_HINT,
           customRequest: handleFileUpload,
@@ -2440,13 +2444,16 @@ export default function ChatPage() {
           session_id: string;
           logical_session_id?: string;
           chat_id?: string | null;
+          msgid?: string | null;
         }) {
           const logicalSessionId = resolveLogicalRequestSessionId(data);
           const chatId = resolveRequestChatId(data, logicalSessionId);
           if (chatId) {
-            return chatApi.stopChat(chatId).catch((err) => {
-              console.error("Failed to stop chat:", err);
-            });
+            return chatApi
+              .stopChat(chatId, data.msgid, logicalSessionId)
+              .catch((err) => {
+                console.error("Failed to stop chat:", err);
+              });
           }
           return Promise.resolve();
         },
@@ -2473,7 +2480,9 @@ export default function ChatPage() {
               headers,
               body: JSON.stringify({
                 reconnect: true,
+                reconnect_mode: "current",
                 session_id: reconnectSessionId,
+                chat_id: data.chat_id || undefined,
                 // ==================== userId 统一整改 (Kun He) ====================
                 // 使用 getUserId()/getChannel() 获取
                 user_id: getUserId(),
@@ -2530,6 +2539,9 @@ export default function ChatPage() {
     expertsLoading,
     multimodalCaps,
     composerDisabled,
+    composerLoading,
+    contextUsageChatId,
+    contextUsage,
     pendingPlanRevision,
     persistPlanMode,
     planModeEnabled,
@@ -2570,179 +2582,187 @@ export default function ChatPage() {
   }, [options.cards]);
 
   return (
-    <AgentScopeRuntimeWebUIComposedProvider options={options} cards={cards}>
-      <ChatFeedbackRenderProvider value={feedbackRenderContextValue}>
-        <HtmlPreviewTrackingProvider value={htmlPreviewTrackingContextValue}>
-          <AutoPreviewHtmlProvider
-            triggerKey={autoPreviewTriggerKey}
-            onConsumed={() => setAutoPreviewTriggerKey(0)}
-          >
-            <div
-              data-chat-shell
-              style={{
-                height: "100%",
-                width: "100%",
-                display: "flex",
-                flexDirection: "row",
-              }}
+    <ChatShareSelectionProvider>
+      <AgentScopeRuntimeWebUIComposedProvider options={options} cards={cards}>
+        <ChatFeedbackRenderProvider value={feedbackRenderContextValue}>
+          <HtmlPreviewTrackingProvider value={htmlPreviewTrackingContextValue}>
+            <AutoPreviewHtmlProvider
+              triggerKey={autoPreviewTriggerKey}
+              onConsumed={() => setAutoPreviewTriggerKey(0)}
             >
-              {/* ==================== 首页改版 (Kun He) ==================== */}
-              {/* 聊天专用侧栏：支持折叠为64px工具条 */}
-              {!isContentOnly && (
-                <ChatSidebar
-                  tasks={tasks}
-                  selectedTaskId={currentTask?.id}
-                  onCreateSession={handleCreateSessionFromSidebar}
-                  onTaskClick={handleTaskOpen}
-                  onTaskPause={handleTaskPause}
-                  onTaskRun={handleTaskRun}
-                  onTaskResume={handleTaskResume}
-                  onTaskDelete={handleTaskDelete}
-                  onTaskEdit={handleTaskEdit}
-                />
-              )}
-              {/* ==================== 首页改版结束 ==================== */}
               <div
-                className={styles.chatMessagesArea}
-                data-chat-messages-area
-                style={{ flex: 1, minWidth: 0, position: "relative" }}
-                onDragEnter={isContentOnly ? undefined : handleDragEnter}
-                onDragLeave={isContentOnly ? undefined : handleDragLeave}
-                onDragOver={isContentOnly ? undefined : handleDragOver}
-                onDrop={isContentOnly ? undefined : handleDrop}
+                data-chat-shell
+                style={{
+                  height: "100%",
+                  width: "100%",
+                  display: "flex",
+                  flexDirection: "row",
+                }}
               >
-                <ChatContentOnlyProvider enabled={isContentOnly}>
-                  <ChatPlanReviewRenderProvider
-                    value={planReviewRenderContextValue}
-                  >
-                    <GlobalVoiceRecorder enabled={voiceRecorderEnabled}>
-                      <WPlusSopActiveBar
-                        chatId={feedbackChatId || chatId}
-                        logicalSessionId={feedbackSessionId || undefined}
-                        onLocksChatInputChange={setWPlusSopLocksChatInput}
-                      />
-                      <div
-                        className={
-                          wPlusSopLocksChatInput
-                            ? styles.chatDisabledOverlay
-                            : undefined
-                        }
-                        style={{ height: "100%", width: "100%" }}
-                      >
-                        <AgentScopeRuntimeWebUILayout ref={chatRef} />
-                      </div>
-                    </GlobalVoiceRecorder>
-                  </ChatPlanReviewRenderProvider>
-                </ChatContentOnlyProvider>
-                <SubAgentRunMonitor
-                  chatId={feedbackChatId}
-                  resetKey={subAgentMonitorResetKey}
-                />
-                <GoalMonitor
-                  chatId={feedbackChatId}
-                  onResume={handleGoalResume}
-                />
+                {/* ==================== 首页改版 (Kun He) ==================== */}
+                {/* 聊天专用侧栏：支持折叠为64px工具条 */}
                 {!isContentOnly && (
-                  <DragUploadOverlay
-                    visible={isDragging}
-                    onClose={handleDragOverlayClose}
+                  <ChatSidebar
+                    tasks={tasks}
+                    selectedTaskId={currentTask?.id}
+                    onCreateSession={handleCreateSessionFromSidebar}
+                    onTaskClick={handleTaskOpen}
+                    onTaskPause={handleTaskPause}
+                    onTaskRun={handleTaskRun}
+                    onTaskResume={handleTaskResume}
+                    onTaskDelete={handleTaskDelete}
+                    onTaskEdit={handleTaskEdit}
                   />
                 )}
-                <ConversationQuickNav />
+                {/* ==================== 首页改版结束 ==================== */}
+                <div
+                  className={styles.chatMessagesArea}
+                  data-chat-messages-area
+                  style={{ flex: 1, minWidth: 0, position: "relative" }}
+                  onDragEnter={isContentOnly ? undefined : handleDragEnter}
+                  onDragLeave={isContentOnly ? undefined : handleDragLeave}
+                  onDragOver={isContentOnly ? undefined : handleDragOver}
+                  onDrop={isContentOnly ? undefined : handleDrop}
+                >
+                  <ChatContentOnlyProvider enabled={isContentOnly}>
+                    <ChatPlanReviewRenderProvider
+                      value={planReviewRenderContextValue}
+                    >
+                      <GlobalVoiceRecorder enabled={voiceRecorderEnabled}>
+                        <WPlusSopActiveBar
+                          chatId={feedbackChatId || chatId}
+                          logicalSessionId={feedbackSessionId || undefined}
+                          onLocksChatInputChange={setWPlusSopLocksChatInput}
+                        />
+                        <div
+                          className={
+                            wPlusSopLocksChatInput
+                              ? styles.chatDisabledOverlay
+                              : undefined
+                          }
+                          style={{ height: "100%", width: "100%" }}
+                        >
+                          <FilePreviewPresentationProvider
+                            value={
+                              feedbackTask?.cronTaskId ? "modal" : "workspace"
+                            }
+                          >
+                            <AgentScopeRuntimeWebUILayout ref={chatRef} />
+                          </FilePreviewPresentationProvider>
+                        </div>
+                      </GlobalVoiceRecorder>
+                    </ChatPlanReviewRenderProvider>
+                  </ChatContentOnlyProvider>
+                  <SubAgentRunMonitor
+                    chatId={feedbackChatId}
+                    resetKey={subAgentMonitorResetKey}
+                  />
+                  <GoalMonitor
+                    chatId={feedbackChatId}
+                    onResume={handleGoalResume}
+                  />
+                  {!isContentOnly && (
+                    <DragUploadOverlay
+                      visible={isDragging}
+                      onClose={handleDragOverlayClose}
+                    />
+                  )}
+                  <ConversationQuickNav />
+                </div>
               </div>
+            </AutoPreviewHtmlProvider>
+          </HtmlPreviewTrackingProvider>
+        </ChatFeedbackRenderProvider>
+
+        <Modal
+          open={Boolean(editingTask)}
+          title="编辑任务"
+          width="min(760px, calc(100vw - 32px))"
+          className={styles.taskEditModal}
+          centered
+          destroyOnClose
+          maskClosable={!taskEditSaving}
+          keyboard={!taskEditSaving}
+          onCancel={handleTaskEditClose}
+          footer={
+            <div className={styles.taskEditModalFooter}>
+              <Button onClick={handleTaskEditClose} disabled={taskEditSaving}>
+                取消
+              </Button>
+              <Button
+                type="primary"
+                loading={taskEditSaving}
+                onClick={() => taskEditForm.submit()}
+              >
+                保存
+              </Button>
             </div>
-          </AutoPreviewHtmlProvider>
-        </HtmlPreviewTrackingProvider>
-      </ChatFeedbackRenderProvider>
-
-      <Modal
-        open={Boolean(editingTask)}
-        title="编辑任务"
-        width="min(760px, calc(100vw - 32px))"
-        className={styles.taskEditModal}
-        centered
-        destroyOnClose
-        maskClosable={!taskEditSaving}
-        keyboard={!taskEditSaving}
-        onCancel={handleTaskEditClose}
-        footer={
-          <div className={styles.taskEditModalFooter}>
-            <Button onClick={handleTaskEditClose} disabled={taskEditSaving}>
-              取消
-            </Button>
-            <Button
-              type="primary"
-              loading={taskEditSaving}
-              onClick={() => taskEditForm.submit()}
-            >
-              保存
-            </Button>
-          </div>
-        }
-      >
-        <Form
-          form={taskEditForm}
-          layout="vertical"
-          onFinish={() =>
-            handleTaskEditSubmit(
-              taskEditForm.getFieldsValue(true) as CronTaskEditFormValues,
-            )
           }
-          initialValues={DEFAULT_FORM_VALUES}
-          className={styles.taskEditForm}
         >
-          <ChatTaskEditFormBody />
-        </Form>
-      </Modal>
+          <Form
+            form={taskEditForm}
+            layout="vertical"
+            onFinish={() =>
+              handleTaskEditSubmit(
+                taskEditForm.getFieldsValue(true) as CronTaskEditFormValues,
+              )
+            }
+            initialValues={DEFAULT_FORM_VALUES}
+            className={styles.taskEditForm}
+          >
+            <ChatTaskEditFormBody />
+          </Form>
+        </Modal>
 
-      <Modal
-        open={showModelPrompt}
-        closable={false}
-        footer={null}
-        width={480}
-        styles={{
-          content: isDark
-            ? {
-                background: "#1f1f1f",
-                boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
-              }
-            : undefined,
-        }}
-      >
-        <Result
-          icon={<ExclamationCircleOutlined style={{ color: "#faad14" }} />}
-          title={
-            <span
-              style={{ color: isDark ? "rgba(255,255,255,0.88)" : undefined }}
-            >
-              {t("modelConfig.promptTitle")}
-            </span>
-          }
-          subTitle={
-            <span
-              style={{ color: isDark ? "rgba(255,255,255,0.55)" : undefined }}
-            >
-              {t("modelConfig.promptMessage")}
-            </span>
-          }
-          extra={[
-            <Button key="skip" onClick={() => setShowModelPrompt(false)}>
-              {t("modelConfig.skipButton")}
-            </Button>,
-            <Button
-              key="configure"
-              type="primary"
-              icon={<SettingOutlined />}
-              onClick={() => {
-                setShowModelPrompt(false);
-                navigate("/models");
-              }}
-            >
-              {t("modelConfig.configureButton")}
-            </Button>,
-          ]}
-        />
-      </Modal>
-    </AgentScopeRuntimeWebUIComposedProvider>
+        <Modal
+          open={showModelPrompt}
+          closable={false}
+          footer={null}
+          width={480}
+          styles={{
+            content: isDark
+              ? {
+                  background: "#1f1f1f",
+                  boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
+                }
+              : undefined,
+          }}
+        >
+          <Result
+            icon={<ExclamationCircleOutlined style={{ color: "#faad14" }} />}
+            title={
+              <span
+                style={{ color: isDark ? "rgba(255,255,255,0.88)" : undefined }}
+              >
+                {t("modelConfig.promptTitle")}
+              </span>
+            }
+            subTitle={
+              <span
+                style={{ color: isDark ? "rgba(255,255,255,0.55)" : undefined }}
+              >
+                {t("modelConfig.promptMessage")}
+              </span>
+            }
+            extra={[
+              <Button key="skip" onClick={() => setShowModelPrompt(false)}>
+                {t("modelConfig.skipButton")}
+              </Button>,
+              <Button
+                key="configure"
+                type="primary"
+                icon={<SettingOutlined />}
+                onClick={() => {
+                  setShowModelPrompt(false);
+                  navigate("/models");
+                }}
+              >
+                {t("modelConfig.configureButton")}
+              </Button>,
+            ]}
+          />
+        </Modal>
+      </AgentScopeRuntimeWebUIComposedProvider>
+    </ChatShareSelectionProvider>
   );
 }

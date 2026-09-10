@@ -3,11 +3,19 @@
 
 import asyncio
 from datetime import datetime, timezone
-from typing import Any, List, Optional
+from typing import Annotated, Any, List, Optional
 
 import segno
 
-from fastapi import APIRouter, Body, HTTPException, Path, Query, Request
+from fastapi import (
+    APIRouter,
+    Body,
+    Header,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+)
 from pydantic import BaseModel, Field
 
 from ..utils import schedule_agent_reload
@@ -1142,13 +1150,18 @@ async def put_skill_scanner(
 )
 async def get_blocked_history(
     request: Request,
+    source_id: Annotated[str, Header(alias="X-Source-Id")],
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=10, le=100),
 ) -> dict:
     store = _get_skill_scan_history_store(request)
     await _flush_skill_scan_history(request)
     try:
-        result = await store.list_page(page=page, page_size=page_size)
+        result = await store.list_page(
+            page=page,
+            page_size=page_size,
+            source_id=source_id,
+        )
     except Exception as exc:
         _raise_skill_scan_history_unavailable(exc)
     return result.to_dict()

@@ -323,6 +323,62 @@ def test_upload_skill_rejects_ast_execution_risk(tmp_path):
     assert "Security scan" in resp.json()["detail"]
 
 
+def test_enable_skill_scan_failure_flushes_history_and_records_bbk(
+    tmp_path,
+    monkeypatch,
+):
+    from market.marketplace.fs import get_user_skills_dir
+    from market.security import skill_scanner
+
+    app = _make_app(tmp_path)
+    client = TestClient(app)
+    skill_dir = (
+        get_user_skills_dir(tmp_path / "swe", "user1", source_id="src_a")
+        / "eval_skill"
+    )
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Eval Skill\n", encoding="utf-8")
+    (skill_dir / "run.py").write_text(
+        "def run(expr):\n    return eval(expr)\n",
+        encoding="utf-8",
+    )
+    submitted = []
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.flushed = False
+
+        def submit(self, record):
+            submitted.append(record)
+            return True
+
+        async def flush(self):
+            self.flushed = True
+
+    recorder = _Recorder()
+    app.state.skill_scan_history_recorder = recorder
+    skill_scanner.install_skill_scan_history_recorder(recorder)
+    try:
+        resp = client.post(
+            "/api/market/skills/mine/eval_skill/enable",
+            headers={
+                "X-Source-Id": "src_a",
+                "X-User-Id": "user1",
+                "X-Bbk-Id": "bbk-a",
+            },
+        )
+    finally:
+        skill_scanner.install_skill_scan_history_recorder(None)
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["reason"] == "security_scan_failed"
+    assert recorder.flushed is True
+    assert len(submitted) == 1
+    assert submitted[0].source_id == "src_a"
+    assert submitted[0].user_id == "user1"
+    assert submitted[0].bbk_id == "bbk-a"
+
+
 def test_log_skill_operation_returns_200(tmp_path):
     """测试操作日志上报端点返回成功。"""
     from fastapi import FastAPI

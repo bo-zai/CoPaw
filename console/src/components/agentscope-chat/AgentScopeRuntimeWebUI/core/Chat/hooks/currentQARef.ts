@@ -10,4 +10,5 @@ export type CurrentQARef = React.MutableRefObject<{
   response?: LiveResponseMessage;
   abortController?: AbortController;
   activeRequestOwner?: ChatRequestOwner;
+  stopPending?: boolean;
 }>;

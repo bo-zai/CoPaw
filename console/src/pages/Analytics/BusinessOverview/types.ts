@@ -44,14 +44,6 @@ export interface OverviewMetricCard {
   breakdown: BreakdownItem[] | null;
 }
 
-export interface DepthStatCard {
-  key: string;
-  title: string;
-  valueText: string;
-  changeText: string;
-  changeDirection: "up" | "down" | "flat";
-}
-
 export interface SummaryLegendItem {
   key: string;
   label: string;
@@ -118,24 +110,7 @@ export function formatChange(value: number | undefined | null): string {
   }
   const numberValue =
     typeof value === "number" && !Number.isNaN(value) ? value : 0;
-  const sign = numberValue > 0 ? "+" : "";
-  return `${sign}${numberValue.toFixed(1)}%`;
-}
-
-export function formatDuration(seconds: number | undefined | null): string {
-  const numberValue =
-    typeof seconds === "number" && !Number.isNaN(seconds) ? seconds : 0;
-
-  if (numberValue < 1) {
-    return `${Math.round(numberValue * 1000)}ms`;
-  }
-  if (numberValue < 60) {
-    return `${numberValue.toFixed(2).replace(/\.00$/, "")}s`;
-  }
-
-  const minutes = Math.floor(numberValue / 60);
-  const remainSeconds = Math.floor(numberValue % 60);
-  return `${minutes}m ${remainSeconds}s`;
+  return `${numberValue > 0 ? "+" : ""}${numberValue.toFixed(1)}%`;
 }
 
 export function toChangeDirection(
@@ -144,12 +119,10 @@ export function toChangeDirection(
   if (value === null || value === undefined) {
     return "flat";
   }
-  const numberValue =
-    typeof value === "number" && !Number.isNaN(value) ? value : 0;
-  if (numberValue > 0) {
+  if (value > 0) {
     return "up";
   }
-  if (numberValue < 0) {
+  if (value < 0) {
     return "down";
   }
   return "flat";

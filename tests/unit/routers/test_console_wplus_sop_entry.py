@@ -11,6 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 from src.swe.app.routers import console as console_router
+from swe.app.answer_turn.models import TurnIdentity, TurnLease
 from swe.app.wplus_sop.models import (
     CommandReceipt,
     OwnershipTuple,
@@ -85,7 +86,7 @@ class FakeTaskTracker:
 
     async def attach_or_start(
         self,
-        _run_key,
+        _identity,
         _payload,
         _stream_fn,
         *,
@@ -98,8 +99,33 @@ class FakeTaskTracker:
         self.started += 1
         return object(), True
 
-    async def stream_from_queue(self, _queue, _run_key):
+    async def attach(self, _identity):
+        return None
+
+    async def stream(self, _identity, _queue):
         yield 'data: {"done": true}\n\n'
+
+
+class FakeCoordinator:
+    def __init__(self, tracker: FakeTaskTracker) -> None:
+        self.tracker = tracker
+
+    async def status(self, _chat_id):
+        return None
+
+    async def start_or_attach(self, chat_id, payload, producer, **kwargs):
+        identity = TurnIdentity(
+            chat_id=chat_id,
+            msgid=kwargs.get("msgid") or "msg-1",
+            turn_id="turn-1",
+        )
+        queue, is_new = await self.tracker.attach_or_start(
+            identity,
+            payload,
+            producer,
+            before_start=kwargs.get("before_start"),
+        )
+        return TurnLease(identity, queue, is_new)
 
 
 def _build_client(
@@ -120,13 +146,15 @@ def _build_client(
             request.state.agent_id = state_agent_id
         return await call_next(request)
 
+    tracker = FakeTaskTracker()
     workspace = SimpleNamespace(
         workspace_dir=tmp_path,
         agent_id="agent-1",
         channel_manager=FakeChannelManager(),
         chat_manager=FakeChatManager(),
-        task_tracker=FakeTaskTracker(),
+        task_tracker=tracker,
     )
+    workspace.answer_turn_coordinator = FakeCoordinator(tracker)
 
     async def fake_get_agent_for_request(_request):
         return workspace
@@ -152,7 +180,9 @@ def test_explicit_wplus_selection_returns_card_before_agent_or_session(
 ) -> None:
     legacy_store_path = tmp_path / ".copaw" / "wplus-sop.json"
     legacy_store_path.parent.mkdir()
-    legacy_store_sentinel = b"legacy W+ store: deliberately invalid JSON\x00\xff"
+    legacy_store_sentinel = (
+        b"legacy W+ store: deliberately invalid JSON\x00\xff"
+    )
     legacy_store_path.write_bytes(legacy_store_sentinel)
 
     current_store_path = tmp_path / ".sop" / "wplus-sop.json"
@@ -187,9 +217,13 @@ def test_explicit_wplus_selection_returns_card_before_agent_or_session(
     assert workspace.task_tracker.started == 0
     assert legacy_store_path.read_bytes() == legacy_store_sentinel
 
-    persisted_store = json.loads(current_store_path.read_text(encoding="utf-8"))
+    persisted_store = json.loads(
+        current_store_path.read_text(encoding="utf-8"),
+    )
     assert card["proposal_id"] in persisted_store["entry_proposals"]
-    persisted_proposal = persisted_store["entry_proposals"][card["proposal_id"]]
+    persisted_proposal = persisted_store["entry_proposals"][
+        card["proposal_id"]
+    ]
     assert persisted_proposal["proposal_id"] == card["proposal_id"]
     assert persisted_proposal["detection_mode"] == "explicit"
     assert persisted_proposal["ownership"]["chat_id"] == card["chat_id"]

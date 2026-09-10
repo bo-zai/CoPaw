@@ -26,7 +26,10 @@ from swe.agents.skills_manager import (
     get_workspace_skill_manifest_path,
 )
 from swe.app.runner.runner import AgentRunner
-from swe.app.runner.session import SafeJSONSession
+from swe.app.runner.session import (
+    SESSION_SKILL_SNAPSHOT_STATE_KEY,
+    SafeJSONSession,
+)
 from swe.config.config import SuggestionMode
 
 
@@ -1218,11 +1221,13 @@ async def test_retryable_plan_failure_defers_snapshot_persistence_until_success(
     original_build_turn_plan = runner._build_turn_plan
 
     async def flaky_build_turn_plan(*args, **kwargs):
+        session_execution = kwargs["runtime"].session_execution
         observed_snapshots.append(
-            await runner.session.get_session_skill_snapshot(
-                session_id="session-1",
-                user_id="user-1",
-                allow_not_exist=True,
+            dict(
+                session_execution.state.get(
+                    SESSION_SKILL_SNAPSHOT_STATE_KEY,
+                    {},
+                ),
             ),
         )
         if len(observed_snapshots) == 1:
@@ -1325,11 +1330,13 @@ async def test_retryable_completion_failure_defers_snapshot_persistence_until_su
     original_stream_completion_lifecycle = runner._stream_completion_lifecycle
 
     async def flaky_stream_completion_lifecycle(*args, **kwargs):
+        session_execution = kwargs["runtime"].session_execution
         observed_snapshots.append(
-            await runner.session.get_session_skill_snapshot(
-                session_id="session-1",
-                user_id="user-1",
-                allow_not_exist=True,
+            dict(
+                session_execution.state.get(
+                    SESSION_SKILL_SNAPSHOT_STATE_KEY,
+                    {},
+                ),
             ),
         )
         if len(observed_snapshots) == 1:

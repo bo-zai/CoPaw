@@ -27,6 +27,14 @@ export interface OverviewStats {
   top_mcp_tools: MCPToolUsage[];
   mcp_servers: MCPServerUsage[];
   daily_trend: DailyStats[];
+  growth_stats?: {
+    callsGrowth?: number | null;
+    tokensGrowth?: number | null;
+    sessionGrowth?: number | null;
+    userGrowth?: number | null;
+    cronGrowth?: number | null;
+    planCustomersGrowth?: number | null;
+  };
   branch_breakdown: OverviewBranchBreakdown;
 }
 
@@ -60,13 +68,6 @@ export interface TaskStatusSummary {
   failed: number;
   cancelled: number;
   read_count: number;
-}
-
-export interface DepthSummary {
-  avg_rounds: number;
-  multi_round_ratio: number;
-  avg_duration_seconds: number;
-  avg_sessions_per_user: number;
 }
 
 export interface ModelUsage {
@@ -412,11 +413,17 @@ export const tracingApi = {
     startDate?: string,
     endDate?: string,
     bbkIds?: string,
+    options?: {
+      detail?: "full" | "summary";
+      timeRange?: "day" | "week" | "month" | "custom";
+    },
   ): Promise<OverviewStats> => {
     const params = new URLSearchParams();
     if (startDate) params.append("start_date", startDate);
     if (endDate) params.append("end_date", endDate);
     if (bbkIds) params.append("bbk_ids", bbkIds);
+    if (options?.detail) params.append("detail", options.detail);
+    if (options?.timeRange) params.append("time_range", options.timeRange);
     return request(`/monitor/tracing/overview?${params.toString()}`);
   },
 
@@ -717,33 +724,6 @@ export const tracingApi = {
     return request(`/monitor/tracing/channel-distribution${query}`);
   },
 
-  getGrowthStats: async (
-    startDate: string,
-    endDate: string,
-    timeRange: string = "day",
-    bbkIds?: string,
-  ): Promise<{
-    callsGrowth: number | null;
-    tokensGrowth: number | null;
-    sessionGrowth: number | null;
-    userGrowth: number | null;
-    cronGrowth: number | null;
-    // 深度指标环比
-    avgRoundsGrowth: number | null;
-    multiRoundRatioGrowth: number | null;
-    avgDurationGrowth: number | null;
-    avgSessionsPerUserGrowth: number | null;
-    // 客户点击环比
-    planCustomersGrowth: number | null;
-  }> => {
-    const params = new URLSearchParams();
-    params.append("start_date", startDate);
-    params.append("end_date", endDate);
-    params.append("time_range", timeRange);
-    if (bbkIds) params.append("bbk_ids", bbkIds);
-    return request(`/monitor/tracing/growth-stats?${params.toString()}`);
-  },
-
   getDailyTrend: async (
     startDate?: string,
     endDate?: string,
@@ -909,24 +889,6 @@ export const tracingApi = {
     }
     const query = params.toString() ? `?${params.toString()}` : "";
     return request(`/monitor/tracing/task-status/summary${query}`);
-  },
-
-  // 使用深度汇总统计
-  getDepthSummary: async (
-    filters?: {
-      start_date?: string;
-      end_date?: string;
-      bbk_ids?: string;
-    },
-  ): Promise<DepthSummary> => {
-    const params = new URLSearchParams();
-    if (filters) {
-      Object.entries(filters).forEach(([key, value]) => {
-        if (value) params.append(key, value);
-      });
-    }
-    const query = params.toString() ? `?${params.toString()}` : "";
-    return request(`/monitor/tracing/depth/summary${query}`);
   },
 
   // 报错分析汇总统计

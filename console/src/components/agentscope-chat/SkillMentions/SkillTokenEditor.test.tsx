@@ -142,6 +142,10 @@ describe("SkillTokenEditor", () => {
     const marker = screen.getByText("@信息提取");
     expect(marker).toHaveAttribute("contenteditable", "false");
     expect(marker).toHaveAttribute("data-scenario-token", "true");
+    expect(marker).toHaveStyle({
+      background: "#EEF4FF",
+      color: "#2957DC",
+    });
 
     marker.remove();
     fireEvent.input(editor);

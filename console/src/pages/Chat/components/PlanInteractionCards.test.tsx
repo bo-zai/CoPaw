@@ -2,6 +2,7 @@ import React from "react";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -233,21 +234,25 @@ function createGoalProposalMessage(): IAgentScopeRuntimeWebUIMessage<unknown> {
   return {
     id: "goal-proposal-message",
     role: "assistant",
-    cards: [{
-      code: "PlanInteraction",
-      data: {
-        card_type: "goal_proposal",
-        objective: "Ship Goal Runtime",
-        completion_criteria: [{
-          requirement: "Runtime works",
-          observable_assertion: "Goal completes",
-          verification_method: "command: pytest tests/unit/app/goals -q",
-          expected_outcome: "exit 0",
-        }],
-        constraints: { must_preserve: ["Chat"], must_not_do: [] },
-        autonomy_boundary: "No deploy",
+    cards: [
+      {
+        code: "PlanInteraction",
+        data: {
+          card_type: "goal_proposal",
+          objective: "Ship Goal Runtime",
+          completion_criteria: [
+            {
+              requirement: "Runtime works",
+              observable_assertion: "Goal completes",
+              verification_method: "command: pytest tests/unit/app/goals -q",
+              expected_outcome: "exit 0",
+            },
+          ],
+          constraints: { must_preserve: ["Chat"], must_not_do: [] },
+          autonomy_boundary: "No deploy",
+        },
       },
-    }],
+    ],
   };
 }
 
@@ -259,9 +264,13 @@ describe("Plan interaction cards", () => {
   });
 
   it("renders Goal Contract Draft in the composer and creates it only after confirmation", async () => {
-    const onConfirmGoalProposal = vi.fn().mockResolvedValue({ goal_id: "goal-1" });
+    const onConfirmGoalProposal = vi
+      .fn()
+      .mockResolvedValue({ goal_id: "goal-1" });
     const events = captureSubmitEvents();
-    renderActiveComposer([createGoalProposalMessage()], { onConfirmGoalProposal });
+    renderActiveComposer([createGoalProposalMessage()], {
+      onConfirmGoalProposal,
+    });
 
     expect(screen.getByLabelText("Goal Contract Draft")).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("整体目标"), {
@@ -269,11 +278,130 @@ describe("Plan interaction cards", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "确认并开始执行" }));
 
-    await waitFor(() => expect(onConfirmGoalProposal).toHaveBeenCalledWith(
-      expect.objectContaining({ objective: "Edited Goal" }),
-    ));
+    await waitFor(() =>
+      expect(onConfirmGoalProposal).toHaveBeenCalledWith(
+        expect.objectContaining({ objective: "Edited Goal" }),
+      ),
+    );
     await waitFor(() => expect(events.handler).toHaveBeenCalled());
     events.cleanup();
+  });
+
+  it("shows local success feedback before starting the confirmed Goal", async () => {
+    vi.useFakeTimers();
+    const onConfirmGoalProposal = vi
+      .fn()
+      .mockResolvedValue({ goal_id: "goal-1" });
+    const events = captureSubmitEvents();
+    renderActiveComposer([createGoalProposalMessage()], {
+      onConfirmGoalProposal,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "确认并开始执行" }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("Goal 已确认，正在开始执行")).toBeInTheDocument();
+    expect(events.handler).not.toHaveBeenCalled();
+
+    await act(async () => {
+      vi.advanceTimersByTime(700);
+    });
+    expect(events.handler).toHaveBeenCalled();
+    events.cleanup();
+    vi.useRealTimers();
+  });
+
+  it("shows a derived summary and starts with contract details expanded", () => {
+    renderActiveComposer([createGoalProposalMessage()], {
+      onConfirmGoalProposal: vi.fn(),
+    });
+
+    expect(screen.getByText("1 项完成条件")).toBeInTheDocument();
+    expect(screen.getByText("必须保留 1 条")).toBeInTheDocument();
+    expect(screen.getByText("禁止操作 未设置")).toBeInTheDocument();
+    expect(screen.queryByText("未确认修改")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "收起详情" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByRole("region", { name: "合同详情" })).toBeVisible();
+  });
+
+  it("formats valid criteria JSON without marking a formatting-only edit", () => {
+    renderActiveComposer([createGoalProposalMessage()], {
+      onConfirmGoalProposal: vi.fn(),
+    });
+
+    const criteria = screen.getByLabelText(
+      "完成条件（JSON）",
+    ) as HTMLTextAreaElement;
+    fireEvent.change(criteria, {
+      target: { value: JSON.stringify(JSON.parse(criteria.value)) },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "格式化 JSON" }));
+
+    expect(criteria.value).toContain('\n    "requirement"');
+    expect(screen.queryByText("未确认修改")).not.toBeInTheDocument();
+  });
+
+  it("collapses details while keeping the summary and reopens them for validation", () => {
+    renderActiveComposer([createGoalProposalMessage()], {
+      onConfirmGoalProposal: vi.fn(),
+    });
+    const toggle = screen.getByRole("button", { name: "收起详情" });
+    fireEvent.click(toggle);
+    expect(screen.getByRole("button", { name: "展开详情" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.getByText("执行摘要")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("region", { name: "合同详情" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "展开详情" }));
+    fireEvent.change(screen.getByLabelText("完成条件（JSON）"), {
+      target: { value: "{" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "确认并开始执行" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("请修正");
+    expect(screen.getByLabelText("完成条件（JSON）")).toHaveFocus();
+  });
+
+  it("focuses the first invalid constraint field", () => {
+    renderActiveComposer([createGoalProposalMessage()], {
+      onConfirmGoalProposal: vi.fn(),
+    });
+    const preserve = screen.getByLabelText("必须保留");
+    fireEvent.change(preserve, {
+      target: {
+        value: Array.from({ length: 33 }, (_, index) => `rule ${index}`).join(
+          "\n",
+        ),
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "确认并开始执行" }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent("请修正");
+    expect(preserve).toHaveFocus();
+  });
+
+  it("returns to the composer and confirms discarding local edits", () => {
+    const confirm = vi.spyOn(window, "confirm");
+    renderActiveComposer([createGoalProposalMessage()], {
+      onConfirmGoalProposal: vi.fn(),
+    });
+    fireEvent.change(screen.getByLabelText("整体目标"), {
+      target: { value: "Changed" },
+    });
+    confirm.mockReturnValueOnce(false);
+    fireEvent.click(screen.getByRole("button", { name: "返回消息编辑" }));
+    expect(screen.getByLabelText("Goal Contract Draft")).toBeInTheDocument();
+    confirm.mockReturnValueOnce(true);
+    fireEvent.click(screen.getByRole("button", { name: "返回消息编辑" }));
+    expect(screen.getByTestId("default-composer")).toBeInTheDocument();
+    confirm.mockRestore();
   });
 
   it("hides a dismissed clarification only for the current render", () => {

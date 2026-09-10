@@ -104,7 +104,9 @@ export default function ScenarioPresetSelector({
   const selectionControls = catalog?.domains.length ? (
     <>
       <div
-        className="scenario-preset-domain-selector"
+        className={`scenario-preset-domain-selector${
+          catalog.domains.length === 1 ? " is-single" : ""
+        }`}
         role="tablist"
         aria-label="能力域"
       >

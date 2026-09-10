@@ -1470,7 +1470,14 @@ export class SessionApi implements IAgentScopeRuntimeWebUISessionAPI {
       return "";
     }
 
-    const session = this.findSessionByIdentity(sessionId);
+    const session = this.sessionList.find((item) => {
+      const extended = item as ExtendedSession;
+      return (
+        extended.id === sessionId ||
+        extended.realId === sessionId ||
+        extended.sessionId === sessionId
+      );
+    }) as ExtendedSession | undefined;
     return session?.sessionId || sessionId;
   }
 
@@ -1863,6 +1870,35 @@ export class SessionApi implements IAgentScopeRuntimeWebUISessionAPI {
     } finally {
       this.sessionRequests.delete(sessionId);
     }
+  }
+
+  applyChatSnapshot(
+    sessionId: string,
+    history: unknown,
+  ): IAgentScopeRuntimeWebUIMessage[] | undefined {
+    const snapshot = history as Partial<ChatHistory> | null;
+    if (!snapshot || !Array.isArray(snapshot.messages)) {
+      return undefined;
+    }
+    const session = this.findSessionByIdentity(sessionId);
+    const messages = withArchiveBoundaries(
+      convertMessagesForSession(
+        snapshot.messages,
+        session?.meta,
+        session?.name,
+      ),
+      snapshot.archive?.boundaries,
+    ).map((message) => ({ ...message, history: true }));
+    if (session) {
+      session.messages = messages;
+      session.generating = false;
+      session.status = "idle";
+      this.patchLastUserMessage(messages, false, session.realId || session.id, [
+        session.id,
+        session.sessionId,
+      ]);
+    }
+    return messages;
   }
 
   private async getResolvedLocalTimestampSession(

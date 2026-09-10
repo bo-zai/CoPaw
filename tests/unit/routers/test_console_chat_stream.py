@@ -11,10 +11,17 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
+from swe.app.agent_context import FileManagerSourceScopeLocation
+from swe.app.answer_turn.models import (
+    StopClaim,
+    TurnIdentity,
+    TurnLease,
+    TurnStatus,
+)
 from swe.app.channels.base import ContentType, TextContent
 from swe.app.channels.console.channel import ConsoleChannel
-from swe.app.agent_context import FileManagerSourceScopeLocation
 from src.swe.app.file_manager import FileManagerService
 from src.swe.app.routers import console as console_router
 
@@ -53,24 +60,106 @@ class _FakeChatManager:
 
 
 class _FakeTaskTracker:
-    async def attach_or_start(self, _run_key, _payload, _stream_fn):
-        return object(), True
+    def __init__(self, *, status=None, is_new=True):
+        self.status_value = status
+        self.is_new = is_new
+        self.payload = None
 
-    async def attach(self, _run_key):
+    async def attach_or_start(self, identity, payload, _stream_fn, **_kwargs):
+        self.payload = payload
+        return object(), self.is_new
+
+    async def attach(self, _identity):
         return object()
 
-    async def stream_from_queue(self, _queue, _run_key):
+    async def stream(self, _identity, _queue):
         await asyncio.sleep(0.03)
         yield 'data: {"done": true}\n\n'
+
+    async def detach_subscriber(self, _identity, _queue):
+        return None
+
+
+class _FakeCoordinator:
+    def __init__(self, tracker):
+        self.tracker = tracker
+        self.identity = TurnIdentity(
+            chat_id="chat:session-1",
+            msgid="msg-1",
+            turn_id="turn-1",
+        )
+
+    async def start_or_attach(self, chat_id, payload, producer, **kwargs):
+        if getattr(self.tracker, "is_new", True):
+            msgid = kwargs.get("msgid") or self.identity.msgid
+            self.identity = TurnIdentity(
+                chat_id=chat_id,
+                msgid=msgid,
+                turn_id="turn-1",
+            )
+        queue, is_new = await self.tracker.attach_or_start(
+            self.identity,
+            payload,
+            producer,
+        )
+        return TurnLease(self.identity, queue, is_new)
+
+    async def status(self, _chat_id):
+        return getattr(self.tracker, "status_value", None)
+
+    async def attach(self, chat_id, *, msgid=None):
+        if msgid is not None and msgid != self.identity.msgid:
+            return None
+        queue = await self.tracker.attach(self.identity)
+        return TurnLease(self.identity, queue, False) if queue else None
+
+    async def current_identity(self, _chat_id):
+        return self.identity
+
+    async def claim_stop(self, identity, *, msgid=None, internal=False):
+        _ = internal
+        return StopClaim(
+            True,
+            identity=identity,
+            status=TurnStatus.STOPPING,
+        )
 
 
 class _TaskStartCountingTracker:
     def __init__(self) -> None:
         self.start_calls = 0
 
-    async def attach_or_start(self, _run_key, _payload, _stream_fn):
+    async def attach_or_start(
+        self,
+        _identity,
+        _payload,
+        _stream_fn,
+        **_kwargs,
+    ):
         self.start_calls += 1
         return object(), True
+
+    async def stream(self, _identity, _queue):
+        yield 'data: {"done": true}\n\n'
+
+    async def detach_subscriber(self, _identity, _queue):
+        return None
+
+
+def test_build_console_chat_meta_carries_agent_and_source() -> None:
+    payload = {"meta": {"source_id": "source-a"}}
+    workspace = SimpleNamespace(agent_id="agent-1")
+
+    assert console_router._build_console_chat_meta(workspace, payload) == {
+        "agent_id": "agent-1",
+        "source_id": "source-a",
+    }
+
+
+def _with_coordinator(workspace, tracker):
+    workspace.task_tracker = tracker
+    workspace.answer_turn_coordinator = _FakeCoordinator(tracker)
+    return workspace
 
 
 def _build_authenticated_console_chat_client(
@@ -95,6 +184,7 @@ def _build_authenticated_console_chat_client(
         channel_manager=_FakeChannelManager(),
         chat_manager=_FakeChatManager(),
         task_tracker=tracker,
+        answer_turn_coordinator=_FakeCoordinator(tracker),
     )
 
     async def _fake_get_agent_for_request(_request):
@@ -179,9 +269,21 @@ async def test_start_new_chat_propagates_created_chat_id_to_compaction_sse():
     class _TaskTracker:
         payload = None
 
-        async def attach_or_start(self, _run_key, payload, _stream_fn):
+        async def attach_or_start(
+            self,
+            _identity,
+            payload,
+            _stream_fn,
+            **_kwargs,
+        ):
             self.payload = payload
             return object(), True
+
+        async def attach(self, _identity):
+            return None
+
+        async def stream(self, _identity, _queue):
+            yield 'data: {"done": true}\n\n'
 
     async def process(_request):
         yield SimpleNamespace(
@@ -206,6 +308,7 @@ async def test_start_new_chat_propagates_created_chat_id_to_compaction_sse():
     workspace = SimpleNamespace(
         agent_id="agent-1",
         chat_manager=_ChatManager(),
+        answer_turn_coordinator=_FakeCoordinator(tracker),
     )
     native_payload = {
         "sender_id": "user-1",
@@ -234,6 +337,54 @@ async def test_start_new_chat_propagates_created_chat_id_to_compaction_sse():
 
 
 @pytest.mark.asyncio
+async def test_start_new_chat_rejects_submission_while_chat_is_stopping():
+    class _ChatManager:
+        async def get_or_create_chat(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                id="chat-stopping",
+                channel="console",
+                meta={},
+            )
+
+    class _TaskTracker:
+        start_calls = 0
+        status_value = "stopping"
+
+        async def attach_or_start(self, *_args, **_kwargs):
+            self.start_calls += 1
+            return object(), True
+
+        async def attach(self, _identity):
+            return None
+
+    tracker = _TaskTracker()
+    workspace = SimpleNamespace(
+        agent_id="agent-1",
+        chat_manager=_ChatManager(),
+        answer_turn_coordinator=_FakeCoordinator(tracker),
+    )
+    payload = {
+        "sender_id": "user-1",
+        "channel_id": "console",
+        "content_parts": [TextContent(type=ContentType.TEXT, text="hello")],
+        "meta": {"session_id": "session-1"},
+    }
+
+    with pytest.raises(console_router.HTTPException) as error:
+        await console_router._start_new_chat(
+            workspace,
+            tracker,
+            _FakeConsoleChannel(),
+            "session-1",
+            payload,
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail == "Chat is stopping"
+    assert tracker.start_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_start_new_chat_persists_first_submit_scenario_snapshot(
     monkeypatch,
 ):
@@ -256,9 +407,21 @@ async def test_start_new_chat_persists_first_submit_scenario_snapshot(
     class _TaskTracker:
         payload = None
 
-        async def attach_or_start(self, _run_key, payload, _stream_fn):
+        async def attach_or_start(
+            self,
+            _identity,
+            payload,
+            _stream_fn,
+            **_kwargs,
+        ):
             self.payload = payload
             return object(), True
+
+        async def attach(self, _identity):
+            return None
+
+        async def stream(self, _identity, _queue):
+            yield 'data: {"done": true}\n\n'
 
     snapshot = {
         "scenario_id": "scenario-a",
@@ -286,7 +449,11 @@ async def test_start_new_chat_persists_first_submit_scenario_snapshot(
     monkeypatch.setattr(scenario_router, "get_service", _get_service)
     tracker = _TaskTracker()
     chat_manager = _ChatManager()
-    workspace = SimpleNamespace(agent_id="agent-1", chat_manager=chat_manager)
+    workspace = SimpleNamespace(
+        agent_id="agent-1",
+        chat_manager=chat_manager,
+        answer_turn_coordinator=_FakeCoordinator(tracker),
+    )
     native_payload = {
         "sender_id": "user-1",
         "channel_id": "console",
@@ -356,6 +523,9 @@ async def test_start_new_chat_cleans_created_scenario_when_tracker_fails(
         async def attach_or_start(self, *_args):
             raise RuntimeError("tracker unavailable")
 
+        async def attach(self, _identity):
+            return None
+
     chat_manager = _ChatManager()
     native_payload = {
         "sender_id": "user-1",
@@ -370,7 +540,11 @@ async def test_start_new_chat_cleans_created_scenario_when_tracker_fails(
 
     with pytest.raises(RuntimeError, match="tracker unavailable"):
         await console_router._start_new_chat(
-            SimpleNamespace(agent_id="agent-1", chat_manager=chat_manager),
+            SimpleNamespace(
+                agent_id="agent-1",
+                chat_manager=chat_manager,
+                answer_turn_coordinator=_FakeCoordinator(_TaskTracker()),
+            ),
             _TaskTracker(),
             SimpleNamespace(stream_one=None),
             "session-1",
@@ -1179,6 +1353,33 @@ def test_console_upload_uses_workspace_copy_for_context_reference(
     }
 
 
+def test_console_upload_uses_bounded_filesystem_worker(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    media_dir = tmp_path / "media"
+    client = _build_upload_client(monkeypatch, media_dir)
+    calls = []
+
+    async def _run_worker(function, *args, **kwargs):
+        calls.append(function)
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(
+        console_router,
+        "run_file_manager_mutation",
+        _run_worker,
+    )
+
+    response = client.post(
+        "/console/upload",
+        files={"file": ("report.pdf", b"content", "application/pdf")},
+    )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+
+
 def test_console_chat_stream_emits_keepalive_and_disables_proxy_buffering(
     monkeypatch,
 ) -> None:
@@ -1189,6 +1390,9 @@ def test_console_chat_stream_emits_keepalive_and_disables_proxy_buffering(
         channel_manager=_FakeChannelManager(),
         chat_manager=_FakeChatManager(),
         task_tracker=_FakeTaskTracker(),
+    )
+    workspace.answer_turn_coordinator = _FakeCoordinator(
+        workspace.task_tracker,
     )
 
     async def _fake_get_agent_for_request(_request):
@@ -1244,7 +1448,121 @@ def test_console_chat_stream_emits_keepalive_and_disables_proxy_buffering(
             )
 
 
-def test_console_chat_copies_b3_trace_id_to_native_meta(monkeypatch) -> None:
+def test_console_chat_stream_exposes_server_turn_identity(monkeypatch) -> None:
+    app = FastAPI()
+    app.include_router(console_router.router)
+
+    class _IdentityTracker(_FakeTaskTracker):
+        async def attach_or_start(
+            self,
+            _run_key,
+            _payload,
+            _stream_fn,
+            *,
+            msgid=None,
+            **_kwargs,
+        ):
+            return object(), True
+
+    workspace = SimpleNamespace(
+        channel_manager=_FakeChannelManager(),
+        chat_manager=_FakeChatManager(),
+        task_tracker=_IdentityTracker(),
+    )
+    workspace.answer_turn_coordinator = _FakeCoordinator(
+        workspace.task_tracker,
+    )
+
+    async def _fake_get_agent_for_request(_request):
+        return workspace
+
+    monkeypatch.setattr(
+        console_router,
+        "get_agent_for_request",
+        _fake_get_agent_for_request,
+    )
+
+    response = TestClient(app).post(
+        "/console/chat",
+        headers={"X-Source-Id": "src-a"},
+        json={
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hi"}],
+                },
+            ],
+            "session_id": "session-1",
+            "user_id": "user-1",
+            "channel": "console",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-swe-chatid"] == "chat:session-1"
+    assert response.headers["x-swe-msgid"]
+    assert response.headers["x-swe-sessionid"] == "session-1"
+
+
+def test_console_chat_stream_reuses_the_active_turn_identity(
+    monkeypatch,
+) -> None:
+    app = FastAPI()
+    app.include_router(console_router.router)
+
+    class _AttachedRunTracker(_FakeTaskTracker):
+        async def attach_or_start(
+            self,
+            _run_key,
+            _payload,
+            _stream_fn,
+            *,
+            msgid=None,
+            **_kwargs,
+        ):
+            return object(), False
+
+        async def get_run_identity(self, run_key: str):
+            assert run_key == "chat:session-1"
+            return run_key, "server-turn-1"
+
+    workspace = SimpleNamespace(
+        channel_manager=_FakeChannelManager(),
+        chat_manager=_FakeChatManager(),
+        task_tracker=_AttachedRunTracker(is_new=False),
+    )
+    workspace.answer_turn_coordinator = _FakeCoordinator(
+        workspace.task_tracker,
+    )
+    workspace.answer_turn_coordinator.identity = TurnIdentity(
+        chat_id="chat:session-1",
+        msgid="server-turn-1",
+        turn_id="turn-1",
+    )
+
+    async def _fake_get_agent_for_request(_request):
+        return workspace
+
+    monkeypatch.setattr(
+        console_router,
+        "get_agent_for_request",
+        _fake_get_agent_for_request,
+    )
+
+    response = TestClient(app).post(
+        "/console/chat",
+        headers={"X-Source-Id": "src-a"},
+        json=_console_chat_payload("user-1"),
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-swe-chatid"] == "chat:session-1"
+    assert response.headers["x-swe-msgid"] == "server-turn-1"
+
+
+def test_console_chat_copies_complete_b3_context_to_native_meta(
+    monkeypatch,
+) -> None:
     app = FastAPI()
     app.include_router(console_router.router)
 
@@ -1252,11 +1570,20 @@ def test_console_chat_copies_b3_trace_id_to_native_meta(monkeypatch) -> None:
         def __init__(self) -> None:
             self.payload = None
 
-        async def attach_or_start(self, _run_key, payload, _stream_fn):
+        async def attach_or_start(
+            self,
+            _identity,
+            payload,
+            _stream_fn,
+            **_kwargs,
+        ):
             self.payload = payload
             return object(), True
 
-        async def stream_from_queue(self, _queue, _run_key):
+        async def attach(self, _identity):
+            return None
+
+        async def stream(self, _identity, _queue):
             yield 'data: {"done": true}\n\n'
 
     tracker = _CapturingTaskTracker()
@@ -1265,6 +1592,7 @@ def test_console_chat_copies_b3_trace_id_to_native_meta(monkeypatch) -> None:
         chat_manager=_FakeChatManager(),
         task_tracker=tracker,
     )
+    workspace.answer_turn_coordinator = _FakeCoordinator(tracker)
 
     async def _fake_get_agent_for_request(_request):
         return workspace
@@ -1291,6 +1619,8 @@ def test_console_chat_copies_b3_trace_id_to_native_meta(monkeypatch) -> None:
         headers={
             "X-Source-Id": "src-a",
             "X-B3-Traceid": "8267fd70bacf497704fec30eaa353979",
+            "X-B3-Spanid": "32befd146889a61a",
+            "X-B3-Sampled": "1",
         },
         json=payload,
     ) as response:
@@ -1301,6 +1631,30 @@ def test_console_chat_copies_b3_trace_id_to_native_meta(monkeypatch) -> None:
     assert tracker.payload["meta"]["b3_trace_id"] == (
         "8267fd70bacf497704fec30eaa353979"
     )
+    assert tracker.payload["meta"]["b3_context"] == {
+        "X-B3-Traceid": "8267fd70bacf497704fec30eaa353979",
+        "X-B3-Spanid": "32befd146889a61a",
+        "X-B3-Sampled": "1",
+    }
+
+
+def test_console_chat_rejects_partial_b3_context() -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/console/chat",
+            "headers": [
+                (b"x-source-id", b"src-a"),
+                (b"x-b3-traceid", b"8267fd70bacf497704fec30eaa353979"),
+            ],
+        },
+    )
+
+    with pytest.raises(console_router.HTTPException) as exc_info:
+        console_router._inject_request_metadata(request, {"meta": {}})
+
+    assert exc_info.value.status_code == 400
 
 
 def test_console_chat_copies_structured_context_references_to_native_meta(
@@ -1313,11 +1667,20 @@ def test_console_chat_copies_structured_context_references_to_native_meta(
         def __init__(self) -> None:
             self.payload = None
 
-        async def attach_or_start(self, _run_key, payload, _stream_fn):
+        async def attach_or_start(
+            self,
+            _identity,
+            payload,
+            _stream_fn,
+            **_kwargs,
+        ):
             self.payload = payload
             return object(), True
 
-        async def stream_from_queue(self, _queue, _run_key):
+        async def attach(self, _identity):
+            return None
+
+        async def stream(self, _identity, _queue):
             yield 'data: {"done": true}\n\n'
 
     tracker = _CapturingTaskTracker()
@@ -1326,6 +1689,7 @@ def test_console_chat_copies_structured_context_references_to_native_meta(
         chat_manager=_FakeChatManager(),
         task_tracker=tracker,
     )
+    workspace.answer_turn_coordinator = _FakeCoordinator(tracker)
 
     async def _fake_get_agent_for_request(_request):
         return workspace
@@ -1379,11 +1743,20 @@ def test_console_chat_adds_uploaded_attachment_as_workspace_reference(
         def __init__(self) -> None:
             self.payload = None
 
-        async def attach_or_start(self, _run_key, payload, _stream_fn):
+        async def attach_or_start(
+            self,
+            _identity,
+            payload,
+            _stream_fn,
+            **_kwargs,
+        ):
             self.payload = payload
             return object(), True
 
-        async def stream_from_queue(self, _queue, _run_key):
+        async def attach(self, _identity):
+            return None
+
+        async def stream(self, _identity, _queue):
             yield 'data: {"done": true}\n\n'
 
     media_dir = tmp_path / "media"
@@ -1405,6 +1778,7 @@ def test_console_chat_adds_uploaded_attachment_as_workspace_reference(
         task_tracker=tracker,
         workspace_dir=tmp_path,
     )
+    workspace.answer_turn_coordinator = _FakeCoordinator(tracker)
 
     async def _fake_get_agent_for_request(_request):
         return workspace

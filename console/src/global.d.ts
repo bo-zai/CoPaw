@@ -15,6 +15,7 @@ declare global {
       systemSect?: string;
       responseFeedbackUserWhitelist?: string[];
       voiceRecorderUserWhitelist?: string[];
+      directAccessUserWhitelist?: string[];
       chatSessionPageSize?: number | string;
     };
     __postMsgSwe__?: string;

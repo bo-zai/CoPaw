@@ -32,7 +32,7 @@ kubectl wait --for=condition=complete job/swe-session-nas-lock-verification --ti
 - 重点看 `PROTECTED_RUNTIME_ENV_KEYS`、`_scrub_user_tool_subprocess_env()` 和 `preserve_boundary_env_keys`
 - Python runtime guard 注入：[src/swe/security/python_runtime_path_guard.py](../../src/swe/security/python_runtime_path_guard.py)
 - 重点看 `prepare_python_runtime_path_guard_env()`、trusted paths 和 trusted entrypoint roots
-- 包导入期 env 加载：[src/swe/__init__.py](../../src/swe/__init__.py)、[src/swe/envs/store.py](../../src/swe/envs/store.py)
+- 包导入期 env 加载：[src/swe/**init**.py](../../src/swe/__init__.py)、[src/swe/envs/store.py](../../src/swe/envs/store.py)
 - CLI 根命令读取 last API：[src/swe/cli/main.py](../../src/swe/cli/main.py)、[src/swe/config/utils.py](../../src/swe/config/utils.py)
 - 回归测试：[tests/unit/test_shell_tenant_boundary.py](../../tests/unit/test_shell_tenant_boundary.py)
 
@@ -119,7 +119,7 @@ kubectl wait --for=condition=complete job/swe-session-nas-lock-verification --ti
 - Agent 运行配置默认值：[src/swe/config/config.py](/Users/shixiangyi/code/Swe/src/swe/config/config.py)
 - source 覆盖合成：[src/swe/app/source_system_config/runtime.py](/Users/shixiangyi/code/Swe/src/swe/app/source_system_config/runtime.py)
 - 历史 tool_result 压缩 hook：[src/swe/agents/hooks/memory_compaction.py](/Users/shixiangyi/code/Swe/src/swe/agents/hooks/memory_compaction.py)
-- MCP 工具返回转换：[src/swe/app/mcp/__init__.py](/Users/shixiangyi/code/Swe/src/swe/app/mcp/__init__.py)
+- MCP 工具返回转换：[src/swe/app/mcp/**init**.py](/Users/shixiangyi/code/Swe/src/swe/app/mcp/__init__.py)
 - 详细经验：[analysis/playbook/tool-result-truncation.md](tool-result-truncation.md)
 
 ## Tenant bootstrap / default workspace scaffold
@@ -161,5 +161,32 @@ kubectl wait --for=condition=complete job/swe-session-nas-lock-verification --ti
 - 外部调度回调入口：[src/swe/app/routers/internal.py](../../src/swe/app/routers/internal.py)，重点看 `/api/internal/cron/callback` 如何解析 `task_type`、`tenant_id`、`source_id` 和 `job_id`
 - Cron job 定义仓库：[src/swe/app/crons/repo/json_repo.py](../../src/swe/app/crons/repo/json_repo.py)，重点看 `JsonJobRepository.load()` / `save()` 是否通过 `asyncio.to_thread()` 包住文件读写、JSON 编解码和 pydantic 校验，`get_job()` 是否命中 mtime/size 快照索引
 - Dream 系统任务：[src/swe/app/crons/manager.py](../../src/swe/app/crons/manager.py)，重点看 `_load_dream_logs()` 与 `run_dream_archive_maintenance()` 是否仍通过 worker thread 执行，避免 dream 日志读取和归档维护放大普通 cron lag
+- Dream 孤立文件候选与删除边界：[src/swe/app/routers/dream_logs.py](../../src/swe/app/routers/dream_logs.py)，重点看 `_scan_orphan_files()` 是否跳过隐藏目录，以及根目录 `dialog` 是否通过 `KEEP_DIRS` 与通用路径解析保持为保留目录
 - Workspace 冷启动：[src/swe/app/multi_agent_manager.py](../../src/swe/app/multi_agent_manager.py)，重点看 `MultiAgentManager.get_agent()` 是否只在全局锁内访问 `agents` / `_agent_start_tasks`，不同 cache key 的配置加载、`Workspace` 构造和 `start()` 不应互相阻塞
 - 首轮验证：优先跑 `venv/bin/python -m pytest tests/unit/app/test_cron_json_repo.py tests/unit/app/test_cron_dream_nonblocking.py tests/unit/app/test_multi_agent_manager_concurrency.py -q`
+
+## 批调度 Agent 已成功但 intent 仍为 dispatched
+
+- SWE `/api/scheduler/cron/execution` 回执仅完成身份校验和执行记录持久化；Scheduler 在调度循环中读取 `swe_cron_executions.status` 和 Monitor 写入的 `async_status`，双成功才结束 intent。
+- 扫描与名额入口：[scheduler/src/scheduler/app/services/cron/scheduling_service.py](../../scheduler/src/scheduler/app/services/cron/scheduling_service.py)，`dispatch_ready_once()` 必须在容量门槛前汇总结果、回收超时。
+- 结果关联及回收：[scheduler/src/scheduler/app/services/cron/dispatch_intent_service.py](../../scheduler/src/scheduler/app/services/cron/dispatch_intent_service.py)，检查 `reconcile_dispatched_executions()` 是否匹配 intent、batch、当前 attempt、job、tenant；不要仅按 job_id 查最新记录。
+- `async_status` 为空时继续占用名额。Agent 执行和子任务等待共用现有派发超时预算；主成功但子结果缺失的回收错误为“获取子任务状态超时”。
+- 先确认 Scheduler 与 Monitor 访问同一执行表，且 Monitor 原有子任务同步/聚合正常运行；沿用 Monitor 的无子任务成功规则，不应把这一行为误诊为 Scheduler 提前完成。
+- 首轮验证：`$env:PYTHONPATH='scheduler/src'; .\.venv\Scripts\python.exe -m pytest tests/unit/scheduler -q`。
+
+## 定时任务详情分行维度 Excel 导出
+
+- 页面与按钮入口：`console/src/pages/Analytics/CronJobOverview/index.tsx`。前端传入当前日期、分行及排序，不再克隆 DOM 或使用 ExcelJS 生成文件。
+- API：`GET /api/monitor/cron/export-branch-dimension`，`start_date/end_date` 必填且包含起止日；`bbk_ids` 可选；`sort_by/sort_order` 成对提供，排序指标使用白名单。
+- 后端路由：`monitor/src/monitor/app/routers/cron_branch_export.py`；复用 `QueryService.get_branch_behavior` 查询全量数据，由 `monitor/src/monitor/app/services/cron/branch_export.py` 生成原始 XLSX 二进制，前端读取 blob 下载。
+- 保留 22 列、两层合并表头；计数千分位、比例两位小数，同值稳定排序，序号排序后从 1 开始。洞察/电访用户比例继续以 plan_managers 为分母。分行名强制文本避免公式解析；空数据返回合法表头工作簿。
+- 用户于 2026-09-09 明确本次只需沿用现有查询过滤：使用 X-Source-Id（缺省 default）及 bbk_ids；未新增身份鉴权或分行权限机制。
+- 加载中、无数据或导出中禁用按钮；失败提示并允许重试。参数或导出失败使用非 200 中文 detail JSON，成功为 Excel MIME 和 Content-Disposition 附件。
+- 验证：Monitor 项目虚拟环境运行 `venv/Scripts/python.exe -m pytest tests/test_branch_export.py tests/test_branch_export_api.py tests/test_export_service.py tests/test_export_integration.py -q`；前端验证入口为 `console/src/api/modules/monitor.branchExport.test.ts` 和 `console/src/pages/Analytics/CronJobOverview/branchExport.test.tsx`。
+
+## 我的任务自动预览文件选择
+
+- 报告提取入口：`console/src/components/agentscope-chat/autoPreviewSelection.ts`，由任务结果卡片和页面预览共用。原始消息按从旧到新排列，选择最后一条含报告的消息及其中最后一个符合原有自动预览条件的文件；包括带 `auto-preview` 标记的 HTML，以及文件卡片中带 `resultId`、`templateId` 的动态报告，不解析文件名时间戳。同次执行优先取最终结果，没有匹配才取步骤结果。
+- 页面入口：`ChatAutoPreviewHtmlProvider.tsx` 在会话加载完成后确定目标 URL；其他消息仍在生成时，已经出现的最新报告仍可自动预览。`AutoPreviewHtmlContext.tsx` 只接受该目标的文件卡片，120ms 防抖后打开一次。URL 比较沿用聊天媒体地址转换，父组件回调变化不能重置已经消费的预览机会。
+- 排错注意：`MessageList` 会倒序挂载消息，不能用组件注册先后判断报告新旧。历史执行默认折叠规则在 `console/src/pages/Chat/sessionApi/index.ts`；最新执行没有报告时，不应回退到折叠的旧执行。加载期间不应消耗 5 秒候选等待窗口。
+- 回归验证：在 `console/` 运行 `npm run test:run -- src/components/agentscope-chat/ChatAutoPreviewHtmlProvider.test.tsx src/components/agentscope-chat/autoPreviewSelection.test.ts src/pages/Chat/components/TaskRunGroupCard/index.test.tsx src/components/agentscope-chat/DownloadFileCard/index.test.tsx`。

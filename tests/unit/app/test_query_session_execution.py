@@ -5,66 +5,17 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-import sys
-from dataclasses import dataclass
-from enum import Enum
 from types import SimpleNamespace
-from types import ModuleType
 from typing import Any, AsyncIterator
 from unittest.mock import AsyncMock
 
 import pytest
 from agentscope.message import Msg
 
-
-class _NoopSpan:
-    async def __aenter__(self) -> "_NoopSpan":
-        return self
-
-    async def __aexit__(self, *_args: Any) -> None:
-        return None
-
-    def set_attribute(self, _key: str, _value: Any) -> None:
-        return None
-
-
-class _NoopTracer:
-    def start_as_current_span(self, *_args: Any, **_kwargs: Any) -> _NoopSpan:
-        return _NoopSpan()
-
-
-class _SpanKind(str, Enum):
-    SERVER = "SERVER"
-    INTERNAL = "INTERNAL"
-    CLIENT = "CLIENT"
-
-
-@dataclass(frozen=True)
-class _TraceFields:
-    task_id: str
-    user_id: str
-    session_id: str
-    agent_id: str
-    agent_version: str
-
-
-def _noop_trace_decorator(**_kwargs: Any):
-    def decorate(function: Any) -> Any:
-        return function
-
-    return decorate
-
-
-_TRACE_SDK_STUB = ModuleType("swe.tracing.agent_trace_sdk")
-_TRACE_SDK_STUB.global_tracer = _NoopTracer()
-_TRACE_SDK_STUB.SpanKind = _SpanKind
-_TRACE_SDK_STUB.TraceFields = _TraceFields
-_TRACE_SDK_STUB.chat_traced = _noop_trace_decorator
-_TRACE_SDK_STUB.execute_tool_traced = _noop_trace_decorator
-sys.modules.setdefault("swe.tracing.agent_trace_sdk", _TRACE_SDK_STUB)
-
 from swe.app.runner.query_attempt import stream_query_after_preflight
 from swe.app.runner.query_contracts import _QueryPreflight
+from swe.app.answer_turn.models import TurnIdentity, TurnStatus
+from swe.app.runner.runner import AgentRunner
 
 
 class _RecordingExecution:
@@ -117,6 +68,15 @@ class _RecordingSession:
         finally:
             self.in_execution = False
             self.active_execution = None
+
+
+class _RecordingCoordinator:
+    def __init__(self) -> None:
+        self.outcomes: list[Any] = []
+
+    async def settle(self, outcome: Any) -> bool:
+        self.outcomes.append(outcome)
+        return True
 
 
 class _SnapshotAgent:
@@ -328,6 +288,41 @@ async def test_retry_uses_one_transaction_and_writes_only_final_state() -> (
 
 
 @pytest.mark.asyncio
+async def test_runner_reports_one_completed_outcome_with_coordinator_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = _RecordingCoordinator()
+    identity = TurnIdentity.create(chat_id="chat-1", msgid="msg-1")
+    runner = AgentRunner(
+        agent_id="test-agent",
+        answer_turn_coordinator=coordinator,
+    )
+    runner._query_execution = None
+
+    async def stream_entry(*_args: Any, **_kwargs: Any):
+        yield Msg(name="Friday", role="assistant", content="answer"), True
+
+    monkeypatch.setattr(runner, "_stream_query_entry", stream_entry)
+    request = SimpleNamespace(
+        session_id="session-1",
+        user_id="user-1",
+        execution_origin="scheduled",
+        channel_meta={"answer_turn_identity": identity},
+    )
+
+    events = [
+        event async for event in runner.query_handler([], request=request)
+    ]
+
+    assert len(events) == 1
+    assert request.channel_meta["turn_id"] == identity.turn_id
+    assert [outcome.status for outcome in coordinator.outcomes] == [
+        TurnStatus.COMPLETED,
+    ]
+    assert coordinator.outcomes[0].identity is identity
+
+
+@pytest.mark.asyncio
 async def test_scheduled_query_uses_one_third_of_existing_job_timeout_for_lock() -> (
     None
 ):
@@ -479,6 +474,293 @@ async def test_admission_command_and_denial_cleanup_run_in_one_session_transacti
 
     assert session.execution_entries == 2
     assert events == ["command", "denial cleanup"]
+
+
+@pytest.mark.asyncio
+async def test_admission_persists_user_anchor_before_preflight_and_agent_start(
+    monkeypatch,
+) -> None:
+    from swe.app.runner.query_execution import admission
+
+    session = _RecordingSession()
+    events: list[str] = []
+
+    class Owner:
+        def __init__(self) -> None:
+            self.session = session
+
+        async def _prepare_query_preflight(self, **_kwargs: Any):
+            events.append("preflight")
+            assert session.active_execution is not None
+            assert (
+                session.active_execution.state["turn_states"]["msg-1"][
+                    "status"
+                ]
+                == "admitted"
+            )
+            return _QueryPreflight(
+                response=Msg(
+                    name="Friday",
+                    role="assistant",
+                    content="blocked",
+                ),
+                cleanup_denied_memory=True,
+            )
+
+        async def _cleanup_denied_session_memory(self, **_kwargs: Any) -> None:
+            events.append("cleanup")
+
+    msg = Msg(name="user-1", role="user", content="hello")
+    msg.id = "msg-1"
+    request = SimpleNamespace(
+        session_id="session-1",
+        user_id="user-1",
+        channel_meta={"msgid": "msg-1"},
+    )
+    async for _item in admission.stream_admission(
+        Owner(),
+        [msg],
+        request=request,
+        query="hello",
+        session_id="session-1",
+        user_id="user-1",
+    ):
+        pass
+
+    assert events == ["preflight", "cleanup"]
+    assert session.commit_count == 1
+    assert (
+        session.committed_states[0]["turn_states"]["msg-1"]["message"][
+            "content"
+        ]
+        == "hello"
+    )
+
+
+@pytest.mark.asyncio
+async def test_admission_does_not_persist_control_command_as_user_turn(
+    monkeypatch,
+) -> None:
+    from swe.app.runner.query_execution import admission
+
+    session = _RecordingSession()
+
+    class Owner:
+        def __init__(self) -> None:
+            self.session = session
+
+        async def _prepare_query_preflight(self, **_kwargs: Any):
+            return _QueryPreflight()
+
+        async def _start_query_trace(self, *_args: Any) -> None:
+            return None
+
+        async def _end_trace_if_needed(self, *_args: Any) -> None:
+            return None
+
+    async def command_path(*_args: Any, **_kwargs: Any):
+        yield Msg(name="Friday", role="assistant", content="done"), True
+
+    monkeypatch.setattr(admission, "run_command_path", command_path)
+    command = Msg(name="user-1", role="user", content="/new")
+    command.id = "command-msg-1"
+    request = SimpleNamespace(
+        session_id="session-1",
+        user_id="user-1",
+        channel_meta={"msgid": "command-msg-1"},
+    )
+
+    async for _item in admission.stream_admission(
+        Owner(),
+        [command],
+        request=request,
+        query="/new",
+        session_id="session-1",
+        user_id="user-1",
+    ):
+        pass
+
+    assert session.commit_count == 0
+    assert session.active_execution is None
+
+
+def test_admitted_user_anchor_is_removed_from_loaded_agent_memory_before_reply() -> (
+    None
+):
+    from swe.app.runner.session_lifecycle import discard_admitted_user_anchor
+
+    anchor = Msg(name="user-1", role="user", content="hello")
+    anchor.id = "msg-1"
+    earlier = Msg(name="Friday", role="assistant", content="previous")
+    memory = SimpleNamespace(content=[(earlier, []), (anchor, [])])
+    agent = SimpleNamespace(memory=memory)
+
+    assert discard_admitted_user_anchor(agent, "msg-1") is True
+    assert memory.content == [(earlier, [])]
+
+
+def test_mark_stopped_turn_state_marks_last_displayable_assistant_message() -> (
+    None
+):
+    from swe.app.runner.session_lifecycle import mark_stopped_turn_state
+
+    state: dict[str, Any] = {
+        "agent": {
+            "memory": {
+                "content": [
+                    [
+                        {
+                            "id": "user-1",
+                            "role": "user",
+                            "content": "hello",
+                        },
+                        [],
+                    ],
+                    [
+                        {
+                            "id": "assistant-1",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "partial"}],
+                        },
+                        [],
+                    ],
+                ],
+            },
+        },
+    }
+
+    mark_stopped_turn_state(state, "user-1")
+
+    assert state["turn_states"]["user-1"]["status"] == "stopped"
+    assert (
+        state["agent"]["memory"]["content"][1][0]["metadata"]["turn_status"]
+        == "stopped"
+    )
+
+
+def test_mark_terminal_turn_state_records_public_terminal_outcome() -> None:
+    from swe.app.runner.session_lifecycle import mark_terminal_turn_state
+
+    state: dict[str, Any] = {
+        "turn_states": {
+            "turn-1": {"status": "admitted", "chat_id": "chat-1"},
+        },
+    }
+
+    mark_terminal_turn_state(state, "turn-1", "completed")
+
+    assert state["turn_states"]["turn-1"] == {
+        "status": "completed",
+        "chat_id": "chat-1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_runner_persists_completed_turn_outcome_after_execution() -> (
+    None
+):
+    from swe.app.answer_turn.models import TurnIdentity, TurnOutcome
+
+    class _Session:
+        def __init__(self) -> None:
+            self.state = {
+                "turn_states": {
+                    "msg-1": {"status": "admitted", "chat_id": "chat-1"},
+                },
+            }
+
+        async def mutate_session_state(
+            self,
+            session_id: str,
+            mutator,
+            *,
+            user_id: str,
+        ) -> dict:
+            assert (session_id, user_id) == ("session-1", "user-1")
+            self.state = mutator(self.state)
+            return self.state
+
+    identity = TurnIdentity("chat-1", "msg-1", "turn-1")
+    runner = object.__new__(AgentRunner)
+    runner.session = _Session()
+    runner._answer_turn_runtimes = {
+        identity: (
+            SimpleNamespace(session_id="session-1", user_id="user-1"),
+            None,
+        ),
+    }
+
+    await runner.persist_outcome(TurnOutcome.completed(identity))
+
+    assert (
+        runner.session.state["turn_states"]["msg-1"]["status"] == "completed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_persists_stopped_outcome_through_active_execution() -> (
+    None
+):
+    from swe.app.answer_turn.models import TurnIdentity, TurnOutcome
+
+    class _Execution:
+        is_active = True
+
+        def __init__(self) -> None:
+            self.state = {
+                "turn_states": {
+                    "msg-1": {"status": "stopping", "chat_id": "chat-1"},
+                },
+            }
+            self.commit_calls = 0
+
+        async def commit_state(self, state: dict[str, Any]) -> None:
+            self.commit_calls += 1
+            assert state is self.state
+
+    class _Session:
+        async def mutate_session_state(
+            self,
+            *_args: Any,
+            **_kwargs: Any,
+        ) -> None:
+            raise AssertionError(
+                "active execution must not use short-lock mutation",
+            )
+
+    identity = TurnIdentity("chat-1", "msg-1", "turn-1")
+    execution = _Execution()
+    runner = object.__new__(AgentRunner)
+    runner.session = _Session()
+    runner._answer_turn_runtimes = {
+        identity: (
+            SimpleNamespace(
+                session_id="session-1",
+                user_id="user-1",
+                agent=SimpleNamespace(memory=SimpleNamespace(content=[])),
+            ),
+            execution,
+        ),
+    }
+
+    await runner.persist_outcome(TurnOutcome.cancelled(identity))
+
+    assert execution.commit_calls == 1
+    assert execution.state["turn_states"]["msg-1"]["status"] == "stopped"
+
+
+def test_mark_stopped_agent_memory_marks_last_assistant_message() -> None:
+    from swe.app.runner.session_lifecycle import mark_stopped_agent_memory
+
+    anchor = Msg(name="user-1", role="user", content="hello")
+    anchor.id = "msg-1"
+    assistant = Msg(name="Friday", role="assistant", content="partial")
+    agent = SimpleNamespace(
+        memory=SimpleNamespace(content=[(anchor, []), (assistant, [])]),
+    )
+
+    assert mark_stopped_agent_memory(agent, "msg-1") is True
+    assert assistant.metadata["turn_status"] == "stopped"
 
 
 @pytest.mark.asyncio

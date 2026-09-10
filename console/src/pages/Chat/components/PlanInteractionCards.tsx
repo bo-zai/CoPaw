@@ -1,5 +1,14 @@
 import { type ReactElement, useEffect, useRef, useState } from "react";
-import { Check, ChevronLeft, ChevronRight, CornerDownLeft } from "lucide-react";
+import {
+  Ban,
+  Check,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  CornerDownLeft,
+  Crosshair,
+  ShieldCheck,
+} from "lucide-react";
 import { type IAgentScopeRuntimeWebUIMessage } from "@/components/agentscope-chat";
 import { ChatAnywhereMessagesContext } from "@/components/agentscope-chat/AgentScopeRuntimeWebUI/core/Context/ChatAnywhereMessagesContext";
 import { emit } from "@/components/agentscope-chat/AgentScopeRuntimeWebUI/core/Context/useChatAnywhereEventEmitter";
@@ -1055,6 +1064,21 @@ function GoalProposalCard({
   onComplete?: () => void;
 }) {
   const { onConfirmGoalProposal } = useChatPlanReviewRenderContext();
+  type DraftState = {
+    objective: string;
+    criteriaText: string;
+    mustPreserve: string;
+    mustNotDo: string;
+    autonomyBoundary: string;
+  };
+  type DraftErrors = Partial<Record<keyof DraftState | "form", string>>;
+  const initialDraft: DraftState = {
+    objective: data.objective,
+    criteriaText: JSON.stringify(data.completion_criteria, null, 2),
+    mustPreserve: data.constraints.must_preserve.join("\n"),
+    mustNotDo: data.constraints.must_not_do.join("\n"),
+    autonomyBoundary: data.autonomy_boundary,
+  };
   const [objective, setObjective] = useState(data.objective);
   const [criteriaText, setCriteriaText] = useState(
     JSON.stringify(data.completion_criteria, null, 2),
@@ -1069,7 +1093,15 @@ function GoalProposalCard({
     data.autonomy_boundary,
   );
   const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [submitted, setSubmitted] = useState(false);
+  const [detailsOpen, setDetailsOpen] = useState(true);
+  const [errors, setErrors] = useState<DraftErrors>({});
+  const criteriaRef = useRef<HTMLTextAreaElement>(null);
+  const objectiveRef = useRef<HTMLTextAreaElement>(null);
+  const preserveRef = useRef<HTMLTextAreaElement>(null);
+  const notDoRef = useRef<HTMLTextAreaElement>(null);
+  const autonomyRef = useRef<HTMLTextAreaElement>(null);
+  const detailsId = `goal-contract-details-${cardInstanceKey}`;
 
   useEffect(() => {
     setObjective(data.objective);
@@ -1077,115 +1109,388 @@ function GoalProposalCard({
     setMustPreserve(data.constraints.must_preserve.join("\n"));
     setMustNotDo(data.constraints.must_not_do.join("\n"));
     setAutonomyBoundary(data.autonomy_boundary);
-    setError(null);
+    setErrors({});
+    setSubmitted(false);
+    setDetailsOpen(true);
   }, [cardInstanceKey, data]);
+
+  const normalizedCriteria = (value: string) => {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? JSON.stringify(parsed) : null;
+    } catch {
+      return null;
+    }
+  };
+  const hasChanges =
+    objective.trim() !== initialDraft.objective.trim() ||
+    autonomyBoundary.trim() !== initialDraft.autonomyBoundary.trim() ||
+    normalizedCriteria(criteriaText) !==
+      normalizedCriteria(initialDraft.criteriaText) ||
+    mustPreserve
+      .split("\n")
+      .map((item) => item.trim())
+      .join("\n") !==
+      initialDraft.mustPreserve
+        .split("\n")
+        .map((item) => item.trim())
+        .join("\n") ||
+    mustNotDo
+      .split("\n")
+      .map((item) => item.trim())
+      .join("\n") !==
+      initialDraft.mustNotDo
+        .split("\n")
+        .map((item) => item.trim())
+        .join("\n");
+
+  const summaryObjective = objective.trim() || "尚未填写目标";
+  const preserveCount = mustPreserve
+    .split("\n")
+    .map((item) => item.trim())
+    .filter(Boolean).length;
+  const notDoCount = mustNotDo
+    .split("\n")
+    .map((item) => item.trim())
+    .filter(Boolean).length;
+  const criteriaCount = (() => {
+    try {
+      const parsed = JSON.parse(criteriaText);
+      return Array.isArray(parsed) ? parsed.length : 0;
+    } catch {
+      return 0;
+    }
+  })();
+
+  const validate = (): DraftErrors => {
+    const next: DraftErrors = {};
+    if (!objective.trim()) next.objective = "整体目标不能为空";
+    else if (objective.trim().length > 4000)
+      next.objective = "整体目标不能超过 4000 字符";
+    let parsedCriteria: unknown;
+    try {
+      parsedCriteria = JSON.parse(criteriaText);
+      if (!Array.isArray(parsedCriteria) || parsedCriteria.length === 0) {
+        next.criteriaText = "完成条件必须是非空 JSON 数组";
+      } else if (
+        parsedCriteria.length > 16 ||
+        parsedCriteria.some(
+          (item) =>
+            !item ||
+            typeof item !== "object" ||
+            [
+              "requirement",
+              "observable_assertion",
+              "verification_method",
+              "expected_outcome",
+            ].some(
+              (key) =>
+                typeof (item as Record<string, unknown>)[key] !== "string" ||
+                !(item as Record<string, string>)[key].trim(),
+            ),
+        )
+      ) {
+        next.criteriaText = "每项完成条件必须包含四个非空字段，且最多 16 项";
+      }
+    } catch (cause) {
+      next.criteriaText =
+        cause instanceof Error
+          ? `JSON 格式错误：${cause.message}`
+          : "完成条件 JSON 无效";
+    }
+    if (objective.length > 4000 && !next.objective)
+      next.objective = "整体目标不能超过 4000 字符";
+    if (!autonomyBoundary.trim()) next.autonomyBoundary = "自主边界不能为空";
+    else if (autonomyBoundary.trim().length > 4000)
+      next.autonomyBoundary = "自主边界不能超过 4000 字符";
+    for (const [field, value] of [
+      ["mustPreserve", mustPreserve],
+      ["mustNotDo", mustNotDo],
+    ] as const) {
+      const items = value
+        .split("\n")
+        .map((item) => item.trim())
+        .filter(Boolean);
+      if (items.length > 32 || items.some((item) => item.length > 1000))
+        next[field] = "每类约束最多 32 项，单项不超过 1000 字符";
+    }
+    return next;
+  };
+
+  const focusFirstError = (next: DraftErrors) => {
+    const target = next.objective
+      ? objectiveRef
+      : next.criteriaText
+      ? criteriaRef
+      : next.mustPreserve
+      ? preserveRef
+      : next.mustNotDo
+      ? notDoRef
+      : next.autonomyBoundary
+      ? autonomyRef
+      : null;
+    target?.current?.focus();
+  };
+
+  const formatCriteria = () => {
+    try {
+      setCriteriaText(JSON.stringify(JSON.parse(criteriaText), null, 2));
+      setErrors((current) => ({ ...current, criteriaText: undefined }));
+    } catch (cause) {
+      setErrors((current) => ({
+        ...current,
+        criteriaText:
+          cause instanceof Error
+            ? `JSON 格式错误：${cause.message}`
+            : "完成条件 JSON 无效",
+      }));
+    }
+  };
+
+  const closeCard = () => {
+    if (hasChanges && !window.confirm("修改尚未确认，返回后将丢失，是否继续？"))
+      return;
+    onComplete?.();
+  };
 
   const submit = async () => {
     if (!onConfirmGoalProposal) {
-      setError("Goal 创建入口不可用");
+      setErrors({ form: "Goal 创建入口不可用" });
       return;
     }
-    let criteria: ChatGoalCompletionCriterion[];
-    try {
-      const parsed = JSON.parse(criteriaText);
-      if (!Array.isArray(parsed) || parsed.length === 0) {
-        throw new Error("完成条件不能为空");
-      }
-      criteria = parsed;
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "完成条件 JSON 无效");
+    const nextErrors = validate();
+    if (Object.keys(nextErrors).length > 0) {
+      setErrors(nextErrors);
+      setDetailsOpen(true);
+      focusFirstError(nextErrors);
       return;
     }
-    if (!objective.trim() || !autonomyBoundary.trim()) {
-      setError("目标和自主边界不能为空");
-      return;
-    }
+    const criteria = JSON.parse(criteriaText) as ChatGoalCompletionCriterion[];
     setSubmitting(true);
-    setError(null);
+    setSubmitted(false);
+    setErrors({});
     try {
       const created = await onConfirmGoalProposal({
         card_type: "goal_proposal",
         objective: objective.trim(),
         completion_criteria: criteria,
         constraints: {
-          must_preserve: mustPreserve.split("\n").map((item) => item.trim()).filter(Boolean),
-          must_not_do: mustNotDo.split("\n").map((item) => item.trim()).filter(Boolean),
+          must_preserve: mustPreserve
+            .split("\n")
+            .map((item) => item.trim())
+            .filter(Boolean),
+          must_not_do: mustNotDo
+            .split("\n")
+            .map((item) => item.trim())
+            .filter(Boolean),
         },
         autonomy_boundary: autonomyBoundary.trim(),
       });
-      emit({
-        type: "handleSubmit",
-        data: {
-          query: "开始执行已确认的 Goal",
-          fileList: [],
-          biz_params: {
-            mode: "normal",
-            goal_id: created.goal_id,
+      setSubmitted(true);
+      window.setTimeout(() => {
+        emit({
+          type: "handleSubmit",
+          data: {
+            query: "开始执行已确认的 Goal",
+            fileList: [],
+            biz_params: {
+              mode: "normal",
+              goal_id: created.goal_id,
+            },
           },
-        },
-      });
-      onComplete?.();
+        });
+        onComplete?.();
+      }, 700);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Goal 创建失败");
+      setErrors({
+        form: cause instanceof Error ? cause.message : "Goal 创建失败",
+      });
     } finally {
       setSubmitting(false);
     }
   };
 
   return (
-    <section className={styles.planReviewCard} aria-label="Goal Contract Draft">
+    <section
+      className={`${styles.planReviewCard} ${styles.goalProposalCard}`}
+      aria-label="Goal Contract Draft"
+    >
       <header className={styles.reviewHeader}>
         <div className={styles.reviewHeading}>
-          <strong>Goal Contract Draft</strong>
-          <p className={styles.reviewStatus}>确认后开始执行</p>
+          <Crosshair aria-hidden="true" size={20} className={styles.goalIcon} />
+          <div>
+            <strong>Goal Contract Draft</strong>
+            <p className={styles.reviewStatus}>
+              {submitted
+                ? "Goal 已确认，正在开始执行"
+                : hasChanges
+                ? "未确认修改"
+                : "确认后开始执行"}
+            </p>
+          </div>
         </div>
+        <span className={styles.goalDraftBadge}>{criteriaCount} 项条件</span>
       </header>
-      <div className={styles.reviewContent}>
-        <label htmlFor="goal-proposal-objective">整体目标</label>
-        <textarea
-          id="goal-proposal-objective"
-          value={objective}
-          onChange={(event) => setObjective(event.target.value)}
-          rows={2}
-        />
-        <label htmlFor="goal-proposal-criteria">完成条件（JSON）</label>
-        <textarea
-          id="goal-proposal-criteria"
-          value={criteriaText}
-          onChange={(event) => setCriteriaText(event.target.value)}
-          rows={8}
-        />
-        <label htmlFor="goal-proposal-preserve">必须保留（每行一项）</label>
-        <textarea
-          id="goal-proposal-preserve"
-          value={mustPreserve}
-          onChange={(event) => setMustPreserve(event.target.value)}
-          rows={2}
-        />
-        <label htmlFor="goal-proposal-not-do">禁止操作（每行一项）</label>
-        <textarea
-          id="goal-proposal-not-do"
-          value={mustNotDo}
-          onChange={(event) => setMustNotDo(event.target.value)}
-          rows={2}
-        />
-        <label htmlFor="goal-proposal-autonomy">自主边界</label>
-        <textarea
-          id="goal-proposal-autonomy"
-          value={autonomyBoundary}
-          onChange={(event) => setAutonomyBoundary(event.target.value)}
-          rows={3}
-        />
-        {error ? <p role="alert">{error}</p> : null}
+      <div className={styles.goalSummary}>
+        <div className={styles.goalSummaryTitle}>执行摘要</div>
+        <p>
+          {summaryObjective.length > 150
+            ? `${summaryObjective.slice(0, 150)}…`
+            : summaryObjective}
+        </p>
+        <div className={styles.goalSummaryStats}>
+          <span>{criteriaCount} 项完成条件</span>
+          <span>
+            必须保留 {preserveCount ? `${preserveCount} 条` : "未设置"}
+          </span>
+          <span>禁止操作 {notDoCount ? `${notDoCount} 条` : "未设置"}</span>
+          <span>自主边界 {autonomyBoundary.trim() ? "已定义" : "未设置"}</span>
+        </div>
       </div>
+      <button
+        type="button"
+        className={styles.goalDetailToggle}
+        aria-expanded={detailsOpen}
+        aria-controls={detailsId}
+        onClick={() => setDetailsOpen((open) => !open)}
+        disabled={submitting || submitted}
+      >
+        {detailsOpen ? "收起详情" : "展开详情"}
+        <ChevronDown size={15} aria-hidden="true" />
+      </button>
+      {detailsOpen ? (
+        <div
+          id={detailsId}
+          role="region"
+          aria-label="合同详情"
+          className={styles.goalDetails}
+        >
+          <p className={styles.goalDraftNotice}>
+            修改仅在当前页面保留，确认后才会创建 Goal。
+          </p>
+          <div className={styles.goalField}>
+            <label htmlFor="goal-proposal-objective">
+              整体目标 <span>（{objective.length} / 4000）</span>
+            </label>
+            <textarea
+              aria-label="整体目标"
+              ref={objectiveRef}
+              id="goal-proposal-objective"
+              value={objective}
+              maxLength={4000}
+              onChange={(event) => setObjective(event.target.value)}
+              rows={2}
+              disabled={submitting || submitted}
+            />
+            {errors.objective ? (
+              <p className={styles.goalFieldError}>{errors.objective}</p>
+            ) : null}
+          </div>
+          <div className={styles.goalField}>
+            <div className={styles.goalFieldLabel}>
+              <label htmlFor="goal-proposal-criteria">完成条件（JSON）</label>
+              <button
+                type="button"
+                className={styles.goalFormatButton}
+                onClick={formatCriteria}
+                disabled={submitting || submitted}
+              >
+                格式化 JSON
+              </button>
+            </div>
+            <textarea
+              aria-label="完成条件（JSON）"
+              ref={criteriaRef}
+              id="goal-proposal-criteria"
+              value={criteriaText}
+              onChange={(event) => setCriteriaText(event.target.value)}
+              rows={7}
+              disabled={submitting || submitted}
+            />
+            {errors.criteriaText ? (
+              <p className={styles.goalFieldError}>{errors.criteriaText}</p>
+            ) : null}
+          </div>
+          <div className={styles.goalConstraintPair}>
+            <div className={styles.goalField}>
+              <label htmlFor="goal-proposal-preserve">
+                <ShieldCheck size={15} />
+                必须保留
+              </label>
+              <textarea
+                ref={preserveRef}
+                id="goal-proposal-preserve"
+                value={mustPreserve}
+                placeholder="暂无约束，每行一项"
+                onChange={(event) => setMustPreserve(event.target.value)}
+                rows={2}
+                disabled={submitting || submitted}
+              />
+              {errors.mustPreserve ? (
+                <p className={styles.goalFieldError}>{errors.mustPreserve}</p>
+              ) : null}
+            </div>
+            <div className={styles.goalField}>
+              <label htmlFor="goal-proposal-not-do">
+                <Ban size={15} />
+                禁止操作
+              </label>
+              <textarea
+                ref={notDoRef}
+                id="goal-proposal-not-do"
+                value={mustNotDo}
+                placeholder="暂无约束，每行一项"
+                onChange={(event) => setMustNotDo(event.target.value)}
+                rows={2}
+                disabled={submitting || submitted}
+              />
+              {errors.mustNotDo ? (
+                <p className={styles.goalFieldError}>{errors.mustNotDo}</p>
+              ) : null}
+            </div>
+          </div>
+          <div className={styles.goalField}>
+            <label htmlFor="goal-proposal-autonomy">自主边界</label>
+            <textarea
+              ref={autonomyRef}
+              id="goal-proposal-autonomy"
+              value={autonomyBoundary}
+              maxLength={4000}
+              onChange={(event) => setAutonomyBoundary(event.target.value)}
+              rows={2}
+              disabled={submitting || submitted}
+            />
+            {errors.autonomyBoundary ? (
+              <p className={styles.goalFieldError}>{errors.autonomyBoundary}</p>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+      {Object.keys(errors).length > 0 ? (
+        <p role="alert" className={styles.goalAggregateError}>
+          {Object.keys(errors).filter((key) => key !== "form").length > 0
+            ? `请修正 ${
+                Object.keys(errors).filter((key) => key !== "form").length
+              } 处问题后再确认`
+            : errors.form}
+        </p>
+      ) : null}
       <footer className={styles.reviewActions}>
         <button
           type="button"
+          className={styles.reviewSecondaryButton}
+          disabled={submitting || submitted}
+          onClick={closeCard}
+        >
+          返回消息编辑
+        </button>
+        <button
+          type="button"
           className={styles.reviewPrimaryButton}
-          disabled={submitting}
+          disabled={submitting || submitted}
           onClick={() => void submit()}
         >
-          {submitting ? "创建中…" : "确认并开始执行"}
+          {submitted ? "已确认" : submitting ? "创建中…" : "确认并开始执行"}
         </button>
       </footer>
     </section>

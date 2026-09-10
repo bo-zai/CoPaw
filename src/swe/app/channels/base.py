@@ -40,6 +40,7 @@ from ..tenant_context import bind_tenant_context
 from ...config.llm_workload import LLM_WORKLOAD_CHAT, bind_llm_workload
 from ...config.context import resolve_runtime_identity
 from ...config.utils import load_config
+from ..answer_turn.models import TurnIdentity
 
 # Optional callback to enqueue payload (set by manager)
 EnqueueCallback = Optional[Callable[[Any], None]]
@@ -414,6 +415,11 @@ class BaseChannel(ABC):
         if channel_meta is None:
             channel_meta = {}
             request.channel_meta = channel_meta
+        channel_meta["chat_id"] = chat.id
+        if isinstance(payload, dict):
+            payload_meta = payload.setdefault("meta", {})
+            if isinstance(payload_meta, dict):
+                payload_meta["chat_id"] = chat.id
         if "session_channel" not in channel_meta:
             channel_meta["session_channel"] = chat.channel
 
@@ -431,17 +437,26 @@ class BaseChannel(ABC):
                 getattr(_sess, "save_dir", None) if _sess else None,
             )
 
-        queue, is_new = await self._workspace.task_tracker.attach_or_start(
+        coordinator = self._workspace.answer_turn_coordinator
+        if coordinator is None:
+            raise RuntimeError("answer-turn coordinator is not configured")
+        proposed_msgid = (
+            channel_meta.get("msgid")
+            if isinstance(channel_meta.get("msgid"), str)
+            else None
+        )
+        lease = await coordinator.start_or_attach(
             chat.id,
             payload,
             self._stream_with_tracker,
+            msgid=proposed_msgid,
         )
 
-        if is_new:
+        if lease.is_new_run:
             try:
-                async for _ in self._workspace.task_tracker.stream_from_queue(
-                    queue,
-                    chat.id,
+                async for _ in self._workspace.task_tracker.stream(
+                    lease.identity,
+                    lease.queue,
                 ):
                     pass
             except asyncio.CancelledError:
@@ -457,8 +472,79 @@ class BaseChannel(ABC):
                 f"This should not happen with UnifiedQueueManager.",
             )
 
+    def _prepare_stream_context(
+        self,
+        identity: TurnIdentity,
+        payload: Any,
+    ) -> tuple["AgentRequest", dict[str, Any], str]:
+        """Normalize payload metadata before starting the process stream."""
+        if isinstance(payload, dict):
+            payload = {
+                **payload,
+                "meta": {
+                    **(payload.get("meta") or {}),
+                    "answer_turn_identity": identity,
+                    "msgid": identity.msgid,
+                },
+            }
+        else:
+            meta = dict(getattr(payload, "channel_meta", None) or {})
+            meta.update(answer_turn_identity=identity, msgid=identity.msgid)
+            setattr(payload, "channel_meta", meta)
+        request = self._payload_to_request(payload)
+        if isinstance(payload, dict):
+            send_meta = dict(payload.get("meta") or {})
+            if payload.get("session_webhook"):
+                send_meta["session_webhook"] = payload["session_webhook"]
+        else:
+            send_meta = getattr(request, "channel_meta", None) or {}
+        bot_prefix = getattr(self, "bot_prefix", None) or getattr(
+            self,
+            "_bot_prefix",
+            "",
+        )
+        if bot_prefix and "bot_prefix" not in send_meta:
+            send_meta = {**send_meta, "bot_prefix": bot_prefix}
+        return request, send_meta, self.get_to_handle_from_request(request)
+
+    @staticmethod
+    def _serialize_stream_event(event: Any) -> str:
+        """Serialize one process event to an SSE data payload."""
+        import json
+
+        if hasattr(event, "model_dump_json"):
+            return event.model_dump_json()
+        if hasattr(event, "json"):
+            return event.json()
+        return json.dumps({"text": str(event)})
+
+    async def _handle_stream_event(
+        self,
+        request: "AgentRequest",
+        event: Any,
+        *,
+        to_handle: str,
+        send_meta: dict[str, Any],
+    ) -> Any:
+        """Dispatch callbacks and return the latest response event."""
+        obj = getattr(event, "object", None)
+        status = getattr(event, "status", None)
+        if obj == "message" and status == RunStatus.Completed:
+            await self.on_event_message_completed(
+                request,
+                to_handle,
+                event,
+                send_meta,
+            )
+            return None
+        if obj == "response":
+            await self.on_event_response(request, event)
+            return event
+        return None
+
     async def _stream_with_tracker(
         self,
+        identity: TurnIdentity,
         payload: Any,
     ) -> AsyncGenerator[str, None]:
         """Stream events through TaskTracker for task tracking.
@@ -472,26 +558,10 @@ class BaseChannel(ABC):
         Yields:
             SSE-formatted event strings
         """
-        import json
-
-        request = self._payload_to_request(payload)
-
-        if isinstance(payload, dict):
-            send_meta = dict(payload.get("meta") or {})
-            if payload.get("session_webhook"):
-                send_meta["session_webhook"] = payload["session_webhook"]
-        else:
-            send_meta = getattr(request, "channel_meta", None) or {}
-
-        bot_prefix = getattr(self, "bot_prefix", None) or getattr(
-            self,
-            "_bot_prefix",
-            "",
+        request, send_meta, to_handle = self._prepare_stream_context(
+            identity,
+            payload,
         )
-        if bot_prefix and "bot_prefix" not in send_meta:
-            send_meta = {**send_meta, "bot_prefix": bot_prefix}
-
-        to_handle = self.get_to_handle_from_request(request)
 
         await self._before_consume_process(request)
 
@@ -500,28 +570,15 @@ class BaseChannel(ABC):
         try:
             process_iterator = self._process(request)
             async for event in process_iterator:
-                if hasattr(event, "model_dump_json"):
-                    data = event.model_dump_json()
-                elif hasattr(event, "json"):
-                    data = event.json()
-                else:
-                    data = json.dumps({"text": str(event)})
-
-                yield f"data: {data}\n\n"
-
-                obj = getattr(event, "object", None)
-                status = getattr(event, "status", None)
-
-                if obj == "message" and status == RunStatus.Completed:
-                    await self.on_event_message_completed(
-                        request,
-                        to_handle,
-                        event,
-                        send_meta,
-                    )
-                elif obj == "response":
-                    last_response = event
-                    await self.on_event_response(request, event)
+                yield f"data: {self._serialize_stream_event(event)}\n\n"
+                response = await self._handle_stream_event(
+                    request,
+                    event,
+                    to_handle=to_handle,
+                    send_meta=send_meta,
+                )
+                if response is not None:
+                    last_response = response
 
             err_msg = self._get_response_error_message(last_response)
             if err_msg:

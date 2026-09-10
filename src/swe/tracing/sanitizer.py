@@ -2,6 +2,9 @@
 """Tracing 数据脱敏工具。"""
 
 from contextvars import ContextVar
+from dataclasses import dataclass
+import json
+import re
 from typing import Any, Optional
 
 # Sensitive keys to redact from tool input/output
@@ -33,6 +36,151 @@ _runtime_secret_values: ContextVar[tuple[str, ...]] = ContextVar(
     "runtime_secret_values",
     default=(),
 )
+
+
+@dataclass(frozen=True)
+class SanitizedTraceValue:
+    """A JSON-compatible trace value and its bounding metadata."""
+
+    value: Any
+    original_bytes: int
+    truncated: bool
+
+
+_TRACE_TEXT_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*:\s*(?:bearer\s+)?)[^\s,;]+"),
+    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(r"(?i)(cookie\s*:\s*)[^\r\n]+"),
+    re.compile(
+        r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|secret|"
+        r"password|session[_-]?token)\b\s*[:=]\s*([^\s,;]+)",
+    ),
+    re.compile(
+        r"(?i)\b[a-z][a-z0-9+.-]*://[^\s/@]+:[^\s/@]+@",
+    ),
+    re.compile(
+        r"-----BEGIN\s+[^\r\n-]*PRIVATE\s+KEY-----[\s\S]*?"
+        r"-----END\s+[^\r\n-]*PRIVATE\s+KEY-----",
+    ),
+    re.compile(
+        r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b",
+    ),
+)
+
+
+def _redact_trace_text(text: str) -> str:
+    """Redact registered secrets and credential-like text fragments."""
+    redacted = _redact_registered_values(text)
+    for pattern in _TRACE_TEXT_PATTERNS:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted
+
+
+def _truncate_trace_text(text: str, max_bytes: int) -> tuple[str, bool]:
+    if max_bytes <= 0:
+        return "", bool(text)
+    if len(text.encode("utf-8")) <= max_bytes:
+        return text, False
+
+    marker = "..."
+    marker_bytes = len(marker.encode("utf-8"))
+    if max_bytes <= marker_bytes:
+        return marker[:max_bytes], True
+
+    prefix = text.encode("utf-8")[: max_bytes - marker_bytes].decode(
+        "utf-8",
+        errors="ignore",
+    )
+    return prefix + marker, True
+
+
+def _trace_json_bytes(value: Any) -> int:
+    try:
+        return len(
+            json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"),
+        )
+    except Exception:
+        return len(str(value).encode("utf-8", errors="replace"))
+
+
+def sanitize_trace_value(
+    value: Any,
+    *,
+    max_bytes: int = 2048,
+    max_depth: int = 5,
+    max_items: int = 32,
+) -> SanitizedTraceValue:
+    """Return a JSON-compatible, redacted and bounded trace value."""
+    original_bytes = _trace_json_bytes(value)
+    truncated = False
+
+    def visit(current: Any, depth: int) -> Any:
+        nonlocal truncated
+        if depth > max_depth:
+            truncated = True
+            return "<max-depth-exceeded>"
+
+        if current is None or isinstance(current, (bool, int, float)):
+            return current
+        if isinstance(current, str):
+            bounded, was_truncated = _truncate_trace_text(
+                _redact_trace_text(current),
+                max_bytes,
+            )
+            truncated = truncated or was_truncated
+            return bounded
+
+        model_dump = getattr(current, "model_dump", None)
+        if callable(model_dump):
+            try:
+                current = model_dump(mode="json")
+            except Exception:
+                try:
+                    current = model_dump()
+                except Exception:
+                    return _truncate_trace_text(
+                        _redact_trace_text(str(current)),
+                        max_bytes,
+                    )[0]
+
+        if isinstance(current, dict):
+            result: dict[str, Any] = {}
+            for index, (key, item) in enumerate(current.items()):
+                if index >= max_items:
+                    truncated = True
+                    break
+                key_text = str(key)
+                if any(
+                    marker in key_text.lower() for marker in SENSITIVE_KEYS
+                ):
+                    result[key_text] = "[REDACTED]"
+                else:
+                    result[key_text] = visit(item, depth + 1)
+            return result
+
+        if isinstance(current, (list, tuple, set, frozenset)):
+            items = list(current)
+            if len(items) > max_items:
+                truncated = True
+            return [visit(item, depth + 1) for item in items[:max_items]]
+
+        try:
+            json.dumps(current, ensure_ascii=False)
+            return current
+        except (TypeError, ValueError):
+            bounded, was_truncated = _truncate_trace_text(
+                _redact_trace_text(str(current)),
+                max_bytes,
+            )
+            truncated = truncated or was_truncated
+            return bounded
+
+    safe_value = visit(value, 0)
+    return SanitizedTraceValue(
+        value=safe_value,
+        original_bytes=original_bytes,
+        truncated=truncated,
+    )
 
 
 def register_sensitive_values(values: Any) -> None:

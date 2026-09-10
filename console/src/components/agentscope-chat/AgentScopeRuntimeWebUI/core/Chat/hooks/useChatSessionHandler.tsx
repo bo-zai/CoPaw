@@ -10,7 +10,7 @@ import {
  * 处理会话创建和更新的 Hook
  */
 export default function useChatSessionHandler() {
-  const { createSession, updateSession, getCurrentSessionId } =
+  const { createSession, updateSession, getCurrentSessionId, refreshSession } =
     useChatAnywhereSessions();
 
   /**
@@ -83,11 +83,18 @@ export default function useChatSessionHandler() {
     [updateSession],
   );
 
+  const refreshSessionForId = useCallback(
+    async (sessionId?: string, reconnectIfGenerating = true) =>
+      refreshSession(sessionId, reconnectIfGenerating),
+    [refreshSession],
+  );
+
   return {
     ensureSession,
     updateSessionName,
     syncSessionMessages,
     syncSessionMessagesForSession,
+    refreshSession: refreshSessionForId,
     getCurrentSessionId,
   };
 }

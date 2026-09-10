@@ -8,11 +8,12 @@ import hashlib
 import json
 from pathlib import Path
 from typing import Any, AsyncGenerator
+from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from starlette.responses import RedirectResponse, Response, StreamingResponse
+from starlette.responses import FileResponse, Response, StreamingResponse
 
 from ...agents.skills_manager import resolve_effective_skill_dir
 from ..agent_context import get_agent_for_request
@@ -35,6 +36,14 @@ from .store import (
 )
 
 router = APIRouter(prefix="/wplus-sop", tags=["wplus-sop"])
+
+# Protected inline previews are capped at 5 MiB; downloads remain streamable.
+DEFAULT_MAX_ARTIFACT_PREVIEW_BYTES = 5 * 1024 * 1024
+MAX_ARTIFACT_PREVIEW_BYTES = DEFAULT_MAX_ARTIFACT_PREVIEW_BYTES
+_ARTIFACT_READ_CHUNK_BYTES = 64 * 1024
+_ARTIFACT_PREVIEW_TOO_LARGE_DETAIL = (
+    "W+ SOP artifact preview exceeds 5 MiB limit"
+)
 
 
 class StrictRequest(BaseModel):
@@ -227,11 +236,104 @@ async def get_wplus_sop_session(
     )
 
 
+def _artifact_not_found() -> HTTPException:
+    return HTTPException(status_code=404, detail="W+ SOP artifact not found")
+
+
+def _verify_artifact_file(
+    static_root: Path,
+    artifact: Any,
+    *,
+    read_content: bool,
+) -> tuple[Path, bytes | None]:
+    """Resolve and verify one artifact; intended to run in a worker thread."""
+    static_root = static_root.expanduser().resolve()
+    try:
+        local_file = (static_root / artifact.static_file_name).resolve()
+        local_file.relative_to(static_root)
+        file_size = local_file.stat().st_size
+    except (OSError, ValueError) as exc:
+        raise _artifact_not_found() from exc
+    if read_content and file_size > MAX_ARTIFACT_PREVIEW_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=_ARTIFACT_PREVIEW_TOO_LARGE_DETAIL,
+        )
+
+    digest = hashlib.sha256()
+    content = bytearray() if read_content else None
+    try:
+        with local_file.open("rb") as artifact_file:
+            while chunk := artifact_file.read(_ARTIFACT_READ_CHUNK_BYTES):
+                digest.update(chunk)
+                if content is not None:
+                    content.extend(chunk)
+                    if len(content) > MAX_ARTIFACT_PREVIEW_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=_ARTIFACT_PREVIEW_TOO_LARGE_DETAIL,
+                        )
+    except HTTPException:
+        raise
+    except (OSError, ValueError) as exc:
+        raise _artifact_not_found() from exc
+    if digest.hexdigest() != artifact.sha256:
+        raise _artifact_not_found()
+    return local_file, bytes(content) if content is not None else None
+
+
+async def _artifact_response(
+    service: WPlusSopService,
+    artifact: Any,
+    *,
+    download: bool,
+) -> Response:
+    static_root = (
+        Path(service.workspace.workspace_dir).expanduser().resolve() / "static"
+    ).resolve()
+    local_file, raw = await asyncio.to_thread(
+        _verify_artifact_file,
+        static_root,
+        artifact,
+        read_content=not download,
+    )
+    media_type = {
+        ".json": "application/json",
+        ".md": "text/markdown",
+        ".html": "text/html",
+    }.get(Path(artifact.name).suffix)
+    if media_type is None:
+        raise _artifact_not_found()
+    headers = {
+        "Cache-Control": "private, no-store",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if download:
+        filename = Path(str(artifact.name)).name
+        headers["Content-Disposition"] = (
+            "attachment; filename*=UTF-8''" + quote(filename, safe="")
+        )
+        return FileResponse(
+            path=local_file,
+            media_type=media_type,
+            headers=headers,
+        )
+    if raw is None:
+        raise _artifact_not_found()
+    return Response(
+        content=raw,
+        media_type="text/plain",
+        headers=headers,
+    )
+
+
 @router.get("/sessions/{sop_session_id}/artifacts/{artifact_id}")
 async def download_wplus_sop_artifact(
     sop_session_id: str,
     artifact_id: str,
     request: Request,
+    download: bool = False,
 ) -> Response:
     service = await _service_for_session(request, sop_session_id)
     result = service.get_session(sop_session_id).projection.final_result
@@ -247,8 +349,76 @@ async def download_wplus_sop_artifact(
         None,
     )
     if artifact is None:
-        raise HTTPException(status_code=404, detail="W+ SOP artifact not found")
-    return RedirectResponse(url=artifact.static_url)
+        raise _artifact_not_found()
+    return await _artifact_response(service, artifact, download=download)
+
+
+@router.get(
+    "/sessions/{sop_session_id}/stage-report-artifacts/{artifact_id}",
+)
+async def download_wplus_sop_stage_report_artifact(
+    sop_session_id: str,
+    artifact_id: str,
+    stage_id: str,
+    revision: int,
+    report_no: int,
+    request: Request,
+    download: bool = False,
+) -> Response:
+    service = await _service_for_session(request, sop_session_id)
+    reports = service.get_session(sop_session_id).projection.stage_reports
+    report = next(
+        (
+            candidate
+            for candidate in reports
+            if candidate.stage_id == stage_id
+            and candidate.revision == revision
+            and candidate.report_no == report_no
+        ),
+        None,
+    )
+    if report is None:
+        raise _artifact_not_found()
+    artifact = next(
+        (
+            candidate
+            for candidate in report.artifacts
+            if candidate.artifact_id == artifact_id
+        ),
+        None,
+    )
+    if artifact is None:
+        raise _artifact_not_found()
+    return await _artifact_response(service, artifact, download=download)
+
+
+@router.get(
+    "/sessions/{sop_session_id}/cumulative-artifacts/{artifact_id}",
+)
+async def download_wplus_sop_cumulative_artifact(
+    sop_session_id: str,
+    artifact_id: str,
+    preview_version: int,
+    request: Request,
+    download: bool = False,
+) -> Response:
+    service = await _service_for_session(request, sop_session_id)
+    preview = service.get_session(
+        sop_session_id,
+    ).projection.cumulative_preview
+    if preview is None or preview.preview_version != preview_version:
+        raise _artifact_not_found()
+    artifact = next(
+        (
+            candidate
+            for candidate in preview.artifacts
+            if candidate.artifact_id == artifact_id
+        ),
+        None,
+    )
+    if artifact is None:
+        raise _artifact_not_found()
+    return await _artifact_response(service, artifact, download=download)
 
 
 @router.get("/chats/{chat_id}/active-session")

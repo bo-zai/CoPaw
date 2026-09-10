@@ -84,6 +84,7 @@ async def test_fetch_overview_report_behavior_counts_reads_directly_from_click_e
     assert "WHEN c.button_type = 'insight' THEN c.cron_task_id" in click_sql
     assert "WHEN c.button_type = 'phone' THEN c.cron_task_id" in click_sql
     assert "c.clicked_at >= %s AND c.clicked_at <= %s" in click_sql
+    assert "c.event_type = 'button_click'" in click_sql
     assert "AND c.bbk_id IN (%s, %s)" in click_sql
     assert "AND c.source_id = %s" in click_sql
     assert list(click_params[2:]) == ["100", "V00", "src-1"]
@@ -143,6 +144,7 @@ async def test_fetch_branch_click_counts_reads_directly_from_click_events():
     assert "COUNT(DISTINCT cron_task_id) AS task_count" in sql
     assert "COUNT(*) AS total_clicks" in sql
     assert "clicked_at >= %s AND clicked_at <= %s" in sql
+    assert "event_type = 'button_click'" in sql
     assert "cron_task_id IS NOT NULL" in sql
     assert "bbk_id IS NOT NULL" in sql
     assert "bbk_id != ''" in sql
@@ -209,8 +211,61 @@ async def test_fetch_manager_click_stats_matches_skill_view_click_scope():
 
     sql, params = db.fetch_all.await_args.args
     assert "FROM swe_html_preview_click_events c" in sql
-    assert "JOIN swe_cron_executions e ON c.cron_task_id = e.job_id" in sql
+    assert "JOIN swe_cron_jobs j ON c.cron_task_id = j.id" in sql
     assert "c.clicked_at >= e.actual_time" not in sql
     assert "c.clicked_at <= COALESCE(e.end_time" not in sql
+    assert "c.event_type = 'button_click'" in sql
     assert params[-1] == "src-1"
     assert result == {"u-1": {"plan": 4}}
+
+
+@pytest.mark.asyncio
+async def test_fetch_branch_manager_click_counts_filters_button_click_only():
+    """分行客户经理点击统计应只统计按钮点击事件。"""
+    db = MagicMock()
+    db.fetch_all = AsyncMock(
+        return_value=[
+            {
+                "button_type": "plan",
+                "manager_count": 2,
+            },
+        ],
+    )
+    service = QueryService()
+
+    await service._fetch_branch_manager_click_counts(
+        db=db,
+        bbk_id="100",
+        start_time=MagicMock(),
+        end_time=MagicMock(),
+        source_id="src-1",
+    )
+
+    sql, _ = db.fetch_all.await_args.args
+    assert "event_type = 'button_click'" in sql
+
+
+@pytest.mark.asyncio
+async def test_fetch_branch_customer_click_counts_filters_button_click_only():
+    """分行客户点击统计应只统计按钮点击事件。"""
+    db = MagicMock()
+    db.fetch_all = AsyncMock(
+        return_value=[
+            {
+                "button_type": "plan",
+                "customer_count": 2,
+            },
+        ],
+    )
+    service = QueryService()
+
+    await service._fetch_branch_customer_click_counts(
+        db=db,
+        bbk_id="100",
+        start_time=MagicMock(),
+        end_time=MagicMock(),
+        source_id="src-1",
+    )
+
+    sql, _ = db.fetch_all.await_args.args
+    assert "event_type = 'button_click'" in sql

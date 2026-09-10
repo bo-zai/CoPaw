@@ -39,7 +39,7 @@ def test_extract_session_and_payload_keeps_selected_skill_names_for_console():
         },
     )
 
-    assert payload["channel_id"] == "console"
+    assert payload["channel_id"] == "feishu"
     assert payload["meta"]["selected_skill_names"] == [
         "guide",
         "guide",
@@ -58,7 +58,7 @@ def test_extract_session_and_payload_reads_selected_skill_names_from_request_met
     with patch.object(console_router, "AgentRequest", SimpleNamespace):
         payload = _extract_session_and_payload(fake_request)
 
-    assert payload["channel_id"] == "console"
+    assert payload["channel_id"] == "feishu"
     assert payload["meta"]["selected_skill_names"] == ["guide"]
 
 

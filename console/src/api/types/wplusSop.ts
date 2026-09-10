@@ -7,6 +7,8 @@ export type WPlusSopState =
   | "ExecutingTrial"
   | "AwaitingTrialFeedback"
   | "AwaitingStageConfirmation"
+  | "GeneratingStageReport"
+  | "RefreshingCumulative"
   | "FinalizingOutputs"
   | "OutputReview"
   | "MemoryReview"
@@ -124,6 +126,43 @@ export interface WPlusSopArtifact {
   copied_by?: "copy_file_to_static" | null;
 }
 
+export interface WPlusSopStageReport {
+  stage_id: string;
+  report_no: number;
+  revision: number;
+  superseded_by?: number | null;
+  created_at: string;
+  artifacts: WPlusSopArtifact[];
+}
+
+export interface WPlusSopCumulativeSnapshot {
+  stage_id: string;
+  report_no: number;
+  revision: number;
+  artifact_sha256: string;
+  confirmed_at: string;
+}
+
+export interface WPlusSopCumulativePreview {
+  preview_version: number;
+  stage_order: string[];
+  snapshots: WPlusSopCumulativeSnapshot[];
+  artifacts: WPlusSopArtifact[];
+  rendered_sha256: Record<string, string>;
+}
+
+export interface WPlusSopStageArtifactIdentity {
+  stageId: string;
+  revision: number;
+  reportNo: number;
+  artifactId: string;
+}
+
+export interface WPlusSopCumulativeArtifactIdentity {
+  previewVersion: number;
+  artifactId: string;
+}
+
 export interface WPlusSopMemoryCandidate {
   candidate_id: string;
   title: string;
@@ -197,6 +236,8 @@ export interface WPlusSopSession {
   unknowns?: string[];
   capabilities?: WPlusSopCapabilityEvidence[];
   artifacts?: WPlusSopArtifact[];
+  stage_reports?: WPlusSopStageReport[];
+  cumulative_preview?: WPlusSopCumulativePreview | null;
   result_preview?: WPlusSopResultPreview | null;
   memory_candidates?: WPlusSopMemoryCandidate[];
   failure?: WPlusSopFailure | null;

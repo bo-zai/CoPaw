@@ -13,6 +13,7 @@ from swe.agents.memory.chat_checkpoint import CheckpointRecord
 from swe.agents.memory.chat_checkpoint import CheckpointEvent
 from swe.agents.memory.conversation_archive import CheckpointArchiveState
 from swe.agents.memory.reme_light_memory_manager import ReMeLightMemoryManager
+from swe.agents.utils.swe_token_counter import SweEstimateTokenCounter
 from swe.config.config import ContextCompactConfig
 from swe.config.config import ToolResultCompactConfig
 
@@ -37,6 +38,51 @@ def test_budget_decision_rejects_invalid_window() -> None:
         assert "max_input_length" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("zero input window must be rejected")
+
+
+@pytest.mark.asyncio
+async def test_projected_tokens_sum_online_messages_and_fixed_text() -> None:
+    counter = SweEstimateTokenCounter(token_count_estimate_divisor=1.0)
+    message = Msg(name="user", role="user", content="m" * 400)
+    fixed_text = "system prompt and compressed summary"
+
+    message_tokens = await counter.count(messages=[message.to_dict()])
+    fixed_text_tokens = await counter.count(messages=[], text=fixed_text)
+
+    assert await MemoryCompactionHook._count_projected_tokens(
+        counter,
+        [message],
+        fixed_text,
+    ) == (message_tokens + fixed_text_tokens)
+
+
+@pytest.mark.asyncio
+async def test_projected_tokens_include_structured_tool_result_output() -> (
+    None
+):
+    counter = SweEstimateTokenCounter(token_count_estimate_divisor=1.0)
+    message = Msg(
+        name="tool",
+        role="assistant",
+        content=[
+            {
+                "type": "tool_result",
+                "id": "call-1",
+                "name": "read_file",
+                "output": [{"type": "text", "text": "r" * 400}],
+            },
+        ],
+    )
+    fixed_text = "system prompt"
+    fixed_text_tokens = await counter.count(messages=[], text=fixed_text)
+
+    projected_tokens = await MemoryCompactionHook._count_projected_tokens(
+        counter,
+        [message],
+        fixed_text,
+    )
+
+    assert projected_tokens >= fixed_text_tokens + 400
 
 
 @pytest.mark.asyncio
@@ -267,7 +313,7 @@ async def test_emergency_degradation_remeasures_then_retries_reme_once(
         context_compact=ContextCompactConfig(),
     )
     token_counter = SimpleNamespace(
-        count=AsyncMock(side_effect=[0, 90, 90]),
+        count=AsyncMock(side_effect=[0, 90, 0, 90, 0]),
     )
     monkeypatch.setattr(
         "swe.agents.hooks.memory_compaction.load_agent_config",
@@ -294,7 +340,7 @@ async def test_emergency_degradation_remeasures_then_retries_reme_once(
         messages=[message],
         memory=memory,
     )
-    assert token_counter.count.await_count == 3
+    assert token_counter.count.await_count == 5
     manager.compact_memory.assert_awaited_once()
 
 

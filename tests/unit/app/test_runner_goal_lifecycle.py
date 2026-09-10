@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from agentscope.message import Msg
 
+from swe.agents.hook_runtime.models import HookDecision, MergedHookResult
 from swe.agents.react_agent import SWEAgent as RealSWEAgent
 from swe.app.goals.models import (
     CompletionCriterion,
@@ -43,7 +45,9 @@ def _contract() -> GoalContract:
     )
 
 
-def test_completion_judge_package_excludes_background_subagent_details() -> None:
+def test_completion_judge_package_excludes_background_subagent_details() -> (
+    None
+):
     observations: list[dict[str, str]] = []
 
     _append_goal_tool_observations(
@@ -93,12 +97,50 @@ async def _goal_service() -> tuple[GoalService, str]:
 
 
 @pytest.mark.asyncio
+async def test_stop_interrupts_the_matching_waiting_goal_turn() -> None:
+    service, goal_id = await _goal_service()
+    await service.begin_turn(goal_id, msgid="msg-current")
+    await service.settle_turn(goal_id, decision="wait")
+
+    interrupted = await service.interrupt_turn_if_matches(
+        goal_id,
+        "msg-current",
+        "Chat Stop interrupted the active Goal turn",
+    )
+
+    assert interrupted is not None
+    assert interrupted.state == GoalState.INTERRUPTED
+    assert interrupted.turn_active is False
+    assert not await service.active_turn_matches(goal_id, "msg-current")
+
+
+@pytest.mark.asyncio
+async def test_stop_does_not_overwrite_a_cancelled_goal_turn() -> None:
+    service, goal_id = await _goal_service()
+    await service.begin_turn(goal_id, msgid="msg-current")
+    cancelled = await service.get(goal_id)
+    cancelled.turn_active = False
+    cancelled.state = GoalState.CANCELLED
+    await service.persist(cancelled)
+
+    interrupted = await service.interrupt_turn_if_matches(
+        goal_id,
+        "msg-current",
+        "Chat Stop interrupted the active Goal turn",
+    )
+
+    assert interrupted is None
+    assert (await service.get(goal_id)).state == GoalState.CANCELLED
+
+
+@pytest.mark.asyncio
 async def test_goal_stream_keeps_intermediate_turns_open_and_wakes_from_wait(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service, goal_id = await _goal_service()
     monkeypatch.setattr(
-        "swe.app.goals.registry.get_goal_service", lambda: service
+        "swe.app.goals.registry.get_goal_service",
+        lambda: service,
     )
     runner = AgentRunner(agent_id="agent-1", tenant_id="tenant-1")
     resolutions = [
@@ -127,7 +169,9 @@ async def test_goal_stream_keeps_intermediate_turns_open_and_wakes_from_wait(
         agent._request_context["goal_turn_resolution"] = resolutions[calls]
         calls += 1
         yield Msg(
-            name="Friday", role="assistant", content=f"turn-{calls}"
+            name="Friday",
+            role="assistant",
+            content=f"turn-{calls}",
         ), True
 
     async def fake_wait_for_goal_wake(waiting_goal_id: str) -> None:
@@ -147,14 +191,34 @@ async def test_goal_stream_keeps_intermediate_turns_open_and_wakes_from_wait(
         fake_wait_for_goal_wake,
     )
     monkeypatch.setattr(
-        runner, "_stream_goal_finalization_turn", fake_finalization_turn
+        runner,
+        "_stream_goal_finalization_turn",
+        fake_finalization_turn,
+    )
+    stop_calls: list[dict[str, Any]] = []
+
+    async def fake_emit_stop_hook_if_needed(**kwargs):
+        stop_calls.append(kwargs)
+        return MergedHookResult(decision=HookDecision.ALLOW)
+
+    monkeypatch.setattr(
+        runner,
+        "_emit_stop_hook_if_needed",
+        fake_emit_stop_hook_if_needed,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_requires_stop_output_buffer",
+        lambda **_kwargs: False,
     )
 
     async def fake_completion_review(**_kwargs):
         return {"criterion-1": (True, "passed")}
 
     monkeypatch.setattr(
-        runner, "_run_goal_completion_review", fake_completion_review,
+        runner,
+        "_run_goal_completion_review",
+        fake_completion_review,
     )
 
     events = [
@@ -173,6 +237,175 @@ async def test_goal_stream_keeps_intermediate_turns_open_and_wakes_from_wait(
         events[-1][0].content
         == "Formal completion delivery from the Main Agent."
     )
+    assert len(stop_calls) == 1
+    assert stop_calls[0]["outcome"].assistant_response == (
+        "Formal completion delivery from the Main Agent."
+    )
+
+
+@pytest.mark.asyncio
+async def test_goal_finalization_buffers_candidate_chunks_until_stop_approves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, goal_id = await _goal_service()
+    monkeypatch.setattr(
+        "swe.app.goals.registry.get_goal_service",
+        lambda: service,
+    )
+    runner = AgentRunner(agent_id="agent-1", tenant_id="tenant-1")
+    agent = SimpleNamespace(_request_context={"source_id": "source-1"})
+    runtime = SimpleNamespace(agent=agent, chat=SimpleNamespace(id="chat-1"))
+
+    async def fake_stream_agent_turns(**_kwargs):
+        agent._request_context["goal_turn_resolution"] = {
+            "decision": "propose_completion",
+            "summary": "Ready for completion",
+            "completion_proposal": "Deliver the completed work",
+        }
+        yield Msg(name="Friday", role="assistant", content="main turn"), True
+
+    async def fake_finalization_turn(**_kwargs):
+        yield Msg(
+            name="Friday",
+            role="assistant",
+            content="candidate chunk",
+        ), False
+        yield Msg(
+            name="Friday",
+            role="assistant",
+            content="approved final",
+        ), True
+
+    async def fake_completion_review(**_kwargs):
+        return {"criterion-1": (True, "passed")}
+
+    async def fake_emit_stop_hook_if_needed(**_kwargs):
+        return MergedHookResult(decision=HookDecision.ALLOW)
+
+    monkeypatch.setattr(runner, "_stream_agent_turns", fake_stream_agent_turns)
+    monkeypatch.setattr(
+        runner,
+        "_stream_goal_finalization_turn",
+        fake_finalization_turn,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_run_goal_completion_review",
+        fake_completion_review,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_emit_stop_hook_if_needed",
+        fake_emit_stop_hook_if_needed,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_requires_stop_output_buffer",
+        lambda **_kwargs: True,
+    )
+
+    events = [
+        event
+        async for event in runner._stream_completion_lifecycle(
+            request=SimpleNamespace(channel_meta={"goal_id": goal_id}),
+            runtime=runtime,
+            plan=_TurnPlan(original_user_message="Start Goal", turn_msgs=[]),
+            outcome=_QueryTurnOutcome(),
+        )
+    ]
+
+    assert [message.content for message, _ in events] == [
+        "main turn",
+        "approved final",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_goal_finalization_retry_receives_stop_rejection_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, goal_id = await _goal_service()
+    monkeypatch.setattr(
+        "swe.app.goals.registry.get_goal_service",
+        lambda: service,
+    )
+    runner = AgentRunner(agent_id="agent-1", tenant_id="tenant-1")
+    agent = SimpleNamespace(_request_context={"source_id": "source-1"})
+    runtime = SimpleNamespace(agent=agent, chat=SimpleNamespace(id="chat-1"))
+    observed_reasons: list[str | None] = []
+
+    async def fake_stream_agent_turns(**_kwargs):
+        agent._request_context["goal_turn_resolution"] = {
+            "decision": "propose_completion",
+            "summary": "Ready for completion",
+            "completion_proposal": "Deliver the completed work",
+        }
+        yield Msg(name="Friday", role="assistant", content="main turn"), True
+
+    async def fake_finalization_turn(
+        *,
+        stop_rejection_reason: str | None = None,
+        **_kwargs,
+    ):
+        observed_reasons.append(stop_rejection_reason)
+        yield Msg(
+            name="Friday",
+            role="assistant",
+            content=f"delivery {len(observed_reasons)}",
+        ), True
+
+    async def fake_completion_review(**_kwargs):
+        return {"criterion-1": (True, "passed")}
+
+    stop_calls = 0
+
+    async def fake_emit_stop_hook_if_needed(**_kwargs):
+        nonlocal stop_calls
+        stop_calls += 1
+        if stop_calls == 1:
+            return MergedHookResult(
+                decision=HookDecision.BLOCK,
+                reason="Include the mandatory acknowledgement",
+            )
+        return MergedHookResult(decision=HookDecision.ALLOW)
+
+    monkeypatch.setattr(runner, "_stream_agent_turns", fake_stream_agent_turns)
+    monkeypatch.setattr(
+        runner,
+        "_stream_goal_finalization_turn",
+        fake_finalization_turn,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_run_goal_completion_review",
+        fake_completion_review,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_emit_stop_hook_if_needed",
+        fake_emit_stop_hook_if_needed,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_requires_stop_output_buffer",
+        lambda **_kwargs: False,
+    )
+
+    events = [
+        event
+        async for event in runner._stream_completion_lifecycle(
+            request=SimpleNamespace(channel_meta={"goal_id": goal_id}),
+            runtime=runtime,
+            plan=_TurnPlan(original_user_message="Start Goal", turn_msgs=[]),
+            outcome=_QueryTurnOutcome(),
+        )
+    ]
+
+    assert observed_reasons == [
+        None,
+        "Include the mandatory acknowledgement",
+    ]
+    assert events[-1][0].content == "delivery 2"
 
 
 @pytest.mark.asyncio
@@ -181,7 +414,8 @@ async def test_goal_finalization_falls_back_when_model_fails(
 ) -> None:
     service, goal_id = await _goal_service()
     monkeypatch.setattr(
-        "swe.app.goals.registry.get_goal_service", lambda: service
+        "swe.app.goals.registry.get_goal_service",
+        lambda: service,
     )
     runner = AgentRunner(agent_id="agent-1", tenant_id="tenant-1")
     goal = await service.get(goal_id)
@@ -192,7 +426,9 @@ async def test_goal_finalization_falls_back_when_model_fails(
         raise RuntimeError("model unavailable")
 
     monkeypatch.setattr(
-        runner, "_create_goal_finalization_agent", fail_to_create_agent
+        runner,
+        "_create_goal_finalization_agent",
+        fail_to_create_agent,
     )
     events = [
         event
@@ -220,7 +456,8 @@ async def test_explicit_goal_request_reports_when_goal_cannot_start_turn(
     goal.state = GoalState.PAUSED
     await service.persist(goal)
     monkeypatch.setattr(
-        "swe.app.goals.registry.get_goal_service", lambda: service
+        "swe.app.goals.registry.get_goal_service",
+        lambda: service,
     )
     runner = AgentRunner(agent_id="agent-1", tenant_id="tenant-1")
     agent = SimpleNamespace(
@@ -239,7 +476,8 @@ async def test_explicit_goal_request_reports_when_goal_cannot_start_turn(
             request=SimpleNamespace(channel_meta={"goal_id": goal_id}),
             runtime=runtime,
             plan=_TurnPlan(
-                original_user_message="Continue Goal", turn_msgs=[]
+                original_user_message="Continue Goal",
+                turn_msgs=[],
             ),
             outcome=_QueryTurnOutcome(),
         )
@@ -257,7 +495,8 @@ async def test_active_goal_request_without_goal_id_is_queued_as_steering(
 ) -> None:
     service, goal_id = await _goal_service()
     monkeypatch.setattr(
-        "swe.app.goals.registry.get_goal_service", lambda: service
+        "swe.app.goals.registry.get_goal_service",
+        lambda: service,
     )
     runner = AgentRunner(agent_id="agent-1", tenant_id="tenant-1")
     runtime = SimpleNamespace(
@@ -300,7 +539,8 @@ async def test_implicit_steering_rejects_a_goal_outside_the_runtime_scope(
     goal.scope.agent_profile_id = "another-agent"
     await service.persist(goal)
     monkeypatch.setattr(
-        "swe.app.goals.registry.get_goal_service", lambda: service
+        "swe.app.goals.registry.get_goal_service",
+        lambda: service,
     )
     runner = AgentRunner(agent_id="agent-1", tenant_id="tenant-1")
     runtime = SimpleNamespace(
@@ -348,7 +588,9 @@ async def test_goal_finalization_persists_the_final_message(
     async def fake_stream_printing_messages(**kwargs):
         kwargs["coroutine_task"].close()
         yield Msg(
-            name="Friday", role="assistant", content="Final delivery"
+            name="Friday",
+            role="assistant",
+            content="Final delivery",
         ), True
 
     async def fake_enforce(stream, **_kwargs):
@@ -389,7 +631,8 @@ async def test_interrupted_goal_after_wake_does_not_finalize(
 ) -> None:
     service, goal_id = await _goal_service()
     monkeypatch.setattr(
-        "swe.app.goals.registry.get_goal_service", lambda: service
+        "swe.app.goals.registry.get_goal_service",
+        lambda: service,
     )
     runner = AgentRunner(agent_id="agent-1", tenant_id="tenant-1")
     agent = SimpleNamespace(
@@ -423,7 +666,9 @@ async def test_interrupted_goal_after_wake_does_not_finalize(
         fake_wait_for_goal_wake,
     )
     monkeypatch.setattr(
-        runner, "_stream_goal_finalization_turn", unexpected_finalization
+        runner,
+        "_stream_goal_finalization_turn",
+        unexpected_finalization,
     )
 
     events = [
@@ -437,6 +682,57 @@ async def test_interrupted_goal_after_wake_does_not_finalize(
     ]
 
     assert [last for _, last in events] == [False]
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_waiting_goal_stream_marks_the_goal_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, goal_id = await _goal_service()
+    monkeypatch.setattr(
+        "swe.app.goals.registry.get_goal_service",
+        lambda: service,
+    )
+    runner = AgentRunner(agent_id="agent-1", tenant_id="tenant-1")
+    agent = SimpleNamespace(
+        _request_context={"source_id": "source-1", "msgid": "msg-current"},
+    )
+    runtime = SimpleNamespace(agent=agent, chat=SimpleNamespace(id="chat-1"))
+    waiting = asyncio.Event()
+
+    async def fake_stream_agent_turns(**_kwargs):
+        agent._request_context["goal_turn_resolution"] = {
+            "decision": "wait",
+            "summary": "Waiting",
+            "wake_conditions": ["manual wake"],
+        }
+        yield Msg(name="Friday", role="assistant", content="waiting"), True
+
+    async def fake_wait_for_goal_wake(_goal_id: str) -> None:
+        waiting.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(runner, "_stream_agent_turns", fake_stream_agent_turns)
+    monkeypatch.setattr(
+        "swe.app.goals.wakeup.wait_for_goal_wake",
+        fake_wait_for_goal_wake,
+    )
+
+    stream = runner._stream_completion_lifecycle(
+        request=SimpleNamespace(channel_meta={"goal_id": goal_id}),
+        runtime=runtime,
+        plan=_TurnPlan(original_user_message="Start Goal", turn_msgs=[]),
+        outcome=_QueryTurnOutcome(),
+    )
+    await anext(stream)
+    waiting_turn = asyncio.create_task(anext(stream))
+    await waiting.wait()
+    waiting_turn.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await waiting_turn
+
+    assert (await service.get(goal_id)).state == GoalState.INTERRUPTED
 
 
 def test_goal_finalization_agent_is_tool_free(
@@ -560,8 +856,7 @@ def test_goal_completion_judge_agent_is_restricted_and_model_frozen(
     assert "completion review" in prompt.lower()
     assert (
         '{"reviews":[{"criterion_id":...,"decision":"accept"|"reject",'
-        '"reason":...,"evidence_refs":[...]}]}'
-        in prompt
+        '"reason":...,"evidence_refs":[...]}]}' in prompt
     )
     assert "one entry for every supplied criterion" in prompt.lower()
     assert "missing evidence" in prompt.lower()
@@ -1003,7 +1298,8 @@ async def test_goal_stream_rejects_a_goal_from_another_chat(
 ) -> None:
     service, goal_id = await _goal_service()
     monkeypatch.setattr(
-        "swe.app.goals.registry.get_goal_service", lambda: service
+        "swe.app.goals.registry.get_goal_service",
+        lambda: service,
     )
     runner = AgentRunner(agent_id="agent-1", tenant_id="tenant-1")
     agent = SimpleNamespace(
@@ -1013,7 +1309,8 @@ async def test_goal_stream_rejects_a_goal_from_another_chat(
         },
     )
     runtime = SimpleNamespace(
-        agent=agent, chat=SimpleNamespace(id="other-chat")
+        agent=agent,
+        chat=SimpleNamespace(id="other-chat"),
     )
 
     async def unexpected_turn(**_kwargs):
@@ -1059,7 +1356,8 @@ async def test_goal_stream_retries_approved_completion_review_before_next_turn(
 ) -> None:
     service, goal_id = await _goal_service()
     monkeypatch.setattr(
-        "swe.app.goals.registry.get_goal_service", lambda: service
+        "swe.app.goals.registry.get_goal_service",
+        lambda: service,
     )
     runner = AgentRunner(agent_id="agent-1", tenant_id="tenant-1")
     verifier_calls = 0
@@ -1134,7 +1432,8 @@ async def test_steering_during_pending_completion_review_keeps_waiting_for_appro
 ) -> None:
     service, goal_id = await _goal_service()
     monkeypatch.setattr(
-        "swe.app.goals.registry.get_goal_service", lambda: service
+        "swe.app.goals.registry.get_goal_service",
+        lambda: service,
     )
     runner = AgentRunner(agent_id="agent-1", tenant_id="tenant-1")
     review_calls = 0
@@ -1169,7 +1468,10 @@ async def test_steering_during_pending_completion_review_keeps_waiting_for_appro
         assert waiting_goal_id == goal_id
         wait_calls += 1
         if wait_calls == 1:
-            await service.enqueue_steering(goal_id, "Please prioritize edge cases")
+            await service.enqueue_steering(
+                goal_id,
+                "Please prioritize edge cases",
+            )
         else:
             await service.wake(goal_id, "Judge tool approval approved")
 
@@ -1206,7 +1508,8 @@ async def test_interrupted_goal_does_not_emit_a_finalization_message(
 ) -> None:
     service, goal_id = await _goal_service()
     monkeypatch.setattr(
-        "swe.app.goals.registry.get_goal_service", lambda: service
+        "swe.app.goals.registry.get_goal_service",
+        lambda: service,
     )
     runner = AgentRunner(agent_id="agent-1", tenant_id="tenant-1")
     agent = SimpleNamespace(
@@ -1234,3 +1537,38 @@ async def test_interrupted_goal_does_not_emit_a_finalization_message(
 
     assert [event[0].content for event in events] == ["partial"]
     assert (await service.get(goal_id)).state.value == "INTERRUPTED"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_goal_turn_is_marked_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, goal_id = await _goal_service()
+    monkeypatch.setattr(
+        "swe.app.goals.registry.get_goal_service",
+        lambda: service,
+    )
+    runner = AgentRunner(agent_id="agent-1", tenant_id="tenant-1")
+    runtime = SimpleNamespace(
+        agent=SimpleNamespace(
+            _request_context={"source_id": "source-1"},
+        ),
+        chat=SimpleNamespace(id="chat-1"),
+    )
+
+    async def cancelled_turn(**_kwargs):
+        raise asyncio.CancelledError()
+        yield
+
+    monkeypatch.setattr(runner, "_stream_agent_turns", cancelled_turn)
+
+    with pytest.raises(asyncio.CancelledError):
+        async for _event in runner._stream_completion_lifecycle(
+            request=SimpleNamespace(channel_meta={"goal_id": goal_id}),
+            runtime=runtime,
+            plan=_TurnPlan(original_user_message="Start Goal", turn_msgs=[]),
+            outcome=_QueryTurnOutcome(),
+        ):
+            pass
+
+    assert (await service.get(goal_id)).state == GoalState.INTERRUPTED

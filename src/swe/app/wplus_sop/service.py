@@ -10,6 +10,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlencode
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from .models import (
@@ -17,9 +18,13 @@ from .models import (
     AnswerBatch,
     ChatProjectionOutboxItem,
     CommandReceipt,
+    ConfirmedStageSnapshot,
+    CumulativePreview,
+    CumulativeRefreshedPayload,
     EntryDetectionMode,
     EntryProposalStatus,
     EventKind,
+    LifecycleProgressPayload,
     MemoryCandidatesPayload,
     MemoryCandidateStatus,
     MemoryWriteCompletedPayload,
@@ -45,6 +50,9 @@ from .models import (
     StageProposalPayload,
     StageQueue,
     StageQueueConfirmedPayload,
+    StageReport,
+    StageReportGeneratedPayload,
+    StageReportGenerationFailedPayload,
     StageStatus,
     StructuredInteractionEnvelope,
     TerminationSummaryPayload,
@@ -73,6 +81,38 @@ _OUTBOX_LOCKS_GUARD = threading.Lock()
 _OUTBOX_LOCKS: dict[str, asyncio.Lock] = {}
 _CHAT_IDLE_WAIT_TIMEOUT_SECONDS = 10.0
 _CHAT_IDLE_POLL_SECONDS = 0.05
+_CUMULATIVE_CONTINUATION_COMMAND = "continue_after_cumulative"
+
+
+def _cumulative_handoff_pending(record: SessionRecord) -> bool:
+    """Return whether the current run crossed cumulative output only."""
+
+    projection = record.projection
+    if projection.state not in {
+        SessionState.GENERATING_QUESTIONS,
+        SessionState.FINALIZING_OUTPUTS,
+    }:
+        return False
+    attempt = next(
+        (
+            item
+            for item in record.runs
+            if item.run_id == projection.current_run_id
+            and item.status in {RunStatus.CLAIMED, RunStatus.RUNNING}
+        ),
+        None,
+    )
+    if attempt is None:
+        return False
+    receipt = record.command_receipts.get(attempt.command_request_id)
+    claimed_version = receipt.resulting_state_version if receipt else None
+    if claimed_version is None:
+        return False
+    return any(
+        event.kind is EventKind.CUMULATIVE_REFRESHED
+        and event.state_version > claimed_version
+        for event in record.events
+    )
 
 
 class _CommandResult:
@@ -112,6 +152,8 @@ class _CommandResult:
         self.rerun_of = rerun_of
         self.cancel_active_run = cancel_active_run
         self.runtime_payload = runtime_payload or {}
+
+
 _CHAT_IDLE_RETRY_AFTER_MS = 1000
 
 
@@ -187,7 +229,10 @@ def _parse_memory_decisions(
         raise WPlusCommandError("Memory decisions must be a complete list")
     decisions: dict[str, str] = {}
     for raw in raw_decisions:
-        if not isinstance(raw, dict) or set(raw) != {"candidate_id", "decision"}:
+        if not isinstance(raw, dict) or set(raw) != {
+            "candidate_id",
+            "decision",
+        }:
             raise WPlusCommandError("Invalid memory decision")
         candidate_id = raw.get("candidate_id")
         decision = raw.get("decision")
@@ -198,11 +243,7 @@ def _parse_memory_decisions(
         ):
             raise WPlusCommandError("Invalid memory decision")
         candidate = next(
-            (
-                item
-                for item in candidates
-                if item.candidate_id == candidate_id
-            ),
+            (item for item in candidates if item.candidate_id == candidate_id),
             None,
         )
         if (
@@ -221,7 +262,9 @@ def _parse_memory_decisions(
         in {MemoryCandidateStatus.PENDING, MemoryCandidateStatus.FAILED}
     }
     if set(decisions) != unresolved_ids:
-        raise WPlusCommandError("Memory decisions must cover every unresolved candidate")
+        raise WPlusCommandError(
+            "Memory decisions must cover every unresolved candidate",
+        )
     return decisions
 
 
@@ -237,7 +280,9 @@ def _memory_runtime_candidate(candidate: Any) -> dict[str, Any]:
         or candidate.target_scope is None
         or candidate.target_file is None
     ):
-        raise WPlusCommandError("Memory candidate is not ready for an approved run")
+        raise WPlusCommandError(
+            "Memory candidate is not ready for an approved run",
+        )
     return {
         "candidate_id": candidate.candidate_id,
         "type": candidate.memory_type,
@@ -264,7 +309,10 @@ def _apply_memory_batch_results(
         raise WPlusCommandError(
             "Memory batch result must cover every server-bound candidate",
         )
-    candidates = [candidate.model_copy(deep=True) for candidate in projection.memory_candidates]
+    candidates = [
+        candidate.model_copy(deep=True)
+        for candidate in projection.memory_candidates
+    ]
     for index, candidate in enumerate(candidates):
         result = results_by_id.get(candidate.candidate_id)
         if result is None:
@@ -305,7 +353,10 @@ def _apply_memory_batch_results(
             )
     target = (
         SessionState.MEMORY_REVIEW
-        if any(candidate.status is MemoryCandidateStatus.FAILED for candidate in candidates)
+        if any(
+            candidate.status is MemoryCandidateStatus.FAILED
+            for candidate in candidates
+        )
         else SessionState.COMPLETED
     )
     return candidates, target
@@ -373,6 +424,15 @@ _RUN_EVENT_STATES: dict[EventKind, frozenset[SessionState]] = {
         },
     ),
     EventKind.SOP_RESULT: frozenset({SessionState.FINALIZING_OUTPUTS}),
+    EventKind.STAGE_REPORT_GENERATED: frozenset(
+        {SessionState.GENERATING_STAGE_REPORT},
+    ),
+    EventKind.STAGE_REPORT_GENERATION_FAILED: frozenset(
+        {SessionState.GENERATING_STAGE_REPORT},
+    ),
+    EventKind.CUMULATIVE_REFRESHED: frozenset(
+        {SessionState.REFRESHING_CUMULATIVE},
+    ),
     EventKind.MEMORY_CANDIDATES: frozenset(
         {SessionState.FINALIZING_OUTPUTS},
     ),
@@ -391,6 +451,8 @@ _RUN_EVENT_STATES: dict[EventKind, frozenset[SessionState]] = {
             SessionState.GENERATING_QUESTIONS,
             SessionState.GENERATING_TRIAL,
             SessionState.EXECUTING_TRIAL,
+            SessionState.GENERATING_STAGE_REPORT,
+            SessionState.REFRESHING_CUMULATIVE,
             SessionState.FINALIZING_OUTPUTS,
             SessionState.WRITING_MEMORY,
         },
@@ -401,6 +463,8 @@ _RUN_EVENT_STATES: dict[EventKind, frozenset[SessionState]] = {
             SessionState.GENERATING_QUESTIONS,
             SessionState.GENERATING_TRIAL,
             SessionState.EXECUTING_TRIAL,
+            SessionState.GENERATING_STAGE_REPORT,
+            SessionState.REFRESHING_CUMULATIVE,
             SessionState.FINALIZING_OUTPUTS,
             SessionState.WRITING_MEMORY,
         },
@@ -413,6 +477,9 @@ _PENDING_EXIT_BOUNDARIES = frozenset(
         EventKind.QUESTION_BATCH,
         EventKind.TRIAL_EXECUTION_COMPLETED,
         EventKind.TRIAL_EXECUTION_FAILED,
+        EventKind.STAGE_REPORT_GENERATED,
+        EventKind.STAGE_REPORT_GENERATION_FAILED,
+        EventKind.CUMULATIVE_REFRESHED,
         EventKind.MEMORY_CANDIDATES,
         EventKind.MEMORY_WRITE_COMPLETED,
         EventKind.MEMORY_WRITE_FAILED,
@@ -427,6 +494,8 @@ _ORPHAN_RECOVERY_STATES = frozenset(
         SessionState.GENERATING_QUESTIONS,
         SessionState.GENERATING_TRIAL,
         SessionState.EXECUTING_TRIAL,
+        SessionState.GENERATING_STAGE_REPORT,
+        SessionState.REFRESHING_CUMULATIVE,
         SessionState.FINALIZING_OUTPUTS,
         SessionState.WRITING_MEMORY,
     },
@@ -453,7 +522,9 @@ def _validate_delivered_artifacts(
         try:
             local_file.relative_to(static_root)
         except ValueError as exc:
-            raise WPlusCommandError("artifact escaped workspace static") from exc
+            raise WPlusCommandError(
+                "artifact escaped workspace static",
+            ) from exc
         if not local_file.is_file():
             raise WPlusCommandError(
                 f"delivered artifact is missing: {artifact.artifact_id}",
@@ -465,10 +536,67 @@ def _validate_delivered_artifacts(
             )
 
 
-def _result_preview(result: Any) -> dict[str, str | None]:
+def _artifact_path_segment(value: Any) -> str:
+    return quote(str(value), safe="")
+
+
+def _artifact_url(path: str, query: dict[str, Any]) -> str:
+    return f"{path}?{urlencode(query)}"
+
+
+def _final_artifact_download_url(
+    sop_session_id: str,
+    artifact_id: str,
+) -> str:
+    return _artifact_url(
+        "/api/wplus-sop/sessions/"
+        f"{_artifact_path_segment(sop_session_id)}/artifacts/"
+        f"{_artifact_path_segment(artifact_id)}",
+        {"download": "true"},
+    )
+
+
+def _stage_report_artifact_download_url(
+    sop_session_id: str,
+    report: StageReport,
+    artifact_id: str,
+) -> str:
+    return _artifact_url(
+        "/api/wplus-sop/sessions/"
+        f"{_artifact_path_segment(sop_session_id)}/stage-report-artifacts/"
+        f"{_artifact_path_segment(artifact_id)}",
+        {
+            "stage_id": report.stage_id,
+            "revision": report.revision,
+            "report_no": report.report_no,
+            "download": "true",
+        },
+    )
+
+
+def _cumulative_artifact_download_url(
+    sop_session_id: str,
+    preview: CumulativePreview,
+    artifact_id: str,
+) -> str:
+    return _artifact_url(
+        "/api/wplus-sop/sessions/"
+        f"{_artifact_path_segment(sop_session_id)}/cumulative-artifacts/"
+        f"{_artifact_path_segment(artifact_id)}",
+        {
+            "preview_version": preview.preview_version,
+            "download": "true",
+        },
+    )
+
+
+def _result_preview(
+    result: Any,
+    *,
+    sop_session_id: str,
+) -> dict[str, str | None]:
     artifacts_by_id = {
-        artifact.artifact_id: artifact
-        for artifact in result.artifacts
+        artifact.artifact_id: artifact for artifact in result.artifacts
     }
     markdown_artifact = artifacts_by_id.get("sop_render_md")
     html_artifact = artifacts_by_id.get("sop_render_html")
@@ -476,9 +604,21 @@ def _result_preview(result: Any) -> dict[str, str | None]:
         "markdown": result.readable_sop,
         "html": result.html,
         "markdown_url": (
-            markdown_artifact.static_url if markdown_artifact else None
+            _final_artifact_download_url(
+                sop_session_id,
+                markdown_artifact.artifact_id,
+            )
+            if markdown_artifact
+            else None
         ),
-        "html_url": html_artifact.static_url if html_artifact else None,
+        "html_url": (
+            _final_artifact_download_url(
+                sop_session_id,
+                html_artifact.artifact_id,
+            )
+            if html_artifact
+            else None
+        ),
         "markdown_sha256": (
             markdown_artifact.sha256 if markdown_artifact else None
         ),
@@ -646,7 +786,8 @@ def _serialize_current_trial(
         failed,
     )
     trial = {
-        "run_id": run_id or (current_attempt.run_id if current_attempt else ""),
+        "run_id": run_id
+        or (current_attempt.run_id if current_attempt else ""),
         "attempt_id": current_attempt.attempt_id if current_attempt else None,
         "rerun_of_run_id": (
             current_attempt.rerun_of_run_id if current_attempt else None
@@ -666,6 +807,57 @@ def _serialize_current_trial(
         "result_rows": result_rows,
     }
     return trial, capabilities
+
+
+def _serialize_artifact(
+    artifact: Any,
+    *,
+    download_url: str,
+) -> dict[str, Any]:
+    return {
+        "artifact_id": artifact.artifact_id,
+        "name": artifact.name,
+        "format": (
+            "json"
+            if artifact.name.endswith(".json")
+            else (
+                "markdown"
+                if artifact.name.endswith(".md")
+                else "html"
+            )
+        ),
+        "status": "validated",
+        "download_url": download_url,
+        "sha256": artifact.sha256,
+        "copied_by": artifact.copied_by,
+    }
+
+
+def _serialize_cumulative_preview(
+    preview: CumulativePreview,
+    *,
+    sop_session_id: str,
+) -> dict[str, Any]:
+    return {
+        "preview_version": preview.preview_version,
+        "stage_order": preview.stage_order,
+        "snapshots": [
+            snapshot.model_dump(mode="json")
+            for snapshot in preview.snapshots
+        ],
+        "artifacts": [
+            _serialize_artifact(
+                artifact,
+                download_url=_cumulative_artifact_download_url(
+                    sop_session_id,
+                    preview,
+                    artifact.artifact_id,
+                ),
+            )
+            for artifact in preview.artifacts
+        ],
+        "rendered_sha256": preview.rendered_sha256,
+    }
 
 
 def serialize_session(record: SessionRecord) -> dict[str, Any]:
@@ -726,23 +918,13 @@ def serialize_session(record: SessionRecord) -> dict[str, Any]:
         "unknowns": projection.unknowns,
         "capabilities": capabilities,
         "artifacts": [
-            {
-                "artifact_id": artifact.artifact_id,
-                "name": artifact.name,
-                "format": (
-                    "json"
-                    if artifact.name.endswith(".json")
-                    else (
-                        "markdown"
-                        if artifact.name.endswith(".md")
-                        else "html"
-                    )
+            _serialize_artifact(
+                artifact,
+                download_url=_final_artifact_download_url(
+                    projection.sop_session_id,
+                    artifact.artifact_id,
                 ),
-                "status": "validated",
-                "download_url": artifact.static_url,
-                "sha256": artifact.sha256,
-                "copied_by": artifact.copied_by,
-            }
+            )
             for artifact in (
                 projection.final_result.artifacts
                 if projection.final_result is not None
@@ -750,8 +932,40 @@ def serialize_session(record: SessionRecord) -> dict[str, Any]:
             )
         ],
         "result_preview": (
-            _result_preview(projection.final_result)
+            _result_preview(
+                projection.final_result,
+                sop_session_id=projection.sop_session_id,
+            )
             if projection.final_result is not None
+            else None
+        ),
+        "stage_reports": [
+            {
+                "stage_id": report.stage_id,
+                "report_no": report.report_no,
+                "revision": report.revision,
+                "superseded_by": report.superseded_by,
+                "created_at": report.created_at.isoformat(),
+                "artifacts": [
+                    _serialize_artifact(
+                        artifact,
+                        download_url=_stage_report_artifact_download_url(
+                            projection.sop_session_id,
+                            report,
+                            artifact.artifact_id,
+                        ),
+                    )
+                    for artifact in report.artifacts
+                ],
+            }
+            for report in projection.stage_reports
+        ],
+        "cumulative_preview": (
+            _serialize_cumulative_preview(
+                projection.cumulative_preview,
+                sop_session_id=projection.sop_session_id,
+            )
+            if projection.cumulative_preview is not None
             else None
         ),
         "memory_candidates": [
@@ -840,12 +1054,19 @@ class WPlusSopService:
         """Project transient owning-Chat availability without persisting it."""
 
         record = self._owned_record(sop_session_id)
-        task_tracker = getattr(self.workspace, "task_tracker", None)
-        get_status = getattr(task_tracker, "get_status", None)
-        if not callable(get_status):
-            tracker_status = "idle"
-        else:
-            tracker_status = await get_status(self.ownership.chat_id)
+        coordinator = getattr(
+            self.workspace,
+            "answer_turn_coordinator",
+            None,
+        )
+        turn_status = (
+            await coordinator.status(self.ownership.chat_id)
+            if coordinator is not None
+            else None
+        )
+        tracker_status = (
+            turn_status.value if turn_status is not None else "idle"
+        )
 
         if tracker_status == "idle":
             status = "ready"
@@ -868,9 +1089,7 @@ class WPlusSopService:
             "status": status,
             "runtime_ready": runtime_ready,
             "blocking_run_id": (
-                None
-                if runtime_ready
-                else record.projection.current_run_id
+                None if runtime_ready else record.projection.current_run_id
             ),
         }
 
@@ -936,9 +1155,7 @@ class WPlusSopService:
             attempt = current_candidates[0]
             payload = RecoverableFailurePayload(
                 error_code="orphaned_agent_run",
-                summary=(
-                    "后台 Agent 任务已丢失；可以从原生成步骤安全重试。"
-                ),
+                summary=("后台 Agent 任务已丢失；可以从原生成步骤安全重试。"),
                 failed_operation=attempt.command,
                 failed_run_id=attempt.run_id,
             )
@@ -1061,7 +1278,7 @@ class WPlusSopService:
             and str(getattr(chat, "id", "")) == self.ownership.chat_id
             and str(getattr(chat, "user_id", "")) == self.ownership.user_id
             and str(getattr(chat, "session_id", ""))
-            == self.ownership.logical_chat_session_id
+            == self.ownership.logical_chat_session_id,
         )
 
     @staticmethod
@@ -1091,13 +1308,19 @@ class WPlusSopService:
     async def _wait_for_owning_chat_idle(self) -> None:
         """Wait for the prior Agent producer to release the owning Chat."""
 
-        task_tracker = getattr(self.workspace, "task_tracker", None)
-        get_status = getattr(task_tracker, "get_status", None)
-        if not callable(get_status):
+        coordinator = getattr(
+            self.workspace,
+            "answer_turn_coordinator",
+            None,
+        )
+        if coordinator is None:
             return
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _CHAT_IDLE_WAIT_TIMEOUT_SECONDS
-        while await get_status(self.ownership.chat_id) != "idle":
+        while (
+            await coordinator.current_identity(self.ownership.chat_id)
+            is not None
+        ):
             remaining = deadline - loop.time()
             if remaining <= 0:
                 raise WPlusOwningChatFinalizingError()
@@ -1320,6 +1543,91 @@ class WPlusSopService:
             raise WPlusOwnershipError(proposal_id)
         return proposal
 
+    async def _start_cumulative_continuation(
+        self,
+        *,
+        sop_session_id: str,
+        completed_run_id: str,
+        completed_attempt_id: str,
+    ) -> None:
+        """Atomically settle cumulative work and claim its next Agent run."""
+
+        await self._wait_for_owning_chat_idle()
+        record = self._owned_record(sop_session_id)
+        projection = record.projection
+        if (
+            projection.current_run_id != completed_run_id
+            or not _cumulative_handoff_pending(record)
+        ):
+            return
+        target_state = projection.state
+        identity_seed = (
+            f"{sop_session_id}|{completed_attempt_id}|cumulative-continuation"
+        )
+        run_id = f"run_{uuid5(NAMESPACE_URL, identity_seed + '|run').hex}"
+        attempt_id = (
+            f"attempt_{uuid5(NAMESPACE_URL, identity_seed + '|attempt').hex}"
+        )
+        command_request_id = f"cmd_cumulative_{completed_attempt_id}"
+        result = _CommandResult(
+            target_state=target_state,
+            kind=EventKind.LIFECYCLE_PROGRESS,
+            typed_payload=LifecycleProgressPayload(
+                phase="agent_turn_handoff",
+                message="上一 Agent 回合已完成，启动下一步。",
+                run_id=run_id,
+            ),
+            starts_run=True,
+        )
+        self._augment_command_runtime_payload(projection, result)
+        event = self._event(
+            record,
+            EventKind.LIFECYCLE_PROGRESS,
+            result.typed_payload.model_dump(mode="json"),
+            event_id=f"evt_cumulative_{completed_attempt_id}",
+        )
+        receipt = CommandReceipt(
+            command_request_id=command_request_id,
+            command=_CUMULATIVE_CONTINUATION_COMMAND,
+            sop_session_id=sop_session_id,
+            resulting_state_version=event.state_version,
+            starts_run=True,
+            run_id=run_id,
+            attempt_id=attempt_id,
+        )
+        attempt = RunAttempt(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            command_request_id=command_request_id,
+            command=_CUMULATIVE_CONTINUATION_COMMAND,
+            status=RunStatus.CLAIMED,
+        )
+        mutation = self.store.commit_event(
+            sop_session_id,
+            expected_state_version=projection.state_version,
+            event=event,
+            next_state=target_state,
+            outbox_item=self._outbox(event),
+            command_receipt=receipt,
+            run_attempt=attempt,
+            run_completion=(
+                completed_run_id,
+                completed_attempt_id,
+                RunStatus.COMPLETED,
+            ),
+        )
+        if mutation.duplicate:
+            return
+        await self._start_command_run(
+            sop_session_id=sop_session_id,
+            command=_CUMULATIVE_CONTINUATION_COMMAND,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            target_state=target_state,
+            runtime_payload=result.runtime_payload,
+            mutation=mutation,
+        )
+
     async def _on_agent_turn_complete(
         self,
         *,
@@ -1405,14 +1713,13 @@ class WPlusSopService:
                         else RunStatus.COMPLETED
                     ),
                 )
-            elif projection.state in {
-                SessionState.GENERATING_STAGE_PROPOSAL,
-                SessionState.GENERATING_QUESTIONS,
-                SessionState.GENERATING_TRIAL,
-                SessionState.EXECUTING_TRIAL,
-                SessionState.FINALIZING_OUTPUTS,
-                SessionState.WRITING_MEMORY,
-            }:
+            elif _cumulative_handoff_pending(record):
+                await self._start_cumulative_continuation(
+                    sop_session_id=sop_session_id,
+                    completed_run_id=run_id,
+                    completed_attempt_id=attempt_id,
+                )
+            elif projection.state in _ORPHAN_RECOVERY_STATES:
                 self._record_runtime_failure(
                     sop_session_id=sop_session_id,
                     summary=(
@@ -1535,9 +1842,11 @@ class WPlusSopService:
                 verified_chat=chat,
             )
         original_text = str(
-            (proposal.original_request or {}).get("text", "")
-            if isinstance(proposal.original_request, dict)
-            else "",
+            (
+                (proposal.original_request or {}).get("text", "")
+                if isinstance(proposal.original_request, dict)
+                else ""
+            ),
         )
         try:
             await start_wplus_chat_turn(
@@ -1613,9 +1922,12 @@ class WPlusSopService:
             self._owned_proposal(proposal_id)
         except WPlusOwnershipError:
             return False
-        digest = "sha256:" + hashlib.sha256(
-            original_text.encode("utf-8"),
-        ).hexdigest()
+        digest = (
+            "sha256:"
+            + hashlib.sha256(
+                original_text.encode("utf-8"),
+            ).hexdigest()
+        )
         return self.store.suppression_matches(
             proposal_id,
             suppression_token=suppression_token,
@@ -1631,9 +1943,12 @@ class WPlusSopService:
         suppression_token: str,
         original_text: str,
     ) -> bool:
-        digest = "sha256:" + hashlib.sha256(
-            original_text.encode("utf-8"),
-        ).hexdigest()
+        digest = (
+            "sha256:"
+            + hashlib.sha256(
+                original_text.encode("utf-8"),
+            ).hexdigest()
+        )
         return self.store.consume_suppression(
             proposal_id,
             claim_id=claim_id,
@@ -1649,9 +1964,12 @@ class WPlusSopService:
         suppression_token: str,
         original_text: str,
     ) -> str | None:
-        digest = "sha256:" + hashlib.sha256(
-            original_text.encode("utf-8"),
-        ).hexdigest()
+        digest = (
+            "sha256:"
+            + hashlib.sha256(
+                original_text.encode("utf-8"),
+            ).hexdigest()
+        )
         return self.store.claim_suppression(
             proposal_id,
             suppression_token=suppression_token,
@@ -1708,8 +2026,7 @@ class WPlusSopService:
                     failed_attempt_id,
                     RunStatus.FAILED,
                 )
-                if failed_run_id is not None
-                and failed_attempt_id is not None
+                if failed_run_id is not None and failed_attempt_id is not None
                 else None
             ),
         )
@@ -1901,9 +2218,10 @@ class WPlusSopService:
             for option in question.options
             if option.requires_custom_input
         }
-        if custom_option_ids.intersection(answer.selected_option_ids) and not (
-            answer.text or ""
-        ).strip():
+        if (
+            custom_option_ids.intersection(answer.selected_option_ids)
+            and not (answer.text or "").strip()
+        ):
             raise WPlusCommandError(
                 "selected option requires non-empty custom input text",
             )
@@ -1953,9 +2271,8 @@ class WPlusSopService:
         if handler is None:
             raise WPlusCommandError(f"Unsupported command: {command}")
         result = handler(self, record, payload, command)
-        # Preserve original behaviour: runtime_payload inherits from the
-        # request payload so downstream augmentation can spread it.
-        result.runtime_payload = {**payload, **result.runtime_payload}
+        if result.starts_run and not result.runtime_payload:
+            result.runtime_payload = dict(payload)
         self._augment_command_runtime_payload(projection, result)
         return await self._execute_command_run_lifecycle(
             sop_session_id=sop_session_id,
@@ -2025,7 +2342,10 @@ class WPlusSopService:
         command: str,
     ) -> _CommandResult:
         projection = record.projection
-        if projection.state is not SessionState.AWAITING_TRIAL_FEEDBACK:
+        if projection.state not in {
+            SessionState.AWAITING_TRIAL_FEEDBACK,
+            SessionState.AWAITING_STAGE_CONFIRMATION,
+        }:
             raise WPlusCommandError("Session is not awaiting trial feedback")
         feedback = str(payload.get("feedback", "")).strip()
         rerun_of = str(
@@ -2033,8 +2353,16 @@ class WPlusSopService:
         )
         if not feedback or not rerun_of:
             raise WPlusCommandError("feedback and prior run are required")
+        next_action = str(payload.get("next_action") or "rerun").strip()
+        if next_action not in {"clarify", "rerun"}:
+            raise WPlusCommandError("Unsupported trial feedback next_action")
+        target_state = (
+            SessionState.GENERATING_QUESTIONS
+            if next_action == "clarify"
+            else SessionState.GENERATING_TRIAL
+        )
         return _CommandResult(
-            target_state=SessionState.GENERATING_TRIAL,
+            target_state=target_state,
             kind=EventKind.TRIAL_FEEDBACK_ACCEPTED,
             typed_payload=TrialFeedbackAcceptedPayload(
                 feedback=feedback,
@@ -2045,7 +2373,7 @@ class WPlusSopService:
                 "trial_feedback": [*projection.trial_feedback, feedback],
                 "trial_result_lists": [],
             },
-            rerun_of=rerun_of,
+            rerun_of=rerun_of if next_action == "rerun" else None,
             starts_run=True,
         )
 
@@ -2062,12 +2390,13 @@ class WPlusSopService:
         if not projection.current_stage_id:
             raise WPlusCommandError("Current stage is missing")
         return _CommandResult(
-            target_state=SessionState.AWAITING_STAGE_CONFIRMATION,
+            target_state=SessionState.GENERATING_STAGE_REPORT,
             kind=EventKind.STAGE_CONFIRMATION_REQUIRED,
             typed_payload=StageConfirmationRequiredPayload(
                 stage_id=projection.current_stage_id,
-                summary="用户接受当前预跑结果，等待环节确认。",
+                summary="用户接受当前预跑结果，生成环节报告，等待环节确认。",
             ),
+            starts_run=True,
         )
 
     @staticmethod
@@ -2094,27 +2423,55 @@ class WPlusSopService:
         )
         if current_index < 0:
             raise WPlusCommandError("Current stage is not in the queue")
+        candidates = [
+            report
+            for report in projection.stage_reports
+            if (
+                report.stage_id == current_id
+                and report.revision == projection.revision
+                and report.superseded_by is None
+            )
+        ]
+        if not candidates:
+            raise WPlusCommandError(
+                "Current stage has no acceptable report to confirm",
+            )
+        latest = max(candidates, key=lambda report: report.report_no)
+        json_artifact = next(
+            artifact
+            for artifact in latest.artifacts
+            if artifact.artifact_id == "stage_sop_json"
+        )
         stages[current_index].status = StageStatus.CONFIRMED
         is_final = current_index == len(stages) - 1
         next_stage_id = None
-        if is_final:
-            target_state = SessionState.FINALIZING_OUTPUTS
-        else:
+        if not is_final:
             stages[current_index + 1].status = StageStatus.CLARIFYING
             next_stage_id = stages[current_index + 1].stage_id
-            target_state = SessionState.GENERATING_QUESTIONS
+        snapshots = [
+            *projection.confirmed_snapshots,
+            ConfirmedStageSnapshot(
+                stage_id=current_id,
+                report_no=latest.report_no,
+                revision=latest.revision,
+                artifact_sha256=json_artifact.sha256,
+            ),
+        ]
         return _CommandResult(
-            target_state=target_state,
+            target_state=SessionState.REFRESHING_CUMULATIVE,
             kind=EventKind.STAGE_CONFIRMED,
             typed_payload=StageConfirmedPayload(
                 stage_id=current_id,
                 next_stage_id=next_stage_id,
                 is_final_stage=is_final,
+                confirmed_report_no=latest.report_no,
             ),
             changes={
                 "stages": stages,
                 "current_stage_id": next_stage_id or current_id,
                 "current_question_batch": None,
+                "confirmed_snapshots": snapshots,
+                "cumulative_preview": None,
             },
             starts_run=True,
         )
@@ -2139,11 +2496,30 @@ class WPlusSopService:
         if revised_round < 1 or revised_round > len(projection.answers):
             raise WPlusCommandError("Invalid revised_round")
         previous = projection.answers[revised_round - 1]
+        current_stage = next(
+            (
+                stage
+                for stage in projection.stages
+                if stage.stage_id == projection.current_stage_id
+            ),
+            None,
+        )
+        if (
+            previous.stage_id != projection.current_stage_id
+            or current_stage is None
+            or current_stage.status is StageStatus.CONFIRMED
+        ):
+            raise WPlusCommandError(
+                "Answers can only be revised for the current unconfirmed stage",
+            )
         raw_answers = payload.get("answers")
         if not isinstance(raw_answers, dict):
             raise WPlusCommandError("answers must be an object")
         replacement_answers = _build_revised_answers(
-            svc, record, previous, raw_answers,
+            svc,
+            record,
+            previous,
+            raw_answers,
         )
         replacement = AnswerBatch(
             batch_id=previous.batch_id,
@@ -2160,9 +2536,7 @@ class WPlusSopService:
             invalidated_event_ids=invalidated_event_ids,
             reason=str(payload.get("reason") or "user_revised_answer"),
         )
-        stages = [
-            stage.model_copy(deep=True) for stage in projection.stages
-        ]
+        stages = [stage.model_copy(deep=True) for stage in projection.stages]
         revised_stage_seen = False
         for stage in stages:
             if stage.stage_id == previous.stage_id:
@@ -2255,9 +2629,7 @@ class WPlusSopService:
             SessionState.PENDING_EXIT
             if generating
             else (
-                SessionState.TERMINATED
-                if terminate
-                else SessionState.PAUSED
+                SessionState.TERMINATED if terminate else SessionState.PAUSED
             )
         )
         kind = (
@@ -2346,7 +2718,9 @@ class WPlusSopService:
         projection = record.projection
         if projection.state is not SessionState.PAUSED:
             raise WPlusCommandError("Session is not paused")
-        target_state = projection.resume_state or SessionState.RECOVERABLE_FAILURE
+        target_state = (
+            projection.resume_state or SessionState.RECOVERABLE_FAILURE
+        )
         if target_state is SessionState.PENDING_EXIT:
             target_state = SessionState.RECOVERABLE_FAILURE
         starts_run = target_state in {
@@ -2461,7 +2835,10 @@ class WPlusSopService:
                 candidate.candidate_id: "reject"
                 for candidate in candidates
                 if candidate.status
-                in {MemoryCandidateStatus.PENDING, MemoryCandidateStatus.FAILED}
+                in {
+                    MemoryCandidateStatus.PENDING,
+                    MemoryCandidateStatus.FAILED,
+                }
             }
         else:
             decisions = _parse_memory_decisions(payload, candidates)
@@ -2502,9 +2879,7 @@ class WPlusSopService:
             },
             starts_run=starts_run,
             runtime_payload=(
-                {"candidates": approved_payloads}
-                if starts_run
-                else None
+                {"candidates": approved_payloads} if starts_run else None
             ),
         )
 
@@ -2531,6 +2906,21 @@ class WPlusSopService:
                 )
             result.runtime_payload["current_stage_id"] = current_stage_id
             return
+        if result.target_state is SessionState.REFRESHING_CUMULATIVE:
+            current_stage_id = result.changes.get(
+                "current_stage_id",
+                projection.current_stage_id,
+            )
+            confirmed_snapshots = result.changes.get(
+                "confirmed_snapshots",
+                projection.confirmed_snapshots,
+            )
+            result.runtime_payload["current_stage_id"] = current_stage_id
+            result.runtime_payload["confirmed_snapshots"] = [
+                snapshot.model_dump(mode="json")
+                for snapshot in confirmed_snapshots
+            ]
+            return
         if result.target_state is SessionState.WRITING_MEMORY:
             if "candidates" not in result.runtime_payload:
                 active_ids = projection.active_memory_candidate_ids or (
@@ -2548,8 +2938,7 @@ class WPlusSopService:
                         "Memory run has no server-bound candidates",
                     )
                 result.runtime_payload["candidates"] = [
-                    _memory_runtime_candidate(c)
-                    for c in active_candidates
+                    _memory_runtime_candidate(c) for c in active_candidates
                 ]
             return
         if result.target_state is SessionState.FINALIZING_OUTPUTS:
@@ -2579,6 +2968,7 @@ class WPlusSopService:
         """Build event/receipt, commit, cancel active runs, and start a turn."""
         if result.starts_run:
             await self._wait_for_owning_chat_idle()
+            await self._verified_owned_chat()
         run_id, attempt_id = self._init_command_run_ids(result)
         self._apply_command_run_tweaks(result, run_id)
 
@@ -2600,7 +2990,9 @@ class WPlusSopService:
 
         if result.cancel_active_run and projection.current_run_id:
             self._cancel_stored_active_run(
-                sop_session_id, record, projection,
+                sop_session_id,
+                record,
+                projection,
             )
 
         if mutation.duplicate or not result.starts_run:
@@ -2695,9 +3087,21 @@ class WPlusSopService:
 
     async def _cancel_active_chat_run(self) -> None:
         try:
-            await self.workspace.task_tracker.request_stop(
-                self.ownership.chat_id,
+            coordinator = getattr(
+                self.workspace,
+                "answer_turn_coordinator",
+                None,
             )
+            identity = (
+                await coordinator.current_identity(self.ownership.chat_id)
+                if coordinator is not None
+                else None
+            )
+            if coordinator is None or identity is None:
+                return
+            claim = await coordinator.claim_stop(identity, internal=True)
+            if not claim.accepted:
+                raise RuntimeError("active run is not stoppable")
         except Exception as exc:
             raise WPlusCommandError(
                 "The active run could not be cancelled",
@@ -2815,15 +3219,28 @@ class WPlusSopService:
         effective_state = _effective_agent_event_state(record.projection)
 
         idem_result = self._check_agent_event_idempotency(
-            record, event_kind, payload, effective_state, event_key,
+            record,
+            event_kind,
+            payload,
+            effective_state,
+            event_key,
         )
         if idem_result is not None:
             return idem_result
+        if _cumulative_handoff_pending(record):
+            raise WPlusCommandError(
+                "Agent run must complete before the next step",
+            )
 
         _validate_agent_event_state(event_kind, effective_state, state)
 
         result = _AGENT_EVENT_HANDLERS[event_kind](
-            self, record, payload, trusted_run_id, effective_state, event_kind,
+            self,
+            record,
+            payload,
+            trusted_run_id,
+            effective_state,
+            event_kind,
         )
         _resolve_pending_exit_target(record, event_kind, result, state)
 
@@ -2962,8 +3379,7 @@ class WPlusSopService:
     ) -> _AgentEventResult:
         typed = StageProposalPayload.model_validate(payload)
         if any(
-            stage.status is not StageStatus.PENDING
-            for stage in typed.stages
+            stage.status is not StageStatus.PENDING for stage in typed.stages
         ):
             raise WPlusCommandError(
                 "stage_proposal stages must start as pending",
@@ -3030,7 +3446,7 @@ class WPlusSopService:
     ) -> _AgentEventResult:
         dummy = _passthrough_event_payload(
             record,
-            EventKind.TRIAL_EXECUTION_STARTED,
+            event_kind,
             payload,
         )
         return _AgentEventResult(
@@ -3111,6 +3527,115 @@ class WPlusSopService:
         )
 
     @staticmethod
+    def _handle_stage_report_generated_agent_event(
+        svc: WPlusSopService,
+        record: SessionRecord,
+        payload: dict[str, Any],
+        trusted_run_id: str | None,
+        effective_state: SessionState,
+        event_kind: EventKind,
+    ) -> _AgentEventResult:
+        typed = StageReportGeneratedPayload.model_validate(payload)
+        projection = record.projection
+        report = typed.report
+        if report.stage_id != projection.current_stage_id:
+            raise WPlusCommandError(
+                "stage report must belong to the current stage",
+            )
+        if report.revision != projection.revision:
+            raise WPlusCommandError(
+                "stage report revision must match the session revision",
+            )
+        existing = [
+            prior
+            for prior in projection.stage_reports
+            if (
+                prior.stage_id == report.stage_id
+                and prior.revision == report.revision
+            )
+        ]
+        if any(prior.report_no == report.report_no for prior in existing):
+            raise WPlusCommandError("stage report version already exists")
+        max_report_no = max(
+            (prior.report_no for prior in existing),
+            default=0,
+        )
+        if report.report_no != max_report_no + 1:
+            raise WPlusCommandError(
+                "stage report version must increment by one",
+            )
+        reports = [
+            prior.model_copy(update={"superseded_by": report.report_no})
+            if (
+                prior.stage_id == report.stage_id
+                and prior.revision == report.revision
+                and prior.superseded_by is None
+            )
+            else prior
+            for prior in projection.stage_reports
+        ]
+        reports.append(report)
+        return _AgentEventResult(
+            target=SessionState.AWAITING_STAGE_CONFIRMATION,
+            typed_payload=typed,
+            changes={"stage_reports": reports},
+        )
+
+    @staticmethod
+    def _handle_stage_report_generation_failed_agent_event(
+        svc: WPlusSopService,
+        record: SessionRecord,
+        payload: dict[str, Any],
+        trusted_run_id: str | None,
+        effective_state: SessionState,
+        event_kind: EventKind,
+    ) -> _AgentEventResult:
+        typed = StageReportGenerationFailedPayload.model_validate(payload)
+        return _AgentEventResult(
+            target=SessionState.RECOVERABLE_FAILURE,
+            typed_payload=typed,
+            changes={
+                "last_error": RecoverableFailurePayload(
+                    error_code=typed.error_code,
+                    summary=typed.summary,
+                    failed_operation="stage_report_generation",
+                ),
+                "resume_state": effective_state,
+            },
+        )
+
+    @staticmethod
+    def _handle_cumulative_refreshed_agent_event(
+        svc: WPlusSopService,
+        record: SessionRecord,
+        payload: dict[str, Any],
+        trusted_run_id: str | None,
+        effective_state: SessionState,
+        event_kind: EventKind,
+    ) -> _AgentEventResult:
+        typed = CumulativeRefreshedPayload.model_validate(payload)
+        projection = record.projection
+        preview = typed.preview
+        if preview.stage_order != [
+            snapshot.stage_id for snapshot in projection.confirmed_snapshots
+        ]:
+            raise WPlusCommandError(
+                "cumulative preview does not match confirmed snapshots",
+            )
+        is_all_confirmed = (
+            len(projection.confirmed_snapshots) == len(projection.stages)
+        )
+        return _AgentEventResult(
+            target=(
+                SessionState.FINALIZING_OUTPUTS
+                if is_all_confirmed
+                else SessionState.GENERATING_QUESTIONS
+            ),
+            typed_payload=typed,
+            changes={"cumulative_preview": preview},
+        )
+
+    @staticmethod
     def _handle_memory_candidates_agent_event(
         svc: WPlusSopService,
         record: SessionRecord,
@@ -3157,7 +3682,8 @@ class WPlusSopService:
     ) -> _AgentEventResult:
         typed = MemoryWriteBatchResultPayload.model_validate(payload)
         candidates, target = _apply_memory_batch_results(
-            record.projection, typed,
+            record.projection,
+            typed,
         )
         return _AgentEventResult(
             target=target,
@@ -3188,7 +3714,11 @@ class WPlusSopService:
         if candidate.status is not MemoryCandidateStatus.WRITING:
             raise WPlusCommandError("Memory candidate is not being written")
         typed, target = _apply_single_memory_result(
-            record, payload, candidate, candidates, match_index,
+            record,
+            payload,
+            candidate,
+            candidates,
+            match_index,
             event_kind is EventKind.MEMORY_WRITE_COMPLETED,
         )
         return _AgentEventResult(
@@ -3247,6 +3777,7 @@ class WPlusSopService:
 # Module-level agent-event helpers
 # ---------------------------------------------------------------------------
 
+
 class _AgentEventResult:
     __slots__ = ("target", "typed_payload", "changes")
 
@@ -3262,7 +3793,9 @@ class _AgentEventResult:
         self.changes = changes or {}
 
 
-def _effective_agent_event_state(projection: SessionProjection) -> SessionState:
+def _effective_agent_event_state(
+    projection: SessionProjection,
+) -> SessionState:
     state = projection.state
     if state is SessionState.PENDING_EXIT:
         return projection.resume_state or state
@@ -3492,6 +4025,9 @@ _AGENT_EVENT_HANDLERS: dict[EventKind, Any] = {
     EventKind.TRIAL_EXECUTION_COMPLETED: WPlusSopService._handle_trial_execution_completed_agent_event,
     EventKind.TRIAL_EXECUTION_FAILED: WPlusSopService._handle_trial_execution_failed_agent_event,
     EventKind.SOP_RESULT: WPlusSopService._handle_sop_result_agent_event,
+    EventKind.STAGE_REPORT_GENERATED: WPlusSopService._handle_stage_report_generated_agent_event,
+    EventKind.STAGE_REPORT_GENERATION_FAILED: WPlusSopService._handle_stage_report_generation_failed_agent_event,
+    EventKind.CUMULATIVE_REFRESHED: WPlusSopService._handle_cumulative_refreshed_agent_event,
     EventKind.MEMORY_CANDIDATES: WPlusSopService._handle_memory_candidates_agent_event,
     EventKind.MEMORY_WRITE_BATCH_RESULT: WPlusSopService._handle_memory_write_batch_result_agent_event,
     EventKind.MEMORY_WRITE_COMPLETED: WPlusSopService._handle_memory_write_single_agent_event,
@@ -3503,6 +4039,7 @@ _AGENT_EVENT_HANDLERS: dict[EventKind, Any] = {
 # ---------------------------------------------------------------------------
 # Module-level command dispatch helpers
 # ---------------------------------------------------------------------------
+
 
 def _adjust_command_event(
     event: StructuredInteractionEnvelope,

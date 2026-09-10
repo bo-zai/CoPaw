@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -17,6 +18,191 @@ from .session import (
 )
 
 logger = logging.getLogger(__name__)
+
+TURN_STATES_KEY = "turn_states"
+
+
+def _user_turn_anchor(
+    msgs: list[Any],
+    request: Any,
+) -> tuple[str, dict[str, Any]] | None:
+    if not msgs:
+        return None
+    message = msgs[-1]
+    if getattr(message, "role", None) != "user" or not hasattr(
+        message,
+        "to_dict",
+    ):
+        return None
+    channel_meta = getattr(request, "channel_meta", None) or {}
+    turn_id = str(
+        getattr(message, "id", None) or channel_meta.get("msgid") or "",
+    ).strip()
+    if not turn_id:
+        return None
+    return turn_id, message.to_dict()
+
+
+def discard_admitted_user_anchor(agent: Any, turn_id: str | None) -> bool:
+    """Remove the prewritten anchor from the live Agent memory snapshot."""
+    if not turn_id:
+        return False
+    memory = getattr(agent, "memory", None)
+    content = getattr(memory, "content", None)
+    if not isinstance(content, list):
+        return False
+    original_len = len(content)
+    memory.content = [
+        entry
+        for entry in content
+        if not (
+            isinstance(entry, tuple)
+            and entry
+            and getattr(entry[0], "id", None) == turn_id
+        )
+    ]
+    return len(memory.content) != original_len
+
+
+def mark_terminal_turn_state(
+    state: dict[str, Any],
+    turn_id: str,
+    status: str,
+) -> None:
+    """Record one public terminal answer-turn status in the durable state."""
+    turn_states = state.setdefault(TURN_STATES_KEY, {})
+    if not isinstance(turn_states, dict):
+        turn_states = {}
+        state[TURN_STATES_KEY] = turn_states
+    turn_state = turn_states.setdefault(turn_id, {})
+    if not isinstance(turn_state, dict):
+        turn_state = {}
+        turn_states[turn_id] = turn_state
+    turn_state["status"] = status
+
+
+def _find_persisted_turn_anchor(
+    content: list[Any],
+    turn_id: str,
+) -> int | None:
+    """Return the user-anchor index for a persisted turn."""
+    return next(
+        (
+            index
+            for index, entry in enumerate(content)
+            if isinstance(entry, list)
+            and entry
+            and isinstance(entry[0], dict)
+            and entry[0].get("id") == turn_id
+            and entry[0].get("role") == "user"
+        ),
+        None,
+    )
+
+
+def _mark_persisted_assistant_stopped(
+    content: list[Any],
+    anchor_index: int,
+) -> None:
+    """Annotate the latest persisted assistant message after the anchor."""
+    for entry in reversed(content[anchor_index + 1 :]):
+        if (
+            not isinstance(entry, list)
+            or not entry
+            or not isinstance(entry[0], dict)
+        ):
+            continue
+        message = entry[0]
+        if message.get("role") != "assistant":
+            continue
+        metadata = message.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            message["metadata"] = metadata
+        metadata["turn_status"] = "stopped"
+        return
+
+
+def mark_stopped_turn_state(state: dict[str, Any], turn_id: str) -> None:
+    """Record terminal Stop status and annotate the last assistant output."""
+    mark_terminal_turn_state(state, turn_id, "stopped")
+    memory_state = (state.get("agent") or {}).get("memory") or {}
+    content = (
+        memory_state.get("content") if isinstance(memory_state, dict) else None
+    )
+    if not isinstance(content, list):
+        return
+    anchor_index = _find_persisted_turn_anchor(content, turn_id)
+    if anchor_index is None:
+        return
+    _mark_persisted_assistant_stopped(content, anchor_index)
+
+
+def mark_stopped_agent_memory(agent: Any, turn_id: str | None) -> bool:
+    """Annotate the latest assistant message in a live Agent memory."""
+    content = getattr(getattr(agent, "memory", None), "content", None)
+    if not turn_id or not isinstance(content, list):
+        return False
+    anchor_index = next(
+        (
+            index
+            for index, entry in enumerate(content)
+            if isinstance(entry, tuple)
+            and entry
+            and getattr(entry[0], "id", None) == turn_id
+            and getattr(entry[0], "role", None) == "user"
+        ),
+        None,
+    )
+    if anchor_index is None:
+        return False
+    for entry in reversed(content[anchor_index + 1 :]):
+        message = entry[0] if isinstance(entry, tuple) and entry else None
+        if getattr(message, "role", None) != "assistant":
+            continue
+        metadata = getattr(message, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+            message.metadata = metadata
+        metadata["turn_status"] = "stopped"
+        return True
+    return False
+
+
+async def admit_user_turn(
+    execution: Any,
+    *,
+    msgs: list[Any],
+    request: Any,
+) -> str | None:
+    """Durably record the submitted user anchor before preflight/Agent work."""
+    anchor = _user_turn_anchor(msgs, request)
+    if anchor is None:
+        return None
+    turn_id, message = anchor
+    state = execution.state
+    turn_states = state.get(TURN_STATES_KEY)
+    if not isinstance(turn_states, dict):
+        turn_states = {}
+        state[TURN_STATES_KEY] = turn_states
+    existing = turn_states.get(turn_id)
+    if not isinstance(existing, dict) or existing.get("message") != message:
+        admitted_state = {
+            "status": "admitted",
+            "message": message,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        chat_id = (getattr(request, "channel_meta", None) or {}).get(
+            "chat_id",
+        )
+        if isinstance(chat_id, str) and chat_id:
+            admitted_state["chat_id"] = chat_id
+        turn_states[turn_id] = admitted_state
+    if not isinstance(existing, dict) or existing.get("message") != message:
+        execution.mark_state_dirty()
+        await execution.commit_state(state)
+    return turn_id
+
 
 if TYPE_CHECKING:
     from ...agents.react_agent import SWEAgent

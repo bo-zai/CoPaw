@@ -55,6 +55,7 @@ SAFE_WORKER_REQUEST_CONTEXT_KEYS = frozenset(
         "session_id",
         "chat_id",
         "turn_id",
+        "msgid",
         "user_id",
         "channel",
         "source_id",
@@ -556,6 +557,9 @@ class DelegationSpec(BaseModel):
 
     task_id: str = Field(default_factory=lambda: f"task-{uuid4().hex[:12]}")
     parent_thread_id: str = ""
+    parent_chat_id: str = ""
+    parent_msgid: str = ""
+    goal_id: str = ""
     name: str
     objective: str
     background: str = ""

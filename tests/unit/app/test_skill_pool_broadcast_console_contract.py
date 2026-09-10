@@ -19,10 +19,8 @@ BROADCAST_MODAL = (
 SKILL_POOL_PAGE = CONSOLE_SRC / "pages" / "Agent" / "SkillPool" / "index.tsx"
 SKILL_API = CONSOLE_SRC / "api" / "modules" / "skill.ts"
 LOCALE_FILES = {
-    "en": CONSOLE_SRC / "locales" / "en.json",
-    "zh": CONSOLE_SRC / "locales" / "zh.json",
-    "ja": CONSOLE_SRC / "locales" / "ja.json",
-    "ru": CONSOLE_SRC / "locales" / "ru.json",
+    file_path.stem: file_path
+    for file_path in (CONSOLE_SRC / "locales").glob("*.json")
 }
 
 

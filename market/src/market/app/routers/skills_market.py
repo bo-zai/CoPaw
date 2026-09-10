@@ -58,6 +58,7 @@ from ...utils.logging_utils import log_params
 from .skills_browse import (
     _decode_zip_filename,
     _extract_zip_skills,
+    _flush_skill_scan_history,
     _read_validated_zip_upload,
     _scan_found_skills_or_raise,
 )
@@ -816,6 +817,7 @@ async def publish_skill_upload(
     x_manager: Optional[str] = Header(default=None, alias="X-Manager"),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
     x_user_name: Optional[str] = Header(default=None, alias="X-User-Name"),
+    x_bbk_id: Optional[str] = Header(default=None, alias="X-Bbk-Id"),
 ):
     """上传 zip 文件上架技能到市场（管理员）.
 
@@ -862,10 +864,16 @@ async def publish_skill_upload(
             data,
             file.filename,
         )
-        _scan_found_skills_or_raise(found_skills)
+        _scan_found_skills_or_raise(
+            found_skills,
+            source_id=source_id,
+            user_id=x_user_id,
+            bbk_id=x_bbk_id or "",
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except SkillScanError as e:
+        await _flush_skill_scan_history(request)
         raise HTTPException(status_code=400, detail=str(e)) from e
     if not found_skills:
         if tmp_dir.exists():

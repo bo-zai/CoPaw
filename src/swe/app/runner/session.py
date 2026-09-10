@@ -653,6 +653,26 @@ class SafeJSONSession(SessionBase):
         )
         return {}
 
+    async def get_persisted_session_state_dict(
+        self,
+        session_id: str,
+        user_id: str = "",
+        allow_not_exist: bool = True,
+    ) -> dict:
+        """Read the latest atomically committed session snapshot without waiting.
+
+        Session writers replace the JSON file atomically.  A history observer can
+        therefore safely consume the last committed file while an execution owns
+        the transaction lock, rather than waiting for model generation to end.
+        """
+        session_save_path = self._get_save_path(session_id, user_id=user_id)
+        exists, states = await run_runtime_state_work(
+            _read_json_state_sync,
+            session_save_path,
+            allow_not_exist=allow_not_exist,
+        )
+        return states if exists else {}
+
     async def get_session_skill_snapshot(
         self,
         session_id: str,

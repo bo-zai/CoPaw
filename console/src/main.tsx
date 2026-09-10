@@ -13,19 +13,26 @@ import {
 import { isExternalTokenEnabled, ensureValidToken } from "./api/externalToken";
 import { applyConsoleDesignTokens } from "./config/consoleDesignTokens";
 import { initializeChatPresentationFromUrl } from "./stores/chatPresentationStore";
+import AccessDeniedPage from "./access/AccessDeniedPage";
+import {
+  getConsoleAccessDecision,
+  runAccessControlledInitialization,
+} from "./access/consoleAccess";
 
 applyConsoleDesignTokens();
 
 /**
  * 初始化流程：
- * 1. 尽早初始化 iframe 消息监听器，避免遗漏父窗口消息
- * 2. 获取外部 token（如果配置了）
- * 3. 等待 token 获取完成
+ * 1. 校验 iframe 或顶层窗口用户白名单
+ * 2. 尽早初始化 iframe 消息监听器，避免遗漏父窗口消息
+ * 3. 获取并等待外部 token（如果配置了）
  * 4. 处理 URL 参数场景
  * 5. 查询用户名称
  * 6. 渲染 React 应用
  */
-async function initializeApp(): Promise<void> {
+async function initializeAllowedApp(
+  root: ReturnType<typeof createRoot>,
+): Promise<void> {
   // URL presentation flags initialize once per full page load and remain stable
   // while the router normalizes or replaces chat URLs.
   initializeChatPresentationFromUrl(
@@ -53,8 +60,20 @@ async function initializeApp(): Promise<void> {
   // 查询用户名称（在 userId 和 token 获取完毕后）
   await fetchAndSetUserName();
 
-  // 渲染 React 应用
-  createRoot(document.getElementById("root")!).render(<App />);
+  root.render(<App />);
+}
+
+async function initializeApp(): Promise<void> {
+  const root = createRoot(document.getElementById("root")!);
+  const decision = getConsoleAccessDecision();
+
+  await runAccessControlledInitialization({
+    decision,
+    initializeAllowedApp: () => initializeAllowedApp(root),
+    renderAccessDenied: () => {
+      root.render(<AccessDeniedPage />);
+    },
+  });
 }
 
 // 启动初始化

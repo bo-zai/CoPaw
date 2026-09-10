@@ -208,11 +208,9 @@ class SweEstimateTokenCounter(HuggingFaceTokenCounter):
             if isinstance(content, str):
                 parts.append(content)
             elif isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict):
-                        parts.append(block.get("text", ""))
-                    else:
-                        parts.append(str(block))
+                parts.append(
+                    json.dumps(content, ensure_ascii=False, default=str),
+                )
             else:
                 parts.append(str(content))
 

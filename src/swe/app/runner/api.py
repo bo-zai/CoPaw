@@ -2,16 +2,27 @@
 """Chat management API."""
 
 from __future__ import annotations
+
+import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 from agentscope.memory import InMemoryMemory
 
 from .session import (
     SafeJSONSession,
     _normalize_state_for_load,
+)
+from .context_usage import (
+    CONTEXT_USAGE_INVALID_STATE_KEY,
+    CONTEXT_USAGE_STATE_KEY,
+    ContextUsageAvailable,
+    ContextUsageResponse,
+    ContextUsageSnapshot,
+    ContextUsageUnavailable,
 )
 from .manager import ChatManager
 from .models import (
@@ -30,6 +41,7 @@ from .utils import agentscope_msg_to_message
 from ..approvals import get_approval_service
 
 router = APIRouter(prefix="/chats", tags=["chats"])
+logger = logging.getLogger(__name__)
 TASK_MESSAGES_STATE_KEY = "task_messages"
 TASK_RUNS_STATE_KEY = "task_runs"
 TASK_RUN_SECTION_STEP = "step"
@@ -104,7 +116,8 @@ async def _annotate_approval_action_statuses(
 ) -> list[ChatMessage]:
     """Attach current approval status to messages carrying approval metadata."""
     approval_service = get_approval_service()
-
+    request_ids: list[str] = []
+    actions: list[dict[str, Any]] = []
     for message in messages:
         metadata = getattr(message, "metadata", None)
         if not isinstance(metadata, dict):
@@ -121,11 +134,23 @@ async def _annotate_approval_action_statuses(
         request_id = approval_action.get("requestId")
         if not isinstance(request_id, str) or not request_id:
             continue
+        request_ids.append(request_id)
+        actions.append(approval_action)
 
-        request = await approval_service.get_request(request_id)
+    batch_get = getattr(approval_service, "get_requests", None)
+    if callable(batch_get):
+        requests = await batch_get(request_ids)
+    else:
+        requests = {
+            request_id: request
+            for request_id in request_ids
+            if (request := await approval_service.get_request(request_id))
+            is not None
+        }
+    for request_id, approval_action in zip(request_ids, actions):
+        request = requests.get(request_id)
         if request is None:
             continue
-
         approval_action["status"] = request.status
 
     return messages
@@ -252,6 +277,103 @@ async def _messages_from_memory_state(
         session_id=session_id,
         position_offset=position_offset,
     )
+
+
+def _turn_state_to_message(
+    turn_id: object,
+    turn_state: object,
+    *,
+    chat_id: str | None,
+) -> ChatMessage | None:
+    """Convert one durable turn state into a public user message."""
+    if not isinstance(turn_state, dict):
+        return None
+    stored_chat_id = turn_state.get("chat_id")
+    if (
+        chat_id is not None
+        and isinstance(stored_chat_id, str)
+        and stored_chat_id
+        and stored_chat_id != chat_id
+    ):
+        return None
+    raw = turn_state.get("message")
+    if not isinstance(raw, dict) or raw.get("role") != "user":
+        return None
+    content = raw.get("content")
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+    if not isinstance(content, list):
+        return None
+    turn_key = str(turn_id)
+    return ChatMessage.model_validate(
+        {
+            "id": raw.get("id") or turn_key,
+            "type": raw.get("type") or "message",
+            "role": "user",
+            "content": content,
+            "metadata": {
+                **(raw.get("metadata") or {}),
+                "original_id": raw.get("id") or turn_key,
+            },
+            "timestamp": raw.get("timestamp"),
+        },
+    )
+
+
+def _turn_state_messages_from_state(
+    state: dict,
+    *,
+    session_id: str,
+    chat_id: str | None = None,
+) -> list[ChatMessage]:
+    """Expose pre-admitted user anchors when Agent memory has no output yet."""
+    turn_states = state.get("turn_states")
+    if not isinstance(turn_states, dict):
+        return []
+    messages: list[ChatMessage] = []
+    for turn_id, turn_state in turn_states.items():
+        message = _turn_state_to_message(
+            turn_id,
+            turn_state,
+            chat_id=chat_id,
+        )
+        if message is not None:
+            messages.append(message)
+    return messages
+
+
+def _turn_status_from_state(state: dict, msgid: str) -> str | None:
+    turn_states = state.get("turn_states")
+    if not isinstance(turn_states, dict):
+        return None
+    turn_state = turn_states.get(msgid)
+    if not isinstance(turn_state, dict):
+        return None
+    status = turn_state.get("status")
+    return status if isinstance(status, str) else None
+
+
+def _turn_state_chat_id(state: dict, msgid: str) -> str | None:
+    turn_states = state.get("turn_states")
+    if not isinstance(turn_states, dict):
+        return None
+    turn_state = turn_states.get(msgid)
+    if not isinstance(turn_state, dict):
+        return None
+    chat_id = turn_state.get("chat_id")
+    return chat_id if isinstance(chat_id, str) and chat_id else None
+
+
+def _message_turn_status(message: ChatMessage) -> str | None:
+    metadata = getattr(message, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    for candidate in (metadata, metadata.get("metadata")):
+        if isinstance(candidate, dict):
+            status = candidate.get("turn_status")
+            if isinstance(status, str):
+                return status
+    return None
 
 
 def _slice_memory_state(
@@ -598,17 +720,64 @@ async def get_session(
     return workspace.runner.session
 
 
+async def _read_history_state(
+    session: SafeJSONSession,
+    session_id: str,
+    user_id: str,
+) -> dict:
+    """Read the durable history snapshot without delaying on an active turn."""
+    read_snapshot = getattr(session, "get_persisted_session_state_dict", None)
+    if read_snapshot is not None:
+        return await read_snapshot(session_id, user_id)
+    return await session.get_session_state_dict(session_id, user_id)
+
+
+async def _cached_history_state(
+    cache: dict[tuple[str, str], dict],
+    session: SafeJSONSession,
+    session_id: str,
+    user_id: str,
+) -> dict:
+    key = (session_id, user_id)
+    state = cache.get(key)
+    if state is None:
+        state = await session.get_session_state_dict(session_id, user_id)
+        cache[key] = state
+    return state
+
+
 async def _build_chat_history(
     chat_spec: ChatSpec,
     *,
     session: SafeJSONSession,
     workspace,
+    status_override: str | None = None,
+    non_blocking: bool = False,
+    state: dict | None = None,
 ) -> ChatHistory:
-    state = await session.get_session_state_dict(
-        chat_spec.session_id,
-        chat_spec.user_id,
-    )
-    status = await workspace.task_tracker.get_status(chat_spec.id)
+    if state is None:
+        state = (
+            await _read_history_state(
+                session,
+                chat_spec.session_id,
+                chat_spec.user_id,
+            )
+            if non_blocking
+            else await session.get_session_state_dict(
+                chat_spec.session_id,
+                chat_spec.user_id,
+            )
+        )
+    if status_override is not None:
+        status = status_override
+    else:
+        coordinator = getattr(workspace, "answer_turn_coordinator", None)
+        turn_status = (
+            await coordinator.status(chat_spec.id)
+            if coordinator is not None
+            else None
+        )
+        status = turn_status.value if turn_status is not None else "idle"
     task_messages = _task_session_messages_from_state(state)
     model_call_failed_messages = _model_call_failed_messages_from_state(state)
     archive = await _archive_metadata(workspace, chat_spec.id)
@@ -639,6 +808,20 @@ async def _build_chat_history(
             )
     messages.extend(task_messages)
     messages.extend(model_call_failed_messages)
+    known_ids = {
+        _message_original_id(message)
+        for message in messages
+        if _message_original_id(message)
+    }
+    messages.extend(
+        message
+        for message in _turn_state_messages_from_state(
+            state,
+            session_id=chat_spec.session_id,
+            chat_id=chat_spec.id,
+        )
+        if _message_original_id(message) not in known_ids
+    )
     messages.sort(key=_message_sort_key)
     messages = await _annotate_approval_action_statuses(messages)
     messages = _redact_hidden_context_messages(messages)
@@ -792,7 +975,32 @@ async def list_chats(
             detail="page and page_size must be provided together",
         )
 
-    tracker = workspace.task_tracker
+    coordinator = getattr(workspace, "answer_turn_coordinator", None)
+
+    async def runtime_statuses(chat_ids: list[str]) -> dict[str, str]:
+        if coordinator is None:
+            return {chat_id: "idle" for chat_id in chat_ids}
+        batch_status = getattr(coordinator, "statuses", None)
+        if callable(batch_status):
+            statuses = await batch_status(chat_ids)
+        else:
+            statuses = dict(
+                zip(
+                    chat_ids,
+                    await asyncio.gather(
+                        *(coordinator.status(chat_id) for chat_id in chat_ids),
+                    ),
+                ),
+            )
+        return {
+            chat_id: (
+                statuses.get(chat_id).value
+                if statuses.get(chat_id) is not None
+                else "idle"
+            )
+            for chat_id in chat_ids
+        }
+
     if cursor_mode and page_size is not None:
         try:
             chat_page = await mgr.list_chats_cursor(
@@ -803,10 +1011,13 @@ async def list_chats(
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        items = []
-        for spec in chat_page.items:
-            status = await tracker.get_status(spec.id)
-            items.append(spec.model_copy(update={"status": status}))
+        statuses = await runtime_statuses(
+            [spec.id for spec in chat_page.items],
+        )
+        items = [
+            spec.model_copy(update={"status": statuses.get(spec.id, "idle")})
+            for spec in chat_page.items
+        ]
         return chat_page.model_copy(update={"items": items})
 
     if page is not None and page_size is not None:
@@ -816,18 +1027,21 @@ async def list_chats(
             page=page,
             page_size=page_size,
         )
-        items = []
-        for spec in chat_page.items:
-            status = await tracker.get_status(spec.id)
-            items.append(spec.model_copy(update={"status": status}))
+        statuses = await runtime_statuses(
+            [spec.id for spec in chat_page.items],
+        )
+        items = [
+            spec.model_copy(update={"status": statuses.get(spec.id, "idle")})
+            for spec in chat_page.items
+        ]
         return chat_page.model_copy(update={"items": items})
 
     chats = await mgr.list_chats(user_id=user_id, channel=channel)
-    result = []
-    for spec in chats:
-        status = await tracker.get_status(spec.id)
-        result.append(spec.model_copy(update={"status": status}))
-    return result
+    statuses = await runtime_statuses([spec.id for spec in chats])
+    return [
+        spec.model_copy(update={"status": statuses.get(spec.id, "idle")})
+        for spec in chats
+    ]
 
 
 @router.post("", response_model=ChatSpec)
@@ -903,8 +1117,9 @@ async def batch_delete_chats(
 @router.get("/answer-turn", response_model=ChatHistory)
 async def get_answer_turn(
     request: Request,
-    sessionid: str = Query(..., description="Logical session id"),
+    sessionid: str | None = Query(None, description="Logical session id"),
     msgid: str = Query(..., description="User question message id"),
+    chat_id: str | None = Query(None, description="Chat id"),
     mgr: ChatManager = Depends(get_chat_manager),
     session: SafeJSONSession = Depends(get_session),
     workspace=Depends(get_workspace),
@@ -916,32 +1131,97 @@ async def get_answer_turn(
             status_code=400,
             detail="Request user identity is required",
         )
-    chat_spec = await mgr.get_chat_by_session(
-        sessionid,
-        channel="console",
-        user_id=user_id,
-    )
+    chat_spec = None
+    candidate_chats: list[ChatSpec] = []
+    selected_history: ChatHistory | None = None
+    selected_state: dict | None = None
+    state_cache: dict[tuple[str, str], dict] = {}
+    if chat_id:
+        chat_spec = await mgr.get_chat(chat_id)
+        if chat_spec:
+            try:
+                _authorize_chat(request, chat_spec, workspace)
+            except HTTPException:
+                chat_spec = None
+    elif sessionid:
+        candidate_chats = [
+            chat
+            for chat in await mgr.list_chats(
+                user_id=user_id,
+                channel="console",
+            )
+            if chat.session_id == sessionid
+        ]
+        for candidate in candidate_chats:
+            try:
+                _authorize_chat(request, candidate, workspace)
+            except HTTPException:
+                continue
+            state = await _cached_history_state(
+                state_cache,
+                session,
+                candidate.session_id,
+                candidate.user_id,
+            )
+            stored_chat_id = _turn_state_chat_id(state, msgid)
+            if stored_chat_id is not None and stored_chat_id != candidate.id:
+                continue
+            history = await _build_chat_history(
+                candidate,
+                session=session,
+                workspace=workspace,
+                non_blocking=False,
+                state=state,
+            )
+            if _slice_answer_turn(history.messages, msgid=msgid) is not None:
+                chat_spec = candidate
+                selected_history = history
+                selected_state = state
+                break
     if not chat_spec:
         raise HTTPException(
             status_code=404,
             detail="Answer turn not found",
         )
 
-    history = await _build_chat_history(
-        chat_spec,
-        session=session,
-        workspace=workspace,
-    )
+    if selected_history is None:
+        selected_state = await _cached_history_state(
+            state_cache,
+            session,
+            chat_spec.session_id,
+            chat_spec.user_id,
+        )
+        selected_history = await _build_chat_history(
+            chat_spec,
+            session=session,
+            workspace=workspace,
+            non_blocking=False,
+            state=selected_state,
+        )
+    history = selected_history
     messages = _slice_answer_turn(history.messages, msgid=msgid)
     if messages is None:
         raise HTTPException(
             status_code=404,
             detail="Answer turn not found",
         )
+    turn_status = _turn_status_from_state(selected_state or {}, msgid)
+    if turn_status is None:
+        turn_status = next(
+            (
+                status
+                for status in (
+                    _message_turn_status(message) for message in messages
+                )
+                if status is not None
+            ),
+            None,
+        )
     return ChatHistory(
         chat=chat_spec,
         messages=messages,
         status=history.status,
+        turn_status=turn_status,
     )
 
 
@@ -966,6 +1246,68 @@ async def get_chat_history_page(
         return await _archive_page(workspace, chat_spec.id, before, limit)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get(
+    "/{chat_id}/context-usage",
+    response_model=ContextUsageResponse,
+)
+async def get_chat_context_usage(
+    request: Request,
+    chat_id: str,
+    mgr: ChatManager = Depends(get_chat_manager),
+    session: SafeJSONSession = Depends(get_session),
+    workspace=Depends(get_workspace),
+) -> ContextUsageResponse:
+    """Return the last committed numeric context-occupancy snapshot."""
+    chat_spec = await mgr.get_chat(chat_id)
+    if not chat_spec:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Chat not found: {chat_id}",
+        )
+    _authorize_chat(request, chat_spec, workspace)
+
+    state = await _read_history_state(
+        session,
+        chat_spec.session_id,
+        chat_spec.user_id,
+    )
+    raw_snapshot = state.get(CONTEXT_USAGE_STATE_KEY)
+    if not isinstance(raw_snapshot, dict):
+        return ContextUsageUnavailable()
+
+    try:
+        snapshot = ContextUsageSnapshot.model_validate(raw_snapshot)
+    except ValidationError:
+        raw_schema_version = raw_snapshot.get("schema_version")
+        schema_metadata = (
+            raw_schema_version
+            if isinstance(raw_schema_version, int)
+            else type(raw_schema_version).__name__
+        )
+        logger.warning(
+            "Ignoring invalid context usage snapshot "
+            "(chat_id=%s session_id=%s schema_version=%s)",
+            chat_spec.id,
+            chat_spec.session_id,
+            schema_metadata,
+        )
+        return ContextUsageUnavailable()
+    coordinator = getattr(workspace, "answer_turn_coordinator", None)
+    turn_status = (
+        await coordinator.status(chat_spec.id)
+        if coordinator is not None
+        else None
+    )
+    status_value = getattr(turn_status, "value", turn_status)
+    return ContextUsageAvailable(
+        **snapshot.model_dump(),
+        stale=(
+            status_value in {"running", "stopping"}
+            or state.get(CONTEXT_USAGE_INVALID_STATE_KEY) is True
+        ),
+    )
 
 
 @router.get("/{chat_id}", response_model=ChatHistory)
@@ -1003,6 +1345,7 @@ async def get_chat(
         chat_spec,
         session=session,
         workspace=workspace,
+        non_blocking=True,
     )
 
 

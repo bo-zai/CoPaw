@@ -23,16 +23,29 @@ from agentscope_runtime.engine.schemas.agent_schemas import (
     AgentRequest,
     Event,
     Message,
+    RunStatus,
 )
 from agentscope_runtime.engine.schemas.exception import AgentException
 from dotenv import load_dotenv
 
-from ..mcp.http_headers import build_mcp_http_headers
+from ..mcp.http_headers import (
+    _filter_passthrough_headers,
+    build_mcp_http_headers,
+)
 from ..mcp.lazy_client import LazyMCPClient, get_mcp_tool_discovery_cache
 from ..mcp.stateful_client import HttpStatefulClient, StdIOStatefulClient
 from ..mcp.stdio_launcher import build_tenant_aware_stdio_launch_config
 from .command_dispatch import (
     _get_last_user_text,
+)
+from .context_usage import (
+    CONTEXT_USAGE_INVALID_STATE_KEY,
+    CONTEXT_USAGE_STATE_KEY,
+    capture_context_usage,
+)
+from .assistant_response import (
+    project_candidate_assistant_response,
+    replace_candidate_assistant_response,
 )
 from .hidden_context_injection import (
     append_hidden_context_to_user_message,
@@ -73,12 +86,17 @@ from ...__version__ import __version__
 from ...agents.react_agent import SWEAgent
 from ...agents.skill_invocation_detector import SkillInvocationDetector
 from ...agents.tool_guard_mixin import PreToolUseTerminalStop
+from ...agents.tool_failure import (
+    TOOL_GOVERNANCE_BLOCK_FIELD,
+    attach_tool_governance_message_metadata,
+)
 from ...agents.skills_manager import (
     get_skill_freshness_token,
     get_workspace_skills_dir,
     resolve_effective_skill_dir,
 )
 from ...agents.hook_runtime import HookRuntime
+from ...agents.hook_runtime.runtime import log_stop_skipped_telemetry
 from ...agents.hook_runtime.conversation_snapshot import (
     capture_conversation_snapshot,
 )
@@ -114,12 +132,18 @@ from ...tracing import (
     has_trace_manager,
     get_trace_manager,
 )
-from ...tracing.agent_trace_sdk import SpanKind, TraceFields, global_tracer
+from ...tracing.agent_trace_sdk import (
+    SpanKind,
+    TraceFields,
+    global_tracer,
+    use_b3_trace_context,
+)
 from ...tracing.models import TraceStatus
 from ...config.context import (
     get_current_passthrough_headers,
 )
 from ...runtime_invocation_claims import runtime_invocation_claims_context
+from ..answer_turn.models import TurnIdentity, TurnOutcome, TurnStatus
 from ..source_system_config import is_chat_task_progress_enabled
 from ..source_system_config.runtime import get_current_source_system_config
 
@@ -140,6 +164,7 @@ _EXTERNAL_APPROVAL_MESSAGE_META_KEY = "external_approval_message"
 _APPROVAL_REQUEST_ID_META_KEY = "approval_request_id"
 _APPROVAL_DECISION_META_KEY = "approval_decision"
 _SESSION_TITLE_GENERATED_META_KEY = "session_title_generated"
+_DEFER_ANSWER_TURN_SETTLEMENT_META_KEY = "defer_answer_turn_settlement"
 _SCENARIO_SNAPSHOT_REQUEST_META_KEYS = frozenset(
     {
         "scenario_preset_snapshot",
@@ -231,6 +256,16 @@ class _TurnPlan:
     turn_msgs: list[Any]
 
 
+@dataclass(frozen=True)
+class _QueryHandlerContext:
+    query: str | None
+    session_id: str
+    user_id: str
+    identity: TurnIdentity | None
+    turn_id: str
+    trace_fields: TraceFields | None
+
+
 @dataclass
 class _QueryTurnOutcome:
     """记录 agent 输出与完成态。"""
@@ -250,6 +285,7 @@ class _QueryTurnOutcome:
     stop_output_buffer_required: bool = False
     buffered_assistant_messages: list[Msg] = field(default_factory=list)
     assistant_memory_start: int = 0
+    goal_finalization_fallback: bool = False
 
 
 def _match_command_with_optional_id(
@@ -625,7 +661,60 @@ def _approved_tool_call_from_record(record) -> dict[str, Any] | None:
     replay_metadata = _approval_replay_metadata(record)
     if replay_metadata is not None:
         approved_tool_call["_approval_replay"] = replay_metadata
-    return approved_tool_call
+    from .operation_group import restore_operation_group_argument
+
+    return restore_operation_group_argument(
+        approved_tool_call,
+        record.extra.get("operation_group"),
+    )
+
+
+def _build_denial_response_msg(pending: Any, text: str) -> Msg:
+    """Build the denial message, optionally marking the pending tool call.
+
+    When the pending record still carries the original tool call, the
+    message embeds a structured tool_result with error_type
+    "approval_rejected" so the Console can turn the never-executed
+    sub-step into "已拒绝" instead of an execution failure.  The text
+    block keeps the existing user-visible denial message.
+    """
+    blocks: list[Any] = []
+    governance_tool_call_id = ""
+    extra = getattr(pending, "extra", None)
+    if isinstance(extra, dict):
+        tool_call = extra.get("tool_call")
+        if isinstance(tool_call, dict) and tool_call.get("id"):
+            governance_tool_call_id = str(tool_call["id"])
+            result_block = {
+                "type": "tool_result",
+                "id": tool_call.get("id", ""),
+                "name": tool_call.get("name")
+                or getattr(pending, "tool_name", ""),
+                TOOL_GOVERNANCE_BLOCK_FIELD: "rejected",
+                "output": {
+                    "isError": True,
+                    "error_type": "approval_rejected",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "该工具调用已被拒绝，未执行。",
+                        },
+                    ],
+                },
+            }
+            operation_group = extra.get("operation_group")
+            if isinstance(operation_group, dict):
+                result_block["operation_group"] = operation_group
+            blocks.append(result_block)
+    blocks.append(TextBlock(type="text", text=text))
+    message = Msg(name="Friday", role="assistant", content=blocks)
+    if governance_tool_call_id:
+        attach_tool_governance_message_metadata(
+            message,
+            tool_call_id=governance_tool_call_id,
+            governance_status="rejected",
+        )
+    return message
 
 
 def _copy_list_extra(
@@ -680,7 +769,10 @@ def _hook_config_enabled(
         or (agent_hooks is not None and agent_hooks.enabled)
         or (
             session_state is not None
-            and session_state.has_loaded_skill_sources()
+            and (
+                session_state.has_loaded_skill_sources()
+                or session_state.has_monitored_skill_sources()
+            )
         ),
     )
 
@@ -747,6 +839,9 @@ def _create_session_skill_detector(
     source_id: str,
     enabled_skills: list[str],
     skill_runtime_profiles: dict[str, Any] | None = None,
+    skill_metadata: dict[str, Any] | None = None,
+    skill_dirs: dict[str, Path] | None = None,
+    skill_signatures: dict[str, str] | None = None,
     get_hook_state: Callable[[], HookSessionState],
     set_hook_state: Callable[[HookSessionState], None],
     approved_http_urls: Collection[str] | None = None,
@@ -761,11 +856,28 @@ def _create_session_skill_detector(
     )
 
     async def _load_skill_hooks(skill_name: str) -> None:
-        skill_root = resolve_effective_skill_dir(workspace, skill_name)
+        skill_root = (skill_dirs or {}).get(skill_name)
+        if skill_root is None:
+            skill_root = resolve_effective_skill_dir(workspace, skill_name)
         if skill_root is None:
             return
+        expected_signature = (skill_signatures or {}).get(skill_name)
+        if expected_signature:
+            from ...agents.skills_manager import _build_signature
+
+            actual_signature = await asyncio.to_thread(
+                _build_signature,
+                skill_root,
+            )
+            if actual_signature != expected_signature:
+                logger.warning(
+                    "Skipping hooks for changed skill '%s'",
+                    skill_name,
+                )
+                return
         try:
-            next_state = load_skill_hooks_for_session(
+            next_state = await asyncio.to_thread(
+                load_skill_hooks_for_session,
                 skill_name=skill_name,
                 skill_root=skill_root,
                 workspace_dir=workspace,
@@ -773,6 +885,8 @@ def _create_session_skill_detector(
                 approved_http_urls=approvals,
             )
         except SkillHookLoadError as exc:
+            if exc.session_state is not None:
+                set_hook_state(exc.session_state)
             logger.warning(
                 "Rejected hooks for skill '%s': %s",
                 skill_name,
@@ -791,7 +905,7 @@ def _create_session_skill_detector(
         skill_hook_loader=_load_skill_hooks,
         confirmed_skill_callback=confirmed_skill_callback,
     )
-    detector.set_enabled_skills(enabled_skills)
+    detector.set_enabled_skills(enabled_skills, skill_metadata)
     if skill_runtime_profiles:
         detector.set_skill_runtime_profiles(skill_runtime_profiles)
     return detector
@@ -908,6 +1022,29 @@ async def _emit_runner_hook(
     )
 
 
+def _emit_runner_stop_skip_telemetry(
+    *,
+    request: Any,
+    runner: "AgentRunner",
+    prompt: str | None,
+    assistant_response: str | None,
+    skipped_reason: str,
+) -> None:
+    try:
+        log_stop_skipped_telemetry(
+            _build_runner_hook_context(
+                HookEventName.STOP,
+                request=request,
+                runner=runner,
+                prompt=prompt,
+                assistant_response=assistant_response,
+            ),
+            skipped_reason=skipped_reason,
+        )
+    except Exception as exc:
+        logger.warning("Failed to emit skipped Stop telemetry: %s", exc)
+
+
 def _build_stop_hook_runtime(
     *,
     tenant_hooks: HookConfig,
@@ -943,7 +1080,10 @@ def _requires_stop_output_buffer(
         tenant_hooks=tenant_hooks,
         agent_config=agent_config,
         overlay=overlay,
-    ).requires_stop_output_buffer(context)
+    ).requires_stop_output_buffer(
+        context,
+        workspace_dir=runner.workspace_dir,
+    )
 
 
 async def _emit_runner_stop_finalization(
@@ -1153,13 +1293,7 @@ def _build_lazy_mcp_clients(
         if not client_config.enabled:
             continue
 
-        effective_passthrough_headers = (
-            None
-            if str(getattr(client_config, "source", "") or "").startswith(
-                "marketplace:",
-            )
-            else passthrough_headers
-        )
+        effective_passthrough_headers = passthrough_headers
 
         config_payload = client_config.model_dump(mode="json")
         config_fingerprint = hashlib.sha256(
@@ -1172,7 +1306,11 @@ def _build_lazy_mcp_clients(
         request_scope_headers = {
             header_name.casefold(): header_value
             for header_name, header_value in (
-                effective_passthrough_headers or {}
+                _filter_passthrough_headers(
+                    effective_passthrough_headers,
+                    url=getattr(client_config, "url", None),
+                )
+                or {}
             ).items()
         }
         request_scope_fingerprint = hashlib.sha256(
@@ -1336,15 +1474,55 @@ async def _cleanup_mcp_clients(clients: list[Any]) -> None:
     await query_cleanup.cleanup_mcp_clients(clients)
 
 
-def _extract_text_from_blocks(blocks: list) -> str:
-    """从 content blocks 中提取文本."""
-    texts = []
-    for block in blocks:
-        if hasattr(block, "text"):
-            texts.append(block.text)
-        elif isinstance(block, dict) and "text" in block:
-            texts.append(block["text"])
-    return "\n".join(texts) if texts else ""
+def _assistant_response_candidate(
+    index: int,
+    entry: Any,
+) -> tuple[str | None, dict[str, Any]]:
+    if not isinstance(entry, (tuple, list)) or not entry:
+        return None, {"index": index, "reason": "invalid_memory_entry"}
+
+    msg = entry[0]
+    role = getattr(msg, "role", None)
+    content = getattr(msg, "content", None)
+    metadata = getattr(msg, "metadata", None)
+    summary: dict[str, Any] = {
+        "index": index,
+        "role": role,
+        "content_type": type(content).__name__,
+        "metadata_fields": [
+            key
+            for key in ("event_type", "message_type", "kind", "type")
+            if isinstance(metadata, dict) and key in metadata
+        ],
+    }
+    if isinstance(content, list):
+        summary["block_types"] = [
+            (
+                block.get("type")
+                if isinstance(block, dict)
+                else getattr(block, "type", None)
+            )
+            for block in content
+        ]
+    if (
+        role != "assistant"
+        or not hasattr(msg, "content")
+        or _is_live_assistant_event(msg)
+    ):
+        summary["reason"] = (
+            "role_or_missing_content"
+            if role != "assistant" or not hasattr(msg, "content")
+            else "live_assistant_event"
+        )
+        return None, summary
+
+    response = project_candidate_assistant_response(msg)
+    if response is not None:
+        summary["text_len"] = len(response)
+        summary["reason"] = "accepted"
+        return response, summary
+    summary["reason"] = "unsupported_content"
+    return None, summary
 
 
 def _extract_assistant_response(
@@ -1354,27 +1532,48 @@ def _extract_assistant_response(
 ) -> str:
     """从 agent memory 的当前 turn 中提取最后的助手响应文本."""
     if not agent or not hasattr(agent, "memory"):
+        logger.warning(
+            "[STOP-DEBUG] extract reason=missing_agent_memory "
+            "memory_start=%d",
+            memory_start,
+        )
         return ""
 
     try:
-        # memory.content 是 list of (Msg, marks) tuples
         memory = agent.memory.content
-        for msg, _marks in reversed(memory[max(memory_start, 0) :]):
-            if (
-                msg.role != "assistant"
-                or not hasattr(msg, "content")
-                or _is_live_assistant_event(msg)
-            ):
-                continue
-            # content 可能是 list of blocks 或 string
-            if isinstance(msg.content, str):
-                return msg.content
-            if isinstance(msg.content, list) and _has_only_text_blocks(
-                msg.content,
-            ):
-                return _extract_text_from_blocks(msg.content)
+        start = max(memory_start, 0)
+        memory_total = len(memory) if isinstance(memory, list) else None
+        candidates: list[dict[str, Any]] = []
+        entries = (
+            list(enumerate(memory[start:], start))
+            if isinstance(memory, list)
+            else []
+        )
+        for index, entry in reversed(entries):
+            response, summary = _assistant_response_candidate(index, entry)
+            if response is not None:
+                logger.warning(
+                    "[STOP-DEBUG] extract memory_total=%s memory_start=%d "
+                    "selected=%s candidates=%s",
+                    memory_total,
+                    start,
+                    summary,
+                    candidates,
+                )
+                return response
+            candidates.append(summary)
+        logger.warning(
+            "[STOP-DEBUG] extract memory_total=%s memory_start=%d "
+            "selected=None candidates=%s",
+            memory_total,
+            start,
+            candidates,
+        )
     except Exception as e:
-        logger.debug("Failed to extract assistant response: %s", e)
+        logger.warning(
+            "[STOP-DEBUG] extract reason=exception error_type=%s",
+            type(e).__name__,
+        )
 
     return ""
 
@@ -1392,44 +1591,11 @@ def _replace_assistant_response(
         for msg, _marks in reversed(memory[max(memory_start, 0) :]):
             if msg.role != "assistant" or _is_live_assistant_event(msg):
                 continue
-            if isinstance(msg.content, str):
-                msg.content = response
-                return True
-            if isinstance(msg.content, list) and _has_only_text_blocks(
-                msg.content,
-            ):
-                text_blocks = [
-                    block
-                    for block in msg.content
-                    if _content_block_has_text(block)
-                ]
-                if not text_blocks:
-                    continue
-                _replace_content_block_text(text_blocks[0], response)
-                for block in text_blocks[1:]:
-                    _replace_content_block_text(block, "")
+            if replace_candidate_assistant_response(msg, response):
                 return True
     except Exception as exc:
         logger.debug("Failed to replace assistant response: %s", exc)
     return False
-
-
-def _content_block_has_text(block: Any) -> bool:
-    if isinstance(block, dict):
-        return block.get("type") == "text" and isinstance(
-            block.get("text"),
-            str,
-        )
-    return getattr(block, "type", None) == "text" and isinstance(
-        getattr(block, "text", None),
-        str,
-    )
-
-
-def _has_only_text_blocks(blocks: list[Any]) -> bool:
-    return bool(blocks) and all(
-        _content_block_has_text(block) for block in blocks
-    )
 
 
 def _is_live_assistant_event(msg: Any) -> bool:
@@ -1441,13 +1607,6 @@ def _is_live_assistant_event(msg: Any) -> bool:
         for key in ("event_type", "message_type", "kind", "type")
     ).lower()
     return any(token in values for token in ("progress", "tool", "approval"))
-
-
-def _replace_content_block_text(block: Any, response: str) -> None:
-    if isinstance(block, dict):
-        block["text"] = response
-    else:
-        block.text = response
 
 
 def _build_internal_follow_up_msg(follow_up_prompt: str) -> Msg:
@@ -1593,12 +1752,22 @@ def _build_goal_finalization_input(
     goal: Any,
     state: str,
     reason: str | None,
+    stop_rejection_reason: str | None = None,
 ) -> Msg:
     """Build bounded internal input for a tool-free Goal Finalization Turn."""
+    stop_feedback = (
+        ""
+        if not stop_rejection_reason
+        else (
+            "\nStop rejected the previous delivery. Revise the final response "
+            f"to address this feedback: {stop_rejection_reason}\n"
+        )
+    )
     return _build_internal_follow_up_msg(
         "Authoritative Goal finalization context:\n"
         f"Goal state: {state}\n"
         f"State reason: {reason or 'No additional reason was recorded.'}\n"
+        + stop_feedback
         + _build_goal_contract_context(goal),
     )
 
@@ -2724,6 +2893,7 @@ class AgentRunner(Runner):
         workspace_dir: Path | None = None,
         task_tracker: Any | None = None,
         tenant_id: str | None = None,
+        answer_turn_coordinator: Any | None = None,
     ) -> None:
         from ...config.context import resolve_runtime_tenant_id
 
@@ -2742,11 +2912,118 @@ class AgentRunner(Runner):
         self._workspace: Any = None  # Workspace instance for control commands
         self.memory_manager: BaseMemoryManager | None = None
         self._task_tracker = task_tracker  # Task tracker for background tasks
+        self._answer_turn_coordinator = answer_turn_coordinator
+        self._answer_turn_tasks: dict[TurnIdentity, asyncio.Task[Any]] = {}
+        self._answer_turn_runtimes: dict[
+            TurnIdentity,
+            tuple[_QueryRuntime | None, Any],
+        ] = {}
+        self._answer_turn_locations: dict[TurnIdentity, tuple[str, str]] = {}
         self._query_background_tasks: set[asyncio.Task[None]] = set()
         self.session: Any | None = None
         self._query_execution = QueryExecution(
             LegacyQueryExecutionAdapter(self),
         )
+
+    def set_answer_turn_coordinator(self, coordinator: Any) -> None:
+        """Attach the workspace-owned answer-turn coordinator."""
+        self._answer_turn_coordinator = coordinator
+
+    @staticmethod
+    def _answer_turn_identity(request: Any) -> TurnIdentity | None:
+        channel_meta = getattr(request, "channel_meta", None) or {}
+        identity = channel_meta.get("answer_turn_identity")
+        return identity if isinstance(identity, TurnIdentity) else None
+
+    async def request_cooperative_stop(self, identity: TurnIdentity) -> None:
+        """Ask the active agent to stop without terminating its task."""
+        runtime, _ = self._answer_turn_runtimes.get(identity, (None, None))
+        if runtime is not None:
+            await runtime.agent.interrupt()
+
+    async def hard_cancel(self, identity: TurnIdentity) -> None:
+        """Cancel the execution task that still owns *identity*."""
+        task = self._answer_turn_tasks.get(identity)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def persist_outcome(self, outcome: TurnOutcome) -> None:
+        """Persist a terminal answer-turn outcome in the owning session."""
+        runtime, session_execution = self._answer_turn_runtimes.get(
+            outcome.identity,
+            (None, None),
+        )
+        locations = getattr(self, "_answer_turn_locations", {})
+        location = locations.get(outcome.identity)
+        if runtime is None and session_execution is None and location is None:
+            raise RuntimeError(
+                "answer turn persistence context is unavailable",
+            )
+        from .session_lifecycle import (
+            mark_stopped_agent_memory,
+            mark_terminal_turn_state,
+        )
+
+        terminal_status = (
+            "stopped"
+            if outcome.status == TurnStatus.CANCELLED
+            else outcome.status.value
+        )
+        if outcome.status == TurnStatus.CANCELLED and runtime is not None:
+            mark_stopped_agent_memory(
+                runtime.agent,
+                outcome.identity.msgid,
+            )
+
+        if session_execution is not None and getattr(
+            session_execution,
+            "is_active",
+            True,
+        ):
+            mark_terminal_turn_state(
+                session_execution.state,
+                outcome.identity.msgid,
+                terminal_status,
+            )
+            await session_execution.commit_state(session_execution.state)
+            return
+
+        session_id = str(
+            getattr(runtime, "session_id", "") or (location or ("", ""))[0],
+        )
+        user_id = str(
+            getattr(runtime, "user_id", "") or (location or ("", ""))[1],
+        )
+        if not session_id or self.session is None:
+            raise RuntimeError("answer turn persistence target is unavailable")
+
+        def mark_outcome(state: dict[str, Any]) -> dict[str, Any]:
+            mark_terminal_turn_state(
+                state,
+                outcome.identity.msgid,
+                terminal_status,
+            )
+            return state
+
+        await self.session.mutate_session_state(
+            session_id,
+            mark_outcome,
+            user_id=user_id,
+        )
+
+    async def release_outcome(self, identity: TurnIdentity) -> None:
+        """Release the execution context after durable settlement succeeds."""
+        self._answer_turn_runtimes.pop(identity, None)
+        getattr(self, "_answer_turn_locations", {}).pop(identity, None)
+
+    async def _report_answer_turn_outcome(
+        self,
+        identity: TurnIdentity | None,
+        outcome: TurnOutcome,
+    ) -> None:
+        if identity is None or self._answer_turn_coordinator is None:
+            return
+        await self._answer_turn_coordinator.settle(outcome)
 
     def set_chat_manager(self, chat_manager):
         """Set chat manager for auto-registration.
@@ -2807,20 +3084,12 @@ class AgentRunner(Runner):
                 ApprovalDecision.TIMEOUT,
             )
             return (
-                Msg(
-                    name="Friday",
-                    role="assistant",
-                    content=[
-                        TextBlock(
-                            type="text",
-                            text=(
-                                f"⏰ Tool `{pending.tool_name}` approval "
-                                f"timed out ({int(elapsed)}s) — denied.\n"
-                                f"工具 `{pending.tool_name}` 审批超时"
-                                f"（{int(elapsed)}s），已拒绝执行。"
-                            ),
-                        ),
-                    ],
+                _build_denial_response_msg(
+                    pending,
+                    f"⏰ Tool `{pending.tool_name}` approval "
+                    f"timed out ({int(elapsed)}s) — denied.\n"
+                    f"工具 `{pending.tool_name}` 审批超时"
+                    f"（{int(elapsed)}s），已拒绝执行。",
                 ),
                 True,
                 None,
@@ -2886,18 +3155,10 @@ class AgentRunner(Runner):
             request,
         )
         return (
-            Msg(
-                name="Friday",
-                role="assistant",
-                content=[
-                    TextBlock(
-                        type="text",
-                        text=(
-                            f"❌ Tool `{pending.tool_name}` denied.\n"
-                            f"工具 `{pending.tool_name}` 已拒绝执行。"
-                        ),
-                    ),
-                ],
+            _build_denial_response_msg(
+                pending,
+                f"❌ Tool `{pending.tool_name}` denied.\n"
+                f"工具 `{pending.tool_name}` 已拒绝执行。",
             ),
             True,
             None,
@@ -3319,24 +3580,55 @@ class AgentRunner(Runner):
             )
             return None
 
-        logger.debug(
-            f"Runner: Calling get_or_create_chat for "
-            f"session_id={session_id}, user_id={user_id}, "
-            f"channel={channel}, name={name}",
-        )
-        chat = await self._chat_manager.get_or_create_chat(
-            session_id,
-            user_id,
-            channel,
-            name=name,
-            meta={"agent_id": self.agent_id},
-        )
-        logger.debug(f"Runner: Got chat: {chat.id}")
         channel_meta = _without_request_scenario_snapshot(
             getattr(request, "channel_meta", None) or {},
         )
-        plan_mode_enabled = _resolve_plan_mode_enabled(channel_meta, chat)
-        requested_plan_mode = _requested_plan_mode_update(channel_meta)
+        chat = None
+        requested_chat_id = channel_meta.get("chat_id")
+        if isinstance(requested_chat_id, str) and requested_chat_id:
+            candidate = await self._chat_manager.get_chat(requested_chat_id)
+            if (
+                candidate is not None
+                and candidate.session_id == session_id
+                and candidate.user_id == user_id
+                and candidate.channel == channel
+            ):
+                chat = candidate
+                merged_meta = {
+                    **(candidate.meta or {}),
+                    "agent_id": self.agent_id,
+                }
+                if merged_meta != (candidate.meta or {}):
+                    chat.meta = merged_meta
+                    chat.updated_at = datetime.now(timezone.utc)
+                    await self._chat_manager.update_chat(chat)
+        if chat is None:
+            logger.debug(
+                f"Runner: Calling get_or_create_chat for "
+                f"session_id={session_id}, user_id={user_id}, "
+                f"channel={channel}, name={name}",
+            )
+            chat = await self._chat_manager.get_or_create_chat(
+                session_id,
+                user_id,
+                channel,
+                name=name,
+                meta={"agent_id": self.agent_id},
+            )
+        logger.debug(f"Runner: Got chat: {chat.id}")
+        scheduled_request = (
+            getattr(request, "execution_origin", None) == "scheduled"
+        )
+        plan_mode_enabled = (
+            False
+            if scheduled_request
+            else _resolve_plan_mode_enabled(channel_meta, chat)
+        )
+        requested_plan_mode = (
+            None
+            if scheduled_request
+            else _requested_plan_mode_update(channel_meta)
+        )
         if requested_plan_mode is not None:
             chat.meta = {
                 **(getattr(chat, "meta", None) or {}),
@@ -3419,6 +3711,7 @@ class AgentRunner(Runner):
         auth_token: str | None,
         approved_tool_call: dict[str, Any] | None,
         current_user_text: str = "",
+        workspace_skill_snapshot: Any | None = None,
     ) -> SWEAgent:
         """创建 SWEAgent，并注入本轮请求上下文。"""
         request_enable_subagents = getattr(request, "enable_subagents", False)
@@ -3437,6 +3730,9 @@ class AgentRunner(Runner):
             "channel": channel,
             "chat_id": chat.id if chat is not None else "",
             "turn_id": turn_id,
+            "msgid": (getattr(request, "channel_meta", None) or {}).get(
+                "msgid",
+            ),
             "agent_id": self.agent_id,
             "tenant_id": self.tenant_id or "",
             "agent_role": "main",
@@ -3445,6 +3741,8 @@ class AgentRunner(Runner):
             "user_name": _request_user_name(request),
             "bbk_id": _request_bbk_id(request),
             "trace_id": getattr(request, "trace_id", None),
+            "execution_origin": getattr(request, "execution_origin", None),
+            "_task_tracker": self._task_tracker,
             "cron_execution_key": getattr(
                 request,
                 "cron_execution_key",
@@ -3476,7 +3774,10 @@ class AgentRunner(Runner):
         request_context["goal_mode_enabled"] = goal_mode_enabled
         plan_mode_enabled = (
             False
-            if goal_request
+            if (
+                goal_request
+                or request_context.get("execution_origin") == "scheduled"
+            )
             else bool(channel_meta.get(_PLAN_MODE_META_KEY, False))
         )
         request_context[_PLAN_MODE_META_KEY] = plan_mode_enabled
@@ -3576,6 +3877,7 @@ class AgentRunner(Runner):
             memory_manager=self.memory_manager,
             request_context=request_context,
             workspace_dir=self.workspace_dir,
+            workspace_skill_snapshot=workspace_skill_snapshot,
             task_tracker=self._task_tracker,
             source_tool_versions=source_tool_versions,
         )
@@ -3622,9 +3924,19 @@ class AgentRunner(Runner):
                 provider_id=provider_id,
                 model=model_name,
             )
-            model_provider_override = ProviderManager.get_instance(
-                self.tenant_id,
-            ).get_provider(provider_id)
+            snapshot_provider = getattr(
+                runtime.agent,
+                "_resolved_model_provider",
+                None,
+            )
+            if getattr(snapshot_provider, "id", None) != provider_id:
+                snapshot_provider = None
+            model_provider_override = (
+                snapshot_provider
+                or ProviderManager.get_instance(
+                    self.tenant_id,
+                ).get_provider(provider_id)
+            )
             if model_provider_override is None:
                 raise RuntimeError("Goal finalization provider is unavailable")
         return SWEAgent(
@@ -3699,9 +4011,19 @@ class AgentRunner(Runner):
             provider_id=provider_id,
             model=model_name,
         )
-        model_provider_override = ProviderManager.get_instance(
-            self.tenant_id,
-        ).get_provider(provider_id)
+        snapshot_provider = getattr(
+            runtime.agent,
+            "_resolved_model_provider",
+            None,
+        )
+        if getattr(snapshot_provider, "id", None) != provider_id:
+            snapshot_provider = None
+        model_provider_override = (
+            snapshot_provider
+            or ProviderManager.get_instance(
+                self.tenant_id,
+            ).get_provider(provider_id)
+        )
         if model_provider_override is None:
             raise RuntimeError("Goal completion judge provider is unavailable")
         return SWEAgent(
@@ -3902,6 +4224,7 @@ class AgentRunner(Runner):
         *,
         runtime: _QueryRuntime,
         goal: Any,
+        stop_rejection_reason: str | None = None,
     ):
         """Stream a no-budget Goal Finalization Turn or its fixed fallback."""
         state = goal.state.value
@@ -3920,6 +4243,7 @@ class AgentRunner(Runner):
                                 goal,
                                 state,
                                 goal.state_reason,
+                                stop_rejection_reason,
                             ),
                         ],
                     ),
@@ -3942,10 +4266,16 @@ class AgentRunner(Runner):
                 "Goal Finalization Turn failed; emitting fallback goal_id=%s",
                 getattr(goal, "goal_id", ""),
             )
+        finalization_fallback = previous_msg is None
         final_msg = previous_msg or _build_goal_finalization_msg(
             state,
             goal.state_reason,
         )
+        if finalization_fallback:
+            final_msg.metadata = {
+                **(final_msg.metadata or {}),
+                "goal_finalization_fallback": True,
+            }
         memory = getattr(runtime.agent, "memory", None)
         add_to_memory = getattr(memory, "add", None)
         if callable(add_to_memory):
@@ -4008,6 +4338,12 @@ class AgentRunner(Runner):
             )
 
         source_id_for_hooks = _request_source_id(request)
+        workspace_skill_snapshot = getattr(
+            runtime.agent,
+            "_workspace_skill_snapshot",
+            None,
+        )
+        snapshot_skills = getattr(workspace_skill_snapshot, "skills", {})
         runtime.session_skill_detector = _create_session_skill_detector(
             workspace_dir=Path(self.workspace_dir or WORKING_DIR),
             tenant_id=self.tenant_id,
@@ -4025,6 +4361,18 @@ class AgentRunner(Runner):
                 if hasattr(runtime.agent, "get_skill_runtime_profiles")
                 else {}
             ),
+            skill_metadata={
+                name: dict(skill.metadata)
+                for name, skill in snapshot_skills.items()
+            },
+            skill_dirs={
+                name: skill.directory
+                for name, skill in snapshot_skills.items()
+            },
+            skill_signatures={
+                name: skill.content_signature
+                for name, skill in snapshot_skills.items()
+            },
             get_hook_state=_get_session_hook_state,
             set_hook_state=_set_session_hook_state,
             confirmed_skill_callback=(_queue_confirmed_skill_snapshot_update),
@@ -4266,9 +4614,6 @@ class AgentRunner(Runner):
         """Connect request resources and run the session-start hook."""
         channel_meta = getattr(request, "channel_meta", None) or {}
         turn_id = str(channel_meta.get("turn_id") or "")
-        if not turn_id:
-            turn_id = f"turn-{uuid4().hex}"
-            request.channel_meta = {**channel_meta, "turn_id": turn_id}
         chat = await self._get_or_create_chat(
             session_id=inputs.session_id,
             user_id=inputs.user_id,
@@ -4456,18 +4801,21 @@ class AgentRunner(Runner):
         runtime: _QueryRuntime,
         plan: _TurnPlan,
     ) -> bool:
+        tenant_hooks = getattr(runtime, "tenant_hooks", HookConfig())
+        agent_config = getattr(runtime, "agent_config", None)
+        hook_overlay = getattr(runtime, "hook_overlay", HookSessionOverlay())
         if not _hook_config_enabled(
-            runtime.tenant_hooks,
-            runtime.agent_config,
-            runtime.hook_overlay,
+            tenant_hooks,
+            agent_config,
+            hook_overlay,
         ):
             return False
         return _requires_stop_output_buffer(
             request=request,
             runner=self,
-            tenant_hooks=runtime.tenant_hooks,
-            agent_config=runtime.agent_config,
-            overlay=runtime.hook_overlay,
+            tenant_hooks=tenant_hooks,
+            agent_config=agent_config,
+            overlay=hook_overlay,
             prompt=plan.original_user_message,
         )
 
@@ -4531,17 +4879,82 @@ class AgentRunner(Runner):
         outcome: _QueryTurnOutcome,
     ) -> MergedHookResult | None:
         """执行 Stop completion gate，active guard 已设置时跳过递归触发。"""
+        tenant_hooks = getattr(runtime, "tenant_hooks", HookConfig())
+        agent_config = getattr(runtime, "agent_config", None)
+        hook_overlay = getattr(runtime, "hook_overlay", HookSessionOverlay())
+        logger.warning(
+            "[STOP-DEBUG] stop_entry trace_id=%s turn_id=%s response_len=%d "
+            "active=%s plan_boundary=%s tenant_enabled=%s agent_enabled=%s "
+            "overlay_ids=%s",
+            getattr(request, "trace_id", None),
+            (getattr(request, "channel_meta", None) or {}).get("turn_id"),
+            len(outcome.assistant_response or ""),
+            outcome.stop_hook_active,
+            outcome.plan_interaction_turn_boundary,
+            getattr(tenant_hooks, "enabled", None),
+            getattr(
+                getattr(agent_config, "hooks", None),
+                "enabled",
+                None,
+            ),
+            [entry.hook_id for entry in hook_overlay.entries],
+        )
         if outcome.stop_hook_active:
+            logger.warning("[STOP-DEBUG] skipped reason=stop_hook_active")
+            _emit_runner_stop_skip_telemetry(
+                request=request,
+                runner=self,
+                prompt=plan.original_user_message,
+                assistant_response=outcome.assistant_response,
+                skipped_reason="stop_hook_active",
+            )
+            return None
+        if outcome.goal_finalization_fallback:
+            _emit_runner_stop_skip_telemetry(
+                request=request,
+                runner=self,
+                prompt=plan.original_user_message,
+                assistant_response=outcome.assistant_response,
+                skipped_reason="finalization_fallback",
+            )
             return None
         if outcome.plan_interaction_turn_boundary:
+            logger.warning(
+                "[STOP-DEBUG] skipped reason=plan_interaction_turn_boundary",
+            )
+            _emit_runner_stop_skip_telemetry(
+                request=request,
+                runner=self,
+                prompt=plan.original_user_message,
+                assistant_response=outcome.assistant_response,
+                skipped_reason="plan_interaction_turn_boundary",
+            )
             return None
         if not outcome.assistant_response:
+            logger.warning(
+                "[STOP-DEBUG] skipped reason=empty_assistant_response",
+            )
+            _emit_runner_stop_skip_telemetry(
+                request=request,
+                runner=self,
+                prompt=plan.original_user_message,
+                assistant_response=outcome.assistant_response,
+                skipped_reason="empty_assistant_response",
+            )
             return None
         if not _hook_config_enabled(
-            runtime.tenant_hooks,
-            runtime.agent_config,
-            runtime.hook_overlay,
+            tenant_hooks,
+            agent_config,
+            hook_overlay,
         ):
+            logger.warning("[STOP-DEBUG] skipped reason=hooks_disabled")
+            _emit_runner_stop_skip_telemetry(
+                request=request,
+                runner=self,
+                prompt=plan.original_user_message,
+                assistant_response=outcome.assistant_response,
+                skipped_reason="hooks_disabled",
+            )
             return None
 
         outcome.stop_hook_active = True
@@ -4549,15 +4962,15 @@ class AgentRunner(Runner):
             finalization = await _emit_runner_stop_finalization(
                 request=request,
                 runner=self,
-                tenant_hooks=runtime.tenant_hooks,
-                agent_config=runtime.agent_config,
-                overlay=runtime.hook_overlay,
+                tenant_hooks=tenant_hooks,
+                agent_config=agent_config,
+                overlay=hook_overlay,
                 prompt=plan.original_user_message,
                 assistant_response=outcome.assistant_response,
                 agent=runtime.agent,
                 max_transform_seconds=(
                     self._resolve_max_stop_transform_seconds(
-                        runtime.agent_config,
+                        agent_config,
                     )
                 ),
             )
@@ -4588,9 +5001,9 @@ class AgentRunner(Runner):
             HookEventName.STOP,
             request=request,
             runner=self,
-            tenant_hooks=runtime.tenant_hooks,
-            agent_config=runtime.agent_config,
-            overlay=runtime.hook_overlay,
+            tenant_hooks=tenant_hooks,
+            agent_config=agent_config,
+            overlay=hook_overlay,
             prompt=plan.original_user_message,
             assistant_response=outcome.assistant_response,
             agent=runtime.agent,
@@ -4605,6 +5018,12 @@ class AgentRunner(Runner):
         outcome: _QueryTurnOutcome,
     ):
         """Coordinate the extracted Goal and Stop turn lifecycle."""
+        identity = self._answer_turn_identity(request)
+        if identity is not None:
+            self._answer_turn_runtimes[identity] = (
+                runtime,
+                runtime.session_execution,
+            )
         async for item in turn_lifecycle.stream_completion_lifecycle(
             self,
             request=request,
@@ -4711,6 +5130,23 @@ class AgentRunner(Runner):
         if agent is not None:
             await agent.interrupt()
         raise AgentException("Task has been cancelled!") from exc
+
+    async def _settle_stopped_turn(
+        self,
+        *,
+        runtime: _QueryRuntime | None,
+        request: AgentRequest,
+        session_execution: Any,
+    ) -> None:
+        """Report a stopped execution for coordinator-owned settlement."""
+        identity = self._answer_turn_identity(request)
+        coordinator = self._answer_turn_coordinator
+        if identity is None or coordinator is None:
+            return
+        if await coordinator.status(identity) != TurnStatus.STOPPING:
+            return
+        self._answer_turn_runtimes[identity] = (runtime, session_execution)
+        await coordinator.settle(TurnOutcome.cancelled(identity))
 
     async def _handle_query_error(
         self,
@@ -5268,6 +5704,148 @@ class AgentRunner(Runner):
         ):
             yield msg, last
 
+    async def _stream_query_frames(
+        self,
+        msgs,
+        *,
+        request: AgentRequest,
+        query: str | None,
+        session_id: str,
+        user_id: str,
+    ):
+        """Yield query frames from the configured execution adapter."""
+        query_execution = getattr(self, "_query_execution", None)
+        if query_execution is not None:
+            async for frame in query_execution.stream(
+                QueryInvocation(request=request, msgs=tuple(msgs)),
+            ):
+                yield self._attach_trace_id_to_msg(
+                    frame.message,
+                    getattr(request, "trace_id", None),
+                ), frame.last
+            return
+        async for msg, last in self._stream_query_entry(
+            msgs,
+            request=request,
+            query=query,
+            session_id=session_id,
+            user_id=user_id,
+        ):
+            yield self._attach_trace_id_to_msg(
+                msg,
+                getattr(request, "trace_id", None),
+            ), last
+
+    def _build_query_trace_fields(
+        self,
+        request: AgentRequest | None,
+        *,
+        session_id: str,
+        user_id: str,
+        turn_id: str,
+    ) -> TraceFields | None:
+        if (
+            getattr(request, "execution_origin", None) == "scheduled"
+            or not user_id
+            or not session_id
+            or not turn_id
+            or not self.agent_id
+        ):
+            return None
+        return TraceFields(
+            task_id=session_id,
+            user_id=user_id,
+            session_id=turn_id,
+            agent_id=self.agent_id,
+            agent_version=__version__,
+            source_id=_request_source_id(request),
+        )
+
+    def _prepare_query_handler_context(
+        self,
+        msgs: Any,
+        request: AgentRequest | None,
+    ) -> _QueryHandlerContext:
+        query = _get_last_user_text(msgs)
+        session_id = getattr(request, "session_id", "") or ""
+        user_id = getattr(request, "user_id", "") or ""
+        channel_meta = getattr(request, "channel_meta", None) or {}
+        identity = self._answer_turn_identity(request)
+        turn_id = identity.turn_id if identity is not None else ""
+        if identity is not None:
+            self._answer_turn_locations[identity] = (
+                str(session_id),
+                str(user_id),
+            )
+            request.channel_meta = {
+                **channel_meta,
+                "turn_id": identity.turn_id,
+                "msgid": identity.msgid,
+            }
+        return _QueryHandlerContext(
+            query=query,
+            session_id=session_id,
+            user_id=user_id,
+            identity=identity,
+            turn_id=turn_id,
+            trace_fields=self._build_query_trace_fields(
+                request,
+                session_id=session_id,
+                user_id=user_id,
+                turn_id=turn_id,
+            ),
+        )
+
+    async def _stream_query_handler_frames(
+        self,
+        msgs: Any,
+        request: AgentRequest | None,
+        context: _QueryHandlerContext,
+    ):
+        with use_b3_trace_context(
+            getattr(request, "b3_context", None),
+            context.trace_fields,
+        ):
+            trace_scope = (
+                global_tracer.start_as_current_span(
+                    "agent.run",
+                    kind=SpanKind.SERVER,
+                    trace_fields=context.trace_fields,
+                )
+                if context.trace_fields is not None
+                else nullcontext(None)
+            )
+            async with trace_scope as span:
+                if span is not None:
+                    span.set_attribute(
+                        "agent.user_message",
+                        context.query or "",
+                    )
+                async for msg, last in self._stream_query_frames(
+                    msgs,
+                    request=request,
+                    query=context.query,
+                    session_id=context.session_id,
+                    user_id=context.user_id,
+                ):
+                    yield msg, last
+
+    async def _settle_query_handler_outcome(
+        self,
+        identity: TurnIdentity | None,
+        status: str,
+        error: Exception | None = None,
+    ) -> None:
+        if identity is None:
+            return
+        if status == "cancelled":
+            outcome = TurnOutcome.cancelled(identity)
+        elif status == "failed":
+            outcome = TurnOutcome.failed(identity, error)
+        else:
+            outcome = TurnOutcome.completed(identity)
+        await self._report_answer_turn_outcome(identity, outcome)
+
     async def query_handler(
         self,
         msgs,
@@ -5279,62 +5857,40 @@ class AgentRunner(Runner):
             f"AgentRunner.query_handler called: agent_id={self.agent_id}, "
             f"msgs={msgs}, request={request}",
         )
-        query = _get_last_user_text(msgs)
-        session_id = getattr(request, "session_id", "") or ""
-        user_id = getattr(request, "user_id", "") or ""
+        context = self._prepare_query_handler_context(msgs, request)
+        identity = context.identity
+        task = asyncio.current_task()
+        if identity is not None and task is not None:
+            self._answer_turn_tasks[identity] = task
         channel_meta = getattr(request, "channel_meta", None) or {}
-        turn_id = ""
-        if request is not None:
-            turn_id = f"turn-{uuid4().hex}"
-            request.channel_meta = {**channel_meta, "turn_id": turn_id}
-        is_scheduled = (
-            getattr(request, "execution_origin", None) == "scheduled"
+        defer_settlement = bool(
+            channel_meta.get(_DEFER_ANSWER_TURN_SETTLEMENT_META_KEY),
         )
-        trace_scope = nullcontext(None)
-        if (
-            not is_scheduled
-            and user_id
-            and session_id
-            and turn_id
-            and self.agent_id
-        ):
-            trace_scope = global_tracer.start_as_current_span(
-                "agent.run",
-                kind=SpanKind.SERVER,
-                trace_fields=TraceFields(
-                    task_id=session_id,
-                    user_id=user_id,
-                    session_id=turn_id,
-                    agent_id=self.agent_id,
-                    agent_version=__version__,
-                    source_id=_request_source_id(request),
-                ),
-            )
-
-        async with trace_scope as span:
-            if span is not None:
-                span.set_attribute("agent.user_message", query or "")
-
-            query_execution = getattr(self, "_query_execution", None)
-            if query_execution is not None:
-                async for frame in query_execution.stream(
-                    QueryInvocation(request=request, msgs=tuple(msgs)),
-                ):
-                    trace_id = getattr(request, "trace_id", None)
-                    msg = self._attach_trace_id_to_msg(frame.message, trace_id)
-                    yield msg, frame.last
-                return
-
-            async for msg, last in self._stream_query_entry(
+        try:
+            async for msg, last in self._stream_query_handler_frames(
                 msgs,
-                request=request,
-                query=query,
-                session_id=session_id,
-                user_id=user_id,
+                request,
+                context,
             ):
-                trace_id = getattr(request, "trace_id", None)
-                msg = self._attach_trace_id_to_msg(msg, trace_id)
                 yield msg, last
+        except asyncio.CancelledError:
+            if not defer_settlement:
+                await self._settle_query_handler_outcome(identity, "cancelled")
+            raise
+        except Exception as exc:
+            if not defer_settlement:
+                await self._settle_query_handler_outcome(
+                    identity,
+                    "failed",
+                    exc,
+                )
+            raise
+        else:
+            if not defer_settlement:
+                await self._settle_query_handler_outcome(identity, "completed")
+        finally:
+            if identity is not None:
+                self._answer_turn_tasks.pop(identity, None)
 
     async def get_state_loaded(
         self,
@@ -5483,11 +6039,30 @@ class AgentRunner(Runner):
             return
 
         current_agent_state = agent.state_dict()
-        stripped_count = 0
-        deduped_external_approvals = 0
+        stripped_count = _strip_internal_follow_up_messages_from_state(
+            current_agent_state,
+        )
+        deduped_external_approvals = (
+            _dedupe_external_approval_messages_from_state(
+                current_agent_state,
+            )
+        )
+        context_usage_snapshot: dict[str, Any] | None = None
+        context_usage_capture_failed = False
+        try:
+            context_usage_snapshot = (
+                await capture_context_usage(agent, current_agent_state)
+            ).model_dump(mode="json")
+        except Exception:  # noqa: BLE001 - session persistence must continue
+            context_usage_capture_failed = True
+            logger.warning(
+                "Failed to capture context usage; preserving prior snapshot "
+                "(session_id=%s)",
+                session_id,
+                exc_info=True,
+            )
 
         def _merge(existing_state: dict[str, Any]) -> dict[str, Any]:
-            nonlocal stripped_count, deduped_external_approvals
             state_modules: dict[str, Any] = (
                 dict(existing_state)
                 if isinstance(existing_state, dict)
@@ -5502,6 +6077,17 @@ class AgentRunner(Runner):
                     )
                 )
             state_modules["agent"] = current_agent_state
+            if context_usage_snapshot is not None:
+                state_modules[CONTEXT_USAGE_STATE_KEY] = context_usage_snapshot
+                state_modules.pop(CONTEXT_USAGE_INVALID_STATE_KEY, None)
+            elif context_usage_capture_failed:
+                if isinstance(
+                    state_modules.get(CONTEXT_USAGE_STATE_KEY),
+                    dict,
+                ):
+                    state_modules[CONTEXT_USAGE_INVALID_STATE_KEY] = True
+                else:
+                    state_modules.pop(CONTEXT_USAGE_INVALID_STATE_KEY, None)
             if hook_overlay is not None:
                 state_modules["hook_overlay"] = hook_overlay.model_dump(
                     mode="json",
@@ -5509,14 +6095,6 @@ class AgentRunner(Runner):
                 )
             else:
                 state_modules.pop("hook_overlay", None)
-            stripped_count = _strip_internal_follow_up_messages_from_state(
-                state_modules["agent"],
-            )
-            deduped_external_approvals = (
-                _dedupe_external_approval_messages_from_state(
-                    state_modules["agent"],
-                )
-            )
             return state_modules
 
         if session_execution is not None:
@@ -5751,28 +6329,76 @@ class AgentRunner(Runner):
         task_progress_enabled = is_chat_task_progress_enabled(
             get_current_source_system_config(),
         )
-        async for event in normalize_reasoning_boundary_stream(
-            super().stream_query(request, **kwargs),
-        ):
-            trace_id = getattr(request, "trace_id", None)
-            event = self._attach_trace_id_to_event(event, trace_id)
-            progress = None
-            if task_progress_enabled:
-                channel_meta = getattr(request, "channel_meta", None) or {}
-                chat_id = channel_meta.get("chat_id")
-                if not chat_id and self._chat_manager is not None:
-                    chat_id = await self._chat_manager.get_chat_id_by_session(
-                        getattr(request, "session_id", "") or "",
-                        getattr(request, "channel", DEFAULT_CHANNEL),
+        identity = self._answer_turn_identity(request)
+        terminal_status: str | None = None
+        channel_meta = getattr(request, "channel_meta", None)
+        marker_was_present = (
+            isinstance(channel_meta, dict)
+            and _DEFER_ANSWER_TURN_SETTLEMENT_META_KEY in channel_meta
+        )
+        previous_defer_marker = (
+            channel_meta.get(_DEFER_ANSWER_TURN_SETTLEMENT_META_KEY)
+            if isinstance(channel_meta, dict)
+            else None
+        )
+        if isinstance(channel_meta, dict):
+            channel_meta[_DEFER_ANSWER_TURN_SETTLEMENT_META_KEY] = True
+        try:
+            async for event in normalize_reasoning_boundary_stream(
+                super().stream_query(request, **kwargs),
+            ):
+                if getattr(event, "object", None) == "response":
+                    status = getattr(event, "status", None)
+                    if status == RunStatus.Completed:
+                        terminal_status = "completed"
+                    elif status == RunStatus.Failed:
+                        terminal_status = "failed"
+                    elif status == RunStatus.Canceled:
+                        terminal_status = "cancelled"
+
+                trace_id = getattr(request, "trace_id", None)
+                event = self._attach_trace_id_to_event(event, trace_id)
+                progress = None
+                if task_progress_enabled:
+                    channel_meta = getattr(request, "channel_meta", None) or {}
+                    chat_id = channel_meta.get("chat_id")
+                    if not chat_id and self._chat_manager is not None:
+                        chat_id = (
+                            await self._chat_manager.get_chat_id_by_session(
+                                getattr(request, "session_id", "") or "",
+                                getattr(request, "channel", DEFAULT_CHANNEL),
+                            )
+                        )
+                    if chat_id and self._task_tracker is not None:
+                        progress = await self._task_tracker.get_task_progress(
+                            chat_id,
+                        )
+                yield attach_task_progress(
+                    event,
+                    progress,
+                    enabled=task_progress_enabled,
+                )
+        except asyncio.CancelledError:
+            await self._settle_query_handler_outcome(identity, "cancelled")
+            raise
+        except Exception as exc:
+            await self._settle_query_handler_outcome(identity, "failed", exc)
+            raise
+        finally:
+            if isinstance(channel_meta, dict):
+                if marker_was_present:
+                    channel_meta[_DEFER_ANSWER_TURN_SETTLEMENT_META_KEY] = (
+                        previous_defer_marker
                     )
-                if chat_id and self._task_tracker is not None:
-                    progress = await self._task_tracker.get_task_progress(
-                        chat_id,
+                else:
+                    channel_meta.pop(
+                        _DEFER_ANSWER_TURN_SETTLEMENT_META_KEY,
+                        None,
                     )
-            yield attach_task_progress(
-                event,
-                progress,
-                enabled=task_progress_enabled,
+        if terminal_status is not None:
+            await self._settle_query_handler_outcome(
+                identity,
+                terminal_status,
             )
 
     async def init_handler(self, *args, **kwargs):

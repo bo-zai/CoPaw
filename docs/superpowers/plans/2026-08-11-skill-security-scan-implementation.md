@@ -37,10 +37,10 @@
 - `SkillScanner` 默认仍只注册 `PatternAnalyzer`；尚未落地 `PackageAnalyzer`、`AstBehaviorAnalyzer`、`DependencyAnalyzer`、profile 选择器或 `external_engines.py`。
 - `SkillScannerConfig` 当前只有 `mode`、`timeout`、`whitelist`，尚无 `profile` 字段。
 - `models.py` 当前只有 `SkillFile`、`Finding`、`ScanResult` 等稳定结果模型；第一阶段不强制修改它，新增安全解包 helper 和分析器直接复用现有同步扫描入口与 `BaseAnalyzer.analyze(skill_dir, files, *, skill_name=None)` 接口。
-- Market 下仍有一套 `market/src/market/security/skill_scanner/` 镜像实现，第二阶段再处理共享或兼容包装，避免第一阶段同时改两套扫描器。
+- Market 下仍有一套 `market/src/market/security/skill_scanner/` 镜像实现；第一阶段必须先取消 Market 拦截历史写本地 `skill_scanner_blocked.json`，改为直接写入数据库表 `swe_skill_scan_history`，并补齐 `source_id`、`user_id`、`bbk_id` 上下文字段，保证 Console 技能扫描器页面能展示 Market 上传/启用拦截记录的来源、用户和分行。`swe_skill_scan_history` 的建表和补列迁移由独立 SQL 脚本维护，SWE 和 Market 启动时只校验数据库可用并读写已有表，不执行 DDL。共享扫描器实现仍放到第二阶段，避免第一阶段同时重构两套分析器。
 - Console 安全页和 API 类型已经存在于 `console/src/pages/Settings/Security/` 与 `console/src/api/modules/security.ts`，但复核、报告详情和 profile 控件仍是后续阶段。
 
-因此，第一阶段收敛为“在现有同步扫描链路上补齐安全解包边界和高置信本地分析器”，不提前引入完整扫描上下文模型、异步任务、Market 重构或开源 CLI 运行器。
+因此，第一阶段收敛为“在现有同步扫描链路上补齐安全解包边界、高置信本地分析器和统一数据库告警历史”，不提前引入完整扫描上下文模型、异步任务、Market 分析器重构或开源 CLI 运行器。
 
 ---
 
@@ -84,15 +84,43 @@
 - 修改：`src/swe/security/skill_scanner/__init__.py`
   - 如测试或下游导入需要，导出新增分析器。
 - 修改：`console/src/api/modules/security.ts`
-  - 为 `BlockedSkillFinding` 补充可选 `analyzer` 字段，复用现有扫描历史接口承接新增分析器来源。
+  - 为 `BlockedSkillFinding` 补充可选 `analyzer` 字段；为 `BlockedSkillRecord` 补充 `source_id`、`user_id`、`bbk_id` 字段。
 - 修改：`console/src/pages/Settings/Security/components/SkillScannerSection.tsx`
-  - 在现有 Findings 弹窗中增加 analyzer 展示列，形成一阶段最小风险可见性。
+  - 在现有 Findings 弹窗中增加 analyzer 展示列；在拦截历史表增加来源、用户和分行展示列，形成一阶段最小风险可见性。
+- 修改：`console/src/api/modules/security.test.ts`
+  - 覆盖扫描历史 API 类型承接 `source_id`、`user_id`、`bbk_id` 和 finding analyzer 字段。
+- 修改：`console/src/locales/zh.json`, `console/src/locales/en.json`
+  - 为来源、用户、分行和 analyzer 列补充本地化文案；空值统一展示 `-`。
+- 修改：`src/swe/security/skill_scanner/history.py`
+  - 将 `BlockedSkillRecord` 和读写 SQL 扩展为包含 `source_id`、`user_id`、`bbk_id`；启动初始化不再执行建表或补列 DDL。
+- 新建：`deploy/migrations/2026_08_19_create_swe_skill_scan_history.sql`
+  - 独立维护 `swe_skill_scan_history` 建表和已有表幂等补列/补索引迁移，由部署或管理员手工执行。
+- 新建：`scripts/sql/skill_scan_history_tables.sql`
+  - 提供同内容的手工执行入口。
+- 修改：`src/swe/app/routers/config.py`
+  - 技能扫描历史接口返回 `source_id`、`user_id`、`bbk_id`，后续可按这些字段做过滤；第一阶段先保证响应字段完整。
+- 修改：`market/src/market/security/skill_scanner/__init__.py`
+  - 取消 `skill_scanner_blocked.json` 本地文件历史写入；Market 上传、上架、启用技能被扫描拦截或告警时，直接写入数据库表 `swe_skill_scan_history`，并携带 `source_id`、`user_id`、`bbk_id`。
+- 新建：`market/src/market/security/skill_scanner/history.py`
+  - 提供 Market 侧数据库历史写入器，复用独立 SQL 维护的 `swe_skill_scan_history` 表结构和 `BlockedSkillRecord` 字段，包含 `source_id`、`user_id`、`bbk_id`；不包含 `CREATE TABLE` 或 `ALTER TABLE`，不引入新的本地文件、轮转文件或 JSONL；支持 `submit()` 和 `flush()`，让接口返回拦截错误前能等待写库完成。
+- 修改：`market/src/market/app/_app.py`
+  - Market 服务启动时把数据库 history writer 安装到 Market scanner；不在 Market 启动流程中建表或迁移表结构。
+- 修改：`market/src/market/app/routers/skills_browse.py`
+  - 用户侧上传/启用和管理操作读取 `X-Source-Id`、`X-User-Id`、`X-Bbk-Id` 并透传给扫描历史。
+- 修改：`market/src/market/app/routers/skills_market.py`
+  - 管理员上架接口新增 `X-Bbk-Id` 请求头，并透传给扫描历史；`bbk_ids` 仍只表示技能分发范围。
+- 修改：`market/src/market/marketplace/service.py`
+  - 首次启用 Skill 的扫描链路透传 `source_id`、`user_id`、`bbk_id`，并在返回 `security_scan_failed` 前等待历史写入完成。
 - 测试：`console/src/pages/Settings/Security/components/SkillScannerSection.test.tsx`
+- 测试：`console/src/api/modules/security.test.ts`
 - 测试：`tests/unit/security/test_skill_scanner_package_analyzer.py`
 - 测试：`tests/unit/security/test_skill_scanner_safe_unpack.py`
 - 测试：`tests/unit/agents/test_tenant_skill_pool_scope.py`
 - 测试：`tests/unit/security/test_skill_scanner_ast_behavior.py`
 - 测试：`tests/unit/security/test_skill_scanner_default_analyzers.py`
+- 测试：`market/tests/unit/security/test_skill_scan_history.py`
+- 测试：`market/tests/unit/marketplace/test_skills_browse.py`
+- 测试：`market/tests/unit/marketplace/test_skills_market.py`
 
 ### 第二阶段：Profile、依赖与 Market 对齐
 
@@ -150,7 +178,8 @@
 - 现有 ZIP 外来包在进入运行目录前完成隔离区安全解包校验，Zip Slip、Zip Bomb、符号链接成员、绝对路径成员会被阻断或产出明确 Finding。
 - 符号链接、可执行二进制、隐藏可执行文件、嵌套压缩包和 Python 危险执行调用能产出 Findings。
 - 现有 SWE Skill manager 调用点无需修改函数签名。
-- 现有 Console 安全页 Findings 弹窗能看到新增 analyzer 名称和风险摘要。
+- 现有 Console 安全页 Findings 弹窗能看到新增 analyzer 名称和风险摘要；拦截历史列表能看到来源、用户和分行。
+- Market 服务上传、上架或首次启用 Skill 被安全扫描拦截后，记录直接写入 `swe_skill_scan_history` 表，并包含 `source_id`、`user_id`、`bbk_id`；不再创建、读取或追加 `skill_scanner_blocked.json`。
 
 ### 迭代二：Profile、依赖/供应链与开源引擎 POC
 
@@ -1106,12 +1135,15 @@ git commit -m "feat(security): enable MVP skill scan analyzers"
 **文件：**
 
 - 修改：`console/src/api/modules/security.ts`
+- 修改：`console/src/api/modules/security.test.ts`
 - 修改：`console/src/pages/Settings/Security/components/SkillScannerSection.tsx`
 - 修改：`console/src/pages/Settings/Security/components/SkillScannerSection.test.tsx`
+- 修改：`console/src/locales/zh.json`
+- 修改：`console/src/locales/en.json`
 
 - [ ] **步骤 1：补充前端类型与失败测试**
 
-在 `console/src/api/modules/security.ts` 的 `BlockedSkillFinding` 中加入可选字段：
+在 `console/src/api/modules/security.ts` 的 `BlockedSkillFinding` 中加入可选字段，并新增 `BlockedSkillRecord` 类型：
 
 ```ts
 export interface BlockedSkillFinding {
@@ -1123,21 +1155,89 @@ export interface BlockedSkillFinding {
   rule_id: string;
   analyzer?: string | null;
 }
+
+export interface BlockedSkillRecord {
+  id: string;
+  source_id: string;
+  user_id: string;
+  bbk_id: string;
+  skill_name: string;
+  blocked_at: string;
+  max_severity: string;
+  findings: BlockedSkillFinding[];
+  content_hash: string;
+  action: "blocked" | "warned";
+}
 ```
 
-在 `SkillScannerSection.test.tsx` 中增加一条历史记录样例，确保 findings 中包含 `analyzer: "ast_behavior"` 时弹窗可以看到该值：
+在 `SkillScannerSection.test.tsx` 中增加一条历史记录样例，确保 findings 中包含 `analyzer: "ast_behavior"` 时弹窗可以看到该值，并且表格能看到 `source_id`、`user_id`、`bbk_id`：
 
 ```tsx
 expect(screen.getByText("ast_behavior")).toBeInTheDocument();
+expect(screen.getByText("portal")).toBeInTheDocument();
+expect(screen.getByText("alice")).toBeInTheDocument();
+expect(screen.getByText("1001")).toBeInTheDocument();
 ```
 
-- [ ] **步骤 2：在 Findings 弹窗增加 analyzer 列**
+- [ ] **步骤 2：补充 API 与本地化测试**
 
-在 `SkillScannerSection.tsx` 的 Findings 表格 columns 中加入：
+在 `console/src/api/modules/security.test.ts` 中补充扫描历史响应样例，确保 `BlockedSkillRecord` 保留 `source_id`、`user_id`、`bbk_id`，`BlockedSkillFinding` 保留 `analyzer`。
+
+在 `console/src/locales/zh.json` 和 `console/src/locales/en.json` 的 `security.skillScanner.scanAlerts` 下补充列名：
+
+```json
+{
+  "source": "来源",
+  "user": "用户",
+  "bbk": "分行",
+  "analyzer": "分析器"
+}
+```
+
+英文文案使用：
+
+```json
+{
+  "source": "Source",
+  "user": "User",
+  "bbk": "BBK",
+  "analyzer": "Analyzer"
+}
+```
+
+- [ ] **步骤 3：在历史表和 Findings 弹窗增加列**
+
+在 `SkillScannerSection.tsx` 的历史表格 columns 中加入：
 
 ```tsx
 {
-  title: "Analyzer",
+  title: t("security.skillScanner.scanAlerts.source"),
+  dataIndex: "source_id",
+  key: "source_id",
+  width: 120,
+  render: (value: string | null | undefined) => value || "-",
+},
+{
+  title: t("security.skillScanner.scanAlerts.user"),
+  dataIndex: "user_id",
+  key: "user_id",
+  width: 120,
+  render: (value: string | null | undefined) => value || "-",
+},
+{
+  title: t("security.skillScanner.scanAlerts.bbk"),
+  dataIndex: "bbk_id",
+  key: "bbk_id",
+  width: 120,
+  render: (value: string | null | undefined) => value || "-",
+},
+```
+
+在 Findings 弹窗的 columns 中加入：
+
+```tsx
+{
+  title: t("security.skillScanner.scanAlerts.analyzer"),
   dataIndex: "analyzer",
   key: "analyzer",
   width: 120,
@@ -1145,23 +1245,26 @@ expect(screen.getByText("ast_behavior")).toBeInTheDocument();
 },
 ```
 
-- [ ] **步骤 3：运行 Console 聚焦测试**
+- [ ] **步骤 4：运行 Console 聚焦测试**
 
 运行：
 
 ```bash
-cd console && npm test -- SkillScannerSection.test.tsx
+cd console && npm run test:run -- src/pages/Settings/Security/components/SkillScannerSection.test.tsx src/api/modules/security.test.ts
 ```
 
 预期：通过；如果仓库当前没有可用 npm test 脚本，执行现有前端测试命令并在交付说明记录。
 
-- [ ] **步骤 4：提交 Console 最小可见性**
+- [ ] **步骤 5：提交 Console 最小可见性**
 
 ```bash
 git add \
   console/src/api/modules/security.ts \
+  console/src/api/modules/security.test.ts \
   console/src/pages/Settings/Security/components/SkillScannerSection.tsx \
-  console/src/pages/Settings/Security/components/SkillScannerSection.test.tsx
+  console/src/pages/Settings/Security/components/SkillScannerSection.test.tsx \
+  console/src/locales/zh.json \
+  console/src/locales/en.json
 git commit -m "feat(security): show skill scan analyzer in console"
 ```
 
@@ -1212,7 +1315,472 @@ git add analysis/security-and-governance.md analysis/agent-and-orchestration.md
 git commit -m "docs(security): document skill scan MVP layers"
 ```
 
-### 任务 9：第一阶段回归验证
+### 任务 9：Market 拦截历史直接写数据库
+
+**文件：**
+
+- 修改：`src/swe/security/skill_scanner/history.py`
+- 测试：`tests/unit/security/test_skill_scan_history.py`
+- 新建：`market/src/market/security/skill_scanner/history.py`
+- 修改：`market/src/market/security/skill_scanner/__init__.py`
+- 修改：`market/src/market/app/_app.py`
+- 修改：`market/src/market/app/routers/skills_browse.py`
+- 修改：`market/src/market/app/routers/skills_market.py`
+- 修改：`market/src/market/marketplace/service.py`
+- 测试：`market/tests/unit/security/test_skill_scan_history.py`
+- 测试：`market/tests/unit/marketplace/test_skills_browse.py`
+- 测试：`market/tests/unit/marketplace/test_skills_market.py`
+
+- [ ] **步骤 1：编写 Market 数据库历史写入测试**
+
+在 `market/tests/unit/security/test_skill_scan_history.py` 中新增测试，确认写入目标是 `swe_skill_scan_history` 表，写入内容包含 `source_id`、`user_id`、`bbk_id`，且不会触碰 `skill_scanner_blocked.json`：
+
+```python
+# -*- coding: utf-8 -*-
+"""测试 Market Skill 扫描历史直接写数据库."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from market.security.skill_scanner.history import (
+    BlockedSkillRecord,
+    SkillScanHistoryStore,
+)
+
+
+class _Db:
+    is_connected = True
+
+    def __init__(self) -> None:
+        self.executed: list[tuple[str, tuple[Any, ...] | None]] = []
+
+    async def execute(
+        self,
+        sql: str,
+        params: tuple[Any, ...] | None = None,
+    ) -> int:
+        self.executed.append((sql, params))
+        return 1
+
+
+@pytest.mark.asyncio
+async def test_market_skill_scan_history_inserts_database_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MARKET_SWE_ROOT", str(tmp_path))
+    db = _Db()
+    store = SkillScanHistoryStore(db)
+
+    await store.insert(
+        BlockedSkillRecord(
+            source_id="portal",
+            user_id="alice",
+            bbk_id="1001",
+            skill_name="danger",
+            blocked_at="2026-08-18T08:00:00+00:00",
+            max_severity="CRITICAL",
+            findings=[
+                {
+                    "severity": "CRITICAL",
+                    "title": "danger",
+                    "description": "eval",
+                    "file_path": "main.py",
+                    "line_number": 1,
+                    "rule_id": "AST_DANGEROUS_EVAL",
+                    "analyzer": "ast_behavior",
+                },
+            ],
+            content_hash="abc",
+            action="blocked",
+        ),
+    )
+
+    assert any("swe_skill_scan_history" in sql for sql, _ in db.executed)
+    insert_sql, params = db.executed[-1]
+    assert "INSERT INTO swe_skill_scan_history" in insert_sql
+    assert params is not None
+    assert params[1:4] == ("portal", "alice", "1001")
+    assert params[4] == "danger"
+    assert json.loads(params[7])[0]["analyzer"] == "ast_behavior"
+    assert not (tmp_path / "skill_scanner_blocked.json").exists()
+```
+
+同文件再补一条 `flush()` 测试，确保接口可以在返回拦截错误前等待已接受的写库任务完成：
+
+```python
+@pytest.mark.asyncio
+async def test_market_skill_scan_history_flush_waits_for_insert() -> None:
+    db = _Db()
+    store = SkillScanHistoryStore(db)
+    accepted = store.submit(
+        BlockedSkillRecord(
+            source_id="portal",
+            user_id="alice",
+            bbk_id="1001",
+            skill_name="danger",
+            blocked_at="2026-08-18T08:00:00+00:00",
+            max_severity="HIGH",
+        ),
+    )
+
+    assert accepted is True
+    await store.flush()
+    assert any("INSERT INTO swe_skill_scan_history" in sql for sql, _ in db.executed)
+```
+
+这两个 Market 测试不能调用 `store.initialize()`，也不能断言任何 `CREATE TABLE`、`ALTER TABLE` 行为。Market 不是表结构 owner，只能在数据库已可用时写入 SWE 已维护的共享表。
+
+- [ ] **步骤 2：补充 SWE 历史表上下文字段测试**
+
+在 `tests/unit/security/test_skill_scan_history.py` 中补充测试，确认 SWE 侧 store 初始化不执行 DDL，插入和读取 API 模型都保留 `source_id`、`user_id`、`bbk_id`：
+
+```python
+@pytest.mark.asyncio
+async def test_skill_scan_history_preserves_actor_context() -> None:
+    db = _MockDb()
+    store = SkillScanHistoryStore(db)
+
+    await store.initialize()
+    await store.insert(
+        BlockedSkillRecord(
+            source_id="portal",
+            user_id="alice",
+            bbk_id="1001",
+            skill_name="danger",
+            blocked_at="2026-08-18T08:00:00+00:00",
+            max_severity="CRITICAL",
+            findings=[],
+            content_hash="abc",
+            action="blocked",
+        ),
+    )
+
+    insert_sql, params = db.executed[-1]
+    assert "INSERT INTO swe_skill_scan_history" in insert_sql
+    assert params is not None
+    assert params[1:4] == ("portal", "alice", "1001")
+
+    record = BlockedSkillRecord(
+        source_id="portal",
+        user_id="alice",
+        bbk_id="1001",
+        skill_name="danger",
+        blocked_at="2026-08-18T08:00:00+00:00",
+        max_severity="CRITICAL",
+    )
+    payload = record.to_dict()
+    assert payload["source_id"] == "portal"
+    assert payload["user_id"] == "alice"
+    assert payload["bbk_id"] == "1001"
+```
+
+在 `deploy/migrations/2026_08_19_create_swe_skill_scan_history.sql` 和 `scripts/sql/skill_scan_history_tables.sql` 中提供独立迁移脚本，确认三列是逐列补齐，不能合并成一条 `ALTER TABLE`：
+
+```python
+@pytest.mark.asyncio
+async def test_skill_scan_history_migrates_context_columns_individually() -> None:
+    db = _MockDb()
+    store = SkillScanHistoryStore(db)
+
+    await store.initialize()
+
+    alter_statements = [
+        sql for sql, _ in db.executed
+        if sql.strip().upper().startswith("ALTER TABLE swe_skill_scan_history".upper())
+    ]
+    assert any("ADD COLUMN source_id" in sql for sql in alter_statements)
+    assert any("ADD COLUMN user_id" in sql for sql in alter_statements)
+    assert any("ADD COLUMN bbk_id" in sql for sql in alter_statements)
+    assert len(alter_statements) >= 3
+```
+
+- [ ] **步骤 3：运行测试并确认失败**
+
+运行：
+
+```bash
+venv/bin/python -m pytest \
+  tests/unit/security/test_skill_scan_history.py \
+  market/tests/unit/security/test_skill_scan_history.py \
+  -v
+```
+
+预期：失败；Market 测试会出现 `ModuleNotFoundError: No module named 'market.security.skill_scanner.history'`，SWE 测试会因 `BlockedSkillRecord` 尚未包含 `source_id`、`user_id`、`bbk_id` 失败。
+
+- [ ] **步骤 4：扩展 SWE 数据库历史表结构**
+
+修改 `src/swe/security/skill_scanner/history.py`，为 `BlockedSkillRecord`、`to_dict()`、`insert()`、`_row_to_record()`、`_INSERT_RECORD`、`_LIST_RECORDS`、`_GET_LATEST_WARNING` 补齐 `source_id`、`user_id`、`bbk_id`。`initialize()` 只校验数据库可用，不执行 `CREATE TABLE` 或 `ALTER TABLE`。
+
+新增列必须允许空字符串默认值，避免破坏已有调用方：
+
+```sql
+source_id VARCHAR(128) NOT NULL DEFAULT '',
+user_id VARCHAR(255) NOT NULL DEFAULT '',
+bbk_id VARCHAR(128) NOT NULL DEFAULT '',
+```
+
+建表和已有表补列由独立 SQL 脚本执行。因为 `CREATE TABLE IF NOT EXISTS` 不会给已有表补字段，必须显式处理旧表；三列不能放进同一条 `ALTER TABLE`，否则线上若只缺其中一两列，会因已存在列报错导致剩余缺失列无法补上：
+
+```python
+_CONTEXT_COLUMN_MIGRATIONS = (
+    "ALTER TABLE swe_skill_scan_history "
+    "ADD COLUMN source_id VARCHAR(128) NOT NULL DEFAULT '' AFTER id",
+    "ALTER TABLE swe_skill_scan_history "
+    "ADD COLUMN user_id VARCHAR(255) NOT NULL DEFAULT '' AFTER source_id",
+    "ALTER TABLE swe_skill_scan_history "
+    "ADD COLUMN bbk_id VARCHAR(128) NOT NULL DEFAULT '' AFTER user_id",
+)
+```
+
+执行迁移脚本时通过 `information_schema` 判断缺失列和索引，只补缺失对象。若项目已有通用 schema migration helper，优先复用项目既有 helper，不新增迁移框架。
+
+`_CREATE_TABLE`、`_INSERT_RECORD`、`_LIST_RECORDS` 和 `_GET_LATEST_WARNING` 的字段顺序要保持一致：`id, source_id, user_id, bbk_id, skill_name, blocked_at, max_severity, findings_json, content_hash, action`。这样 SWE API 返回给 Console 的历史记录和 Market 插入的历史记录使用同一套列语义。
+
+- [ ] **步骤 5：实现 Market 数据库历史写入器**
+
+在 `market/src/market/security/skill_scanner/history.py` 中实现与 SWE Console 兼容的表写入器。它只负责写表，不提供本地文件 fallback，也不维护建表或迁移逻辑；表名、列名和写入顺序必须与 SWE 侧一致。写入器要提供 `submit()` 和 `flush()`，接口在返回拦截错误前调用 `flush()` 等待已接受记录完成：
+
+```python
+# -*- coding: utf-8 -*-
+"""Market Skill scan history persistence."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+_INSERT_RECORD = """
+    INSERT INTO swe_skill_scan_history (
+        id, source_id, user_id, bbk_id,
+        skill_name, blocked_at, max_severity,
+        findings_json, content_hash, action
+    )
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+"""
+
+
+@dataclass(frozen=True)
+class BlockedSkillRecord:
+    skill_name: str
+    blocked_at: str
+    max_severity: str
+    findings: list[dict[str, Any]] = field(default_factory=list)
+    content_hash: str = ""
+    action: str = "blocked"
+    source_id: str = ""
+    user_id: str = ""
+    bbk_id: str = ""
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+
+class SkillScanHistoryStore:
+    def __init__(self, db: Any | None = None) -> None:
+        self.db = db
+        self._pending: set[asyncio.Task[None]] = set()
+
+    @property
+    def is_available(self) -> bool:
+        return self.db is not None and bool(
+            getattr(self.db, "is_connected", False),
+        )
+
+    async def insert(self, record: BlockedSkillRecord) -> None:
+        if not self.is_available:
+            return
+        await self.db.execute(
+            _INSERT_RECORD,
+            (
+                record.id,
+                record.source_id,
+                record.user_id,
+                record.bbk_id,
+                record.skill_name,
+                _to_database_datetime(record.blocked_at),
+                record.max_severity,
+                json.dumps(record.findings, ensure_ascii=False),
+                record.content_hash,
+                record.action,
+            ),
+        )
+
+    def submit(self, record: BlockedSkillRecord) -> bool:
+        if not self.is_available:
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        task = loop.create_task(self.insert(record))
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+        return True
+
+    async def flush(self) -> None:
+        while self._pending:
+            await asyncio.gather(*tuple(self._pending), return_exceptions=True)
+
+
+def _to_database_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+```
+
+- [ ] **步骤 6：让 Market scanner 使用数据库写入器**
+
+修改 `market/src/market/security/skill_scanner/__init__.py`：
+
+```python
+from .history import BlockedSkillRecord, SkillScanHistoryStore
+
+_history_store: SkillScanHistoryStore | None = None
+
+
+def install_skill_scan_history_store(
+    store: SkillScanHistoryStore | None,
+) -> None:
+    global _history_store
+    _history_store = store
+
+
+def _finding_to_dict(f: Finding) -> dict[str, Any]:
+    return {
+        "severity": f.severity.value,
+        "title": f.title,
+        "description": f.description,
+        "file_path": f.file_path,
+        "line_number": f.line_number,
+        "rule_id": f.rule_id,
+        "analyzer": f.analyzer,
+    }
+```
+
+将 Market 侧 `scan_skill_directory()` 增加仅 Market 内部使用的可选上下文参数：
+
+```python
+def scan_skill_directory(
+    skill_dir: str | Path,
+    *,
+    skill_name: str | None = None,
+    block: bool | None = None,
+    timeout: float | None = None,
+    source_id: str = "",
+    user_id: str = "",
+    bbk_id: str = "",
+) -> ScanResult | None:
+```
+
+将 `_record_blocked_skill()` 改为只提交数据库写入，构造 `BlockedSkillRecord(source_id=source_id or "", user_id=user_id or "", bbk_id=bbk_id or "", ...)` 后调用 `store.submit(record)`。删除 `_BLOCKED_HISTORY_FILE`、`_history_lock`、`_get_blocked_history_path()`、`get_blocked_history()`、`clear_blocked_history()` 和 `remove_blocked_entry()` 的本地文件实现。没有运行循环或数据库不可用时记录 warning 并跳过，不写本地文件兜底。
+
+同时修改 Market 上传、管理员上架和启用调用点，让扫描入口携带上下文。用户侧上传/启用使用 `X-Source-Id`、`X-User-Id`、`X-Bbk-Id`；管理员上架接口也必须新增并使用 `X-Bbk-Id` 请求头作为操作者分行归属。`bbk_ids` 查询参数只表示技能上架后的可见/分发分行范围，不能写入扫描历史的 `bbk_id`。`scan_skill_directory()` 的新上下文参数要从这些请求头向下透传到 `_record_blocked_skill()`：
+
+管理员上架接口签名中显式增加请求头参数：
+
+```python
+x_bbk_id: Annotated[str | None, Header(alias="X-Bbk-Id")] = None
+```
+
+如果该文件仍使用 `Optional[str]` 风格，则保持现有风格并写成：
+
+```python
+x_bbk_id: Optional[str] = Header(default=None, alias="X-Bbk-Id")
+```
+
+```python
+scan_skill_directory(
+    skill_dir,
+    skill_name=skill_name,
+    block=True,
+    source_id=source_id or "",
+    user_id=user_id or "",
+    bbk_id=bbk_id or "",
+)
+```
+
+新增可等待 helper，供路由或 service 在返回拦截错误前等待写库完成：
+
+```python
+async def flush_skill_scan_history() -> None:
+    store = _history_store
+    if store is not None:
+        await store.flush()
+```
+
+在 `market/src/market/app/routers/skills_browse.py`、`market/src/market/app/routers/skills_market.py` 和 `market/src/market/marketplace/service.py` 中捕获 `SkillScanError` 后，返回 `HTTPException` 或 `{"reason": "security_scan_failed"}` 前先 `await flush_skill_scan_history()`。这一步是接口可观测性的关键：扫描拦截响应返回时，Console 查询历史表应该已经能看到该条记录。
+
+- [ ] **步骤 7：Market 应用启动时安装数据库历史 writer**
+
+修改 `market/src/market/app/_app.py`，在创建 `MarketplaceService` 后安装 store。Market 和 SWE 必须使用同一张表，但建表和补列迁移只由独立 SQL 脚本负责；Market 只做可用性检查并安装 writer：
+
+```python
+from ..security.skill_scanner import install_skill_scan_history_store
+from ..security.skill_scanner.history import SkillScanHistoryStore
+
+history_store = SkillScanHistoryStore(db)
+if history_store.is_available:
+    install_skill_scan_history_store(history_store)
+else:
+    install_skill_scan_history_store(None)
+```
+
+- [ ] **步骤 8：补充 Market 上传/上架拦截回归**
+
+在 `market/tests/unit/marketplace/test_skills_browse.py` 和 `market/tests/unit/marketplace/test_skills_market.py` 中，为已有“上传危险 Skill 被拦截”的测试补充断言：
+
+- 拦截后数据库收到 `INSERT INTO swe_skill_scan_history`。
+- 用户侧上传/启用记录参数包含请求头中的 `X-Source-Id`、`X-User-Id`、`X-Bbk-Id`。
+- 管理员上架接口必须新增 `X-Bbk-Id` 请求头，记录参数包含 `X-Source-Id`、`X-User-Id`、`X-Bbk-Id`。
+- `bbk_ids` 查询参数不得写入扫描历史的 `bbk_id`。
+- 返回 `security_scan_failed` 或抛出 `HTTPException` 前已经调用 `flush_skill_scan_history()`。
+- 临时 `MARKET_SWE_ROOT/skill_scanner_blocked.json` 不存在。
+
+Console 的字段展示由任务 7 的 `SkillScannerSection` 和 API 测试覆盖，不放在 Market 后端测试中。
+
+- [ ] **步骤 9：运行 Market 聚焦测试**
+
+运行：
+
+```bash
+venv/bin/python -m pytest \
+  tests/unit/security/test_skill_scan_history.py \
+  market/tests/unit/security/test_skill_scan_history.py \
+  market/tests/unit/marketplace/test_skills_browse.py \
+  market/tests/unit/marketplace/test_skills_market.py \
+  -v
+```
+
+预期：通过。
+
+- [ ] **步骤 10：提交 Market 数据库历史落库**
+
+```bash
+git add \
+  src/swe/security/skill_scanner/history.py \
+  tests/unit/security/test_skill_scan_history.py \
+  market/src/market/security/skill_scanner/history.py \
+  market/src/market/security/skill_scanner/__init__.py \
+  market/src/market/app/_app.py \
+  market/src/market/app/routers/skills_browse.py \
+  market/src/market/app/routers/skills_market.py \
+  market/src/market/marketplace/service.py \
+  market/tests/unit/security/test_skill_scan_history.py \
+  market/tests/unit/marketplace/test_skills_browse.py \
+  market/tests/unit/marketplace/test_skills_market.py
+git commit -m "feat(market): persist skill scan alerts to database"
+```
+
+### 任务 10：第一阶段回归验证
 
 **文件：**
 
@@ -1266,7 +1834,7 @@ git commit -m "chore(security): verify skill scan MVP"
 
 ## 第二阶段任务池
 
-### 任务 10：增加 Profile 配置测试
+### 任务 11：增加 Profile 配置测试
 
 **文件：**
 
@@ -1345,7 +1913,7 @@ git add src/swe/config/config.py tests/unit/security/test_skill_scanner_profiles
 git commit -m "feat(security): add skill scanner profiles"
 ```
 
-### 任务 11：开源引擎适配器契约
+### 任务 12：开源引擎适配器契约
 
 **文件：**
 
@@ -1408,7 +1976,7 @@ git add src/swe/security/skill_scanner/external_engines.py tests/unit/security/t
 git commit -m "feat(security): add external skill scan engine adapters"
 ```
 
-### 任务 12：Dependency Analyzer
+### 任务 13：Dependency Analyzer
 
 **文件：**
 
@@ -1449,7 +2017,7 @@ class DependencyAnalyzer(BaseAnalyzer):
 venv/bin/python -m pytest tests/unit/security/test_skill_scanner_dependency_analyzer.py -v
 ```
 
-### 任务 13：按 Profile 选择分析器
+### 任务 14：按 Profile 选择分析器
 
 **文件：**
 
@@ -1471,7 +2039,7 @@ venv/bin/python -m pytest tests/unit/security/test_skill_scanner_dependency_anal
 venv/bin/python -m pytest tests/unit/security/test_skill_scanner_profiles.py -v
 ```
 
-### 任务 14：Market Scanner 对齐
+### 任务 15：Market Scanner 对齐
 
 **文件：**
 
@@ -1496,7 +2064,7 @@ venv/bin/python -m pytest market/tests/unit/marketplace/test_skills_market.py -v
 
 ## 第三阶段任务池
 
-### 任务 15：Taint Flow Analyzer
+### 任务 16：Taint Flow Analyzer
 
 **文件：**
 
@@ -1511,7 +2079,7 @@ venv/bin/python -m pytest market/tests/unit/marketplace/test_skills_market.py -v
 | `open("~/.ssh/...")` | `requests.post(...)` | `TAINT_SECRET_FILE_TO_NETWORK` |
 | file read variable | `subprocess.run(..., shell=True)` | `TAINT_FILE_TO_SHELL` |
 
-### 任务 16：Semantic Analyzer Adapter
+### 任务 17：Semantic Analyzer Adapter
 
 **文件：**
 
@@ -1525,7 +2093,7 @@ venv/bin/python -m pytest market/tests/unit/marketplace/test_skills_market.py -v
 - 将 Skill 内容视为对抗性输入。
 - 在 Finding metadata 中返回 confidence。
 
-### 任务 17：外部引擎运行器与 strict profile 集成
+### 任务 18：外部引擎运行器与 strict profile 集成
 
 **文件：**
 
@@ -1555,7 +2123,7 @@ venv/bin/python -m pytest \
   -v
 ```
 
-### 任务 18：复核与运营 API
+### 任务 19：复核与运营 API
 
 **文件：**
 

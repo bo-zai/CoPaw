@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
 """Regression tests for the lightweight API health endpoint."""
 
+import os
+from pathlib import Path
 import subprocess
 import sys
 
 
 def test_api_health_route_is_registered_and_returns_ok():
     """The app should expose GET /api/health/health without extra deps."""
+    repo_root = Path(__file__).resolve().parents[3]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{repo_root / 'tests' / 'fakes'}:{repo_root / 'src'}"
     result = subprocess.run(
         [
             sys.executable,
@@ -33,6 +38,8 @@ def test_api_health_route_is_registered_and_returns_ok():
                 "response.json() == {'status': 'ok'} else 1)"
             ),
         ],
+        cwd=repo_root,
+        env=env,
         capture_output=True,
         text=True,
         check=False,

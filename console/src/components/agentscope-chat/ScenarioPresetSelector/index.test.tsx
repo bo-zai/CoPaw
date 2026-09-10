@@ -28,6 +28,32 @@ describe("ScenarioPresetSelector", () => {
     expect(container.querySelector(".scenario-preset-selector")).toBeNull();
   });
 
+  it("uses a simplified domain selector when the catalog has only one domain", async () => {
+    getEffectiveCatalog.mockResolvedValueOnce({
+      domains: [
+        {
+          id: "domain-a",
+          name: "文档处理",
+          capabilities: [
+            {
+              id: "capability-a",
+              name: "信息提取",
+              scenarios: [],
+            },
+          ],
+        },
+      ],
+    });
+
+    render(<ScenarioPresetSelector onSelect={vi.fn()} />);
+
+    const domainSelector = await screen.findByRole("tablist", {
+      name: "能力域",
+    });
+    expect(domainSelector).toHaveClass("is-single");
+    expect(screen.getByRole("tab", { name: "文档处理" })).toBeInTheDocument();
+  });
+
   it("renders independent domain cards, capability tabs, and the selected capability scenarios", async () => {
     getEffectiveCatalog.mockResolvedValueOnce({
       domains: [

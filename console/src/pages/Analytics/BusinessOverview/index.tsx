@@ -6,11 +6,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { UIEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import {
-  ArrowUpRight,
   CalendarDays,
   CheckSquare,
   ChevronRight,
-  Clock3,
   Coins,
   Database,
   MessageCircleMore,
@@ -36,7 +34,6 @@ import {
   type OverviewStats,
   type SkillUsage,
   type TaskStatusSummary,
-  type DepthSummary,
 } from "../../../api/modules/tracing";
 import UserDetailModal from "./components/UserDetailModal";
 import SkillDetailModal from "./components/SkillDetailModal";
@@ -48,14 +45,12 @@ import {
 } from "../../../utils/branchScope";
 import {
   formatChange,
-  formatDuration,
   formatNumber,
   formatPercent,
   formatTokens,
-  truncateName,
   toChangeDirection,
+  truncateName,
   type BreakdownItem,
-  type DepthStatCard,
   type OverviewMetricCard,
   type SummaryLegendItem,
   type TimeRange,
@@ -107,15 +102,8 @@ function mapBreakdown(
 function buildMetricCards(
   overviewStats: OverviewStats | null,
   taskStatusSummary: TaskStatusSummary | null,
-  growthStats: {
-    callsGrowth: number | null;
-    tokensGrowth: number | null;
-    sessionGrowth: number | null;
-    userGrowth: number | null;
-    cronGrowth: number | null;
-    planCustomersGrowth: number | null;
-  },
 ): OverviewMetricCard[] {
+  const growthStats = overviewStats?.growth_stats;
   return [
     {
       key: "users",
@@ -135,8 +123,8 @@ function buildMetricCards(
           </span>
         </span>
       ),
-      changeText: formatChange(growthStats.userGrowth),
-      changeDirection: toChangeDirection(growthStats.userGrowth),
+      changeText: formatChange(growthStats?.userGrowth),
+      changeDirection: toChangeDirection(growthStats?.userGrowth),
       accentColor: METRIC_ACCENT_COLORS[0],
       breakdown: mapBreakdown(overviewStats?.branch_breakdown?.users),
     },
@@ -144,8 +132,8 @@ function buildMetricCards(
       key: "sessions",
       title: "总会话数",
       valueText: formatNumber(overviewStats?.total_sessions ?? 0),
-      changeText: formatChange(growthStats.sessionGrowth),
-      changeDirection: toChangeDirection(growthStats.sessionGrowth),
+      changeText: formatChange(growthStats?.sessionGrowth),
+      changeDirection: toChangeDirection(growthStats?.sessionGrowth),
       accentColor: METRIC_ACCENT_COLORS[1],
       breakdown: mapBreakdown(overviewStats?.branch_breakdown?.sessions),
     },
@@ -165,8 +153,8 @@ function buildMetricCards(
           </span>
         </span>
       ),
-      changeText: formatChange(growthStats.cronGrowth),
-      changeDirection: toChangeDirection(growthStats.cronGrowth),
+      changeText: formatChange(growthStats?.cronGrowth),
+      changeDirection: toChangeDirection(growthStats?.cronGrowth),
       accentColor: METRIC_ACCENT_COLORS[2],
       breakdown: mapBreakdown(overviewStats?.branch_breakdown?.cron_tasks),
     },
@@ -174,8 +162,8 @@ function buildMetricCards(
       key: "tokens",
       title: "资源消耗",
       valueText: formatTokens(overviewStats?.total_tokens ?? 0),
-      changeText: formatChange(growthStats.tokensGrowth),
-      changeDirection: toChangeDirection(growthStats.tokensGrowth),
+      changeText: formatChange(growthStats?.tokensGrowth),
+      changeDirection: toChangeDirection(growthStats?.tokensGrowth),
       accentColor: METRIC_ACCENT_COLORS[3],
       breakdown: mapBreakdown(overviewStats?.branch_breakdown?.tokens),
     },
@@ -199,51 +187,10 @@ function buildMetricCards(
           </span>
         </span>
       ),
-      changeText: formatChange(growthStats.planCustomersGrowth),
-      changeDirection: toChangeDirection(growthStats.planCustomersGrowth),
+      changeText: formatChange(growthStats?.planCustomersGrowth),
+      changeDirection: toChangeDirection(growthStats?.planCustomersGrowth),
       accentColor: METRIC_ACCENT_COLORS[4],
       breakdown: mapBreakdown(overviewStats?.branch_breakdown?.customers),
-    },
-  ];
-}
-
-function buildDepthCards(
-  summary: DepthSummary | null,
-  growthStats: {
-    avgRoundsGrowth: number | null;
-    multiRoundRatioGrowth: number | null;
-    avgDurationGrowth: number | null;
-    avgSessionsPerUserGrowth: number | null;
-  },
-): DepthStatCard[] {
-  return [
-    {
-      key: "avg-rounds",
-      title: "单次会话平均轮数",
-      valueText: safeNumber(summary?.avg_rounds).toFixed(1),
-      changeText: formatChange(growthStats.avgRoundsGrowth),
-      changeDirection: toChangeDirection(growthStats.avgRoundsGrowth),
-    },
-    {
-      key: "multi-round",
-      title: "多轮会话占比(>3轮)",
-      valueText: formatPercent(safeNumber(summary?.multi_round_ratio)),
-      changeText: formatChange(growthStats.multiRoundRatioGrowth),
-      changeDirection: toChangeDirection(growthStats.multiRoundRatioGrowth),
-    },
-    {
-      key: "avg-duration",
-      title: "平均对话时长",
-      valueText: formatDuration(safeNumber(summary?.avg_duration_seconds)),
-      changeText: formatChange(growthStats.avgDurationGrowth),
-      changeDirection: toChangeDirection(growthStats.avgDurationGrowth),
-    },
-    {
-      key: "avg-sessions",
-      title: "人均会话数",
-      valueText: safeNumber(summary?.avg_sessions_per_user).toFixed(1),
-      changeText: formatChange(growthStats.avgSessionsPerUserGrowth),
-      changeDirection: toChangeDirection(growthStats.avgSessionsPerUserGrowth),
     },
   ];
 }
@@ -749,29 +696,6 @@ export default function BusinessOverviewPage() {
     null,
   );
   const [dashboardLoading, setDashboardLoading] = useState(false);
-  const [growthStats, setGrowthStats] = useState<{
-    callsGrowth: number | null;
-    tokensGrowth: number | null;
-    sessionGrowth: number | null;
-    userGrowth: number | null;
-    cronGrowth: number | null;
-    avgRoundsGrowth: number | null;
-    multiRoundRatioGrowth: number | null;
-    avgDurationGrowth: number | null;
-    avgSessionsPerUserGrowth: number | null;
-    planCustomersGrowth: number | null;
-  }>({
-    callsGrowth: null,
-    tokensGrowth: null,
-    sessionGrowth: null,
-    userGrowth: null,
-    cronGrowth: null,
-    avgRoundsGrowth: null,
-    multiRoundRatioGrowth: null,
-    avgDurationGrowth: null,
-    avgSessionsPerUserGrowth: null,
-    planCustomersGrowth: null,
-  });
   const [trendData, setTrendData] = useState<TrendDatum[]>([]);
   const [activeUsers, setActiveUsers] = useState<UserRow[]>([]);
   const [activePage, setActivePage] = useState(1);
@@ -781,8 +705,6 @@ export default function BusinessOverviewPage() {
   const activeListRef = useRef<HTMLDivElement | null>(null);
   // 用户过滤类型：filtered(过滤IT人员) / all(全部用户)
   const [activeFilterType, setActiveFilterType] = useState<"filtered" | "all">("all");
-  // 使用深度卡片默认隐藏
-  const [hideDepthCard] = useState(true);
   const [skills, setSkills] = useState<SkillUsage[]>([]);
   const [skillsPage, setSkillsPage] = useState(1);
   const [skillsHasMore, setSkillsHasMore] = useState(true);
@@ -793,8 +715,6 @@ export default function BusinessOverviewPage() {
   const [taskStatusSummary, setTaskStatusSummary] =
     useState<TaskStatusSummary | null>(null);
   const [taskStatusLoading, setTaskStatusLoading] = useState(false);
-  const [depthSummary, setDepthSummary] = useState<DepthSummary | null>(null);
-  const [depthLoading, setDepthLoading] = useState(false);
   const [htmlPreviewRefreshKey, setHtmlPreviewRefreshKey] = useState(0);
   const [errorLoading, setErrorLoading] = useState(false);
   const errorLoadingRef = useRef(false);
@@ -868,17 +788,12 @@ export default function BusinessOverviewPage() {
 
     setDashboardLoading(true);
     try {
-      const [overviewRes, growthRes, trendRes] = await Promise.allSettled([
+      const [overviewRes, trendRes] = await Promise.allSettled([
         tracingApi.getOverview(
           startDateText,
           endDateText,
           effectiveBbkIds?.join(","),
-        ),
-        tracingApi.getGrowthStats(
-          startDateText,
-          endDateText,
-          timeRange,
-          effectiveBbkIds?.join(","),
+          { detail: "summary", timeRange },
         ),
         isSingleDay
           ? tracingApi.getHourlyTrend(
@@ -895,9 +810,6 @@ export default function BusinessOverviewPage() {
 
       if (overviewRes.status === "fulfilled") {
         setOverviewStats(overviewRes.value);
-      }
-      if (growthRes.status === "fulfilled") {
-        setGrowthStats(growthRes.value);
       }
       if (trendRes.status === "fulfilled") {
         setTrendData(trendRes.value.trendData || []);
@@ -1042,22 +954,6 @@ export default function BusinessOverviewPage() {
     }
   }, [effectiveBbkIds, endDateText, startDateText]);
 
-  const fetchDepthSummary = useCallback(async () => {
-    setDepthLoading(true);
-    try {
-      const result = await tracingApi.getDepthSummary({
-        start_date: startDateText,
-        end_date: endDateText,
-        bbk_ids: effectiveBbkIds?.join(","),
-      });
-      setDepthSummary(result);
-    } catch (error) {
-      console.error("Failed to fetch depth summary:", error);
-    } finally {
-      setDepthLoading(false);
-    }
-  }, [effectiveBbkIds, endDateText, startDateText]);
-
   useEffect(() => {
     fetchDashboard();
     setSkills([]);
@@ -1066,11 +962,9 @@ export default function BusinessOverviewPage() {
     fetchSkills(1, false);
     fetchErrorSummary();
     fetchTaskStatusSummary();
-    fetchDepthSummary();
     // 活跃用户请求由独立的 useEffect 处理
   }, [
     fetchDashboard,
-    fetchDepthSummary,
     fetchErrorSummary,
     fetchSkills,
     fetchTaskStatusSummary,
@@ -1197,12 +1091,8 @@ export default function BusinessOverviewPage() {
     !!current && current.isAfter(dayjs().startOf("day"), "day");
 
   const metricCards = useMemo(
-    () => buildMetricCards(overviewStats, taskStatusSummary, growthStats),
-    [growthStats, overviewStats, taskStatusSummary],
-  );
-  const depthCards = useMemo(
-    () => buildDepthCards(depthSummary, growthStats),
-    [growthStats, depthSummary],
+    () => buildMetricCards(overviewStats, taskStatusSummary),
+    [overviewStats, taskStatusSummary],
   );
   const executionSummary = useMemo(
     () => buildExecutionSummary(taskStatusSummary),
@@ -1328,7 +1218,6 @@ export default function BusinessOverviewPage() {
                 fetchSkills();
                 fetchErrorSummary();
                 fetchTaskStatusSummary();
-                fetchDepthSummary();
                 setHtmlPreviewRefreshKey((value) => value + 1);
               }}
             >
@@ -1422,7 +1311,7 @@ export default function BusinessOverviewPage() {
       </section>
 
       <section
-        className={hideDepthCard ? styles.analysisGrid : styles.analysisGridWithDepth}
+        className={styles.analysisGrid}
         data-testid="overview-analysis-grid"
       >
         <article className={styles.panelLarge}>
@@ -1554,49 +1443,6 @@ export default function BusinessOverviewPage() {
           </div>
         </article>
 
-        {!hideDepthCard && (
-          <article className={styles.panelMedium}>
-            <div className={styles.panelHeader}>
-              <h3 className={styles.panelTitle}>使用深度</h3>
-            </div>
-            {depthLoading ? (
-              renderCardLoading()
-            ) : (
-              <div className={styles.depthGrid}>
-                {depthCards.map((card) => (
-                  <div key={card.key} className={styles.depthCard}>
-                    <div className={styles.depthIconWrap}>
-                      {card.key === "avg-rounds" && <MessageCircleMore size={15} />}
-                      {card.key === "multi-round" && <Users size={15} />}
-                      {card.key === "avg-duration" && <Clock3 size={15} />}
-                      {card.key === "avg-sessions" && <ArrowUpRight size={15} />}
-                    </div>
-                    <div className={styles.depthValue}>{card.valueText}</div>
-                    <Tooltip title={card.title} placement="top">
-                      <div className={styles.depthTitle}>{card.title}</div>
-                    </Tooltip>
-                    <div
-                      className={
-                        card.changeDirection === "up"
-                          ? styles.metricChangeUp
-                          : card.changeDirection === "down"
-                          ? styles.metricChangeDown
-                          : styles.metricChangeFlat
-                      }
-                    >
-                      环比
-                      {card.changeDirection === "up" && <TrendingUp size={12} />}
-                      {card.changeDirection === "down" && (
-                        <TrendingDown size={12} />
-                      )}
-                      {card.changeText}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </article>
-        )}
       </section>
 
       <section

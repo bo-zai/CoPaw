@@ -4,13 +4,68 @@ import { request } from "../request";
 import type {
   WPlusSopCommandReceipt,
   WPlusSopCommandRequest,
+  WPlusSopCumulativeArtifactIdentity,
   WPlusSopEntryRejectReceipt,
   WPlusSopSession,
   WPlusSopSessionEvent,
+  WPlusSopStageArtifactIdentity,
 } from "../types/wplusSop";
 
 function sessionPath(sessionId: string): string {
   return `/wplus-sop/sessions/${encodeURIComponent(sessionId)}`;
+}
+
+function artifactPath(sessionId: string, artifactId: string): string {
+  return `${sessionPath(sessionId)}/artifacts/${encodeURIComponent(
+    artifactId,
+  )}`;
+}
+
+function stageArtifactPath(
+  sessionId: string,
+  identity: WPlusSopStageArtifactIdentity,
+): string {
+  const query = new URLSearchParams({
+    stage_id: identity.stageId,
+    revision: String(identity.revision),
+    report_no: String(identity.reportNo),
+  });
+  return `${sessionPath(sessionId)}/stage-report-artifacts/${encodeURIComponent(
+    identity.artifactId,
+  )}?${query.toString()}`;
+}
+
+function cumulativeArtifactPath(
+  sessionId: string,
+  identity: WPlusSopCumulativeArtifactIdentity,
+): string {
+  const query = new URLSearchParams({
+    preview_version: String(identity.previewVersion),
+  });
+  return `${sessionPath(sessionId)}/cumulative-artifacts/${encodeURIComponent(
+    identity.artifactId,
+  )}?${query.toString()}`;
+}
+
+function downloadArtifactPath(path: string): string {
+  return `${path}${path.includes("?") ? "&" : "?"}download=true`;
+}
+
+async function fetchArtifact(
+  path: string,
+  signal?: AbortSignal,
+): Promise<Response> {
+  const response = await fetch(getApiUrl(path), {
+    method: "GET",
+    headers: buildAuthHeaders(),
+    signal,
+  });
+  if (!response.ok) {
+    const error = new Error(`产物读取失败（${response.status}）`);
+    (error as Error & { status?: number }).status = response.status;
+    throw error;
+  }
+  return response;
 }
 
 function parseEventBlock(block: string): WPlusSopSessionEvent | null {
@@ -99,22 +154,71 @@ export const wplusSopApi = {
     artifactId: string,
     signal?: AbortSignal,
   ): Promise<Blob> => {
-    const response = await fetch(
-      getApiUrl(
-        `${sessionPath(sessionId)}/artifacts/${encodeURIComponent(artifactId)}`,
-      ),
-      {
-        method: "GET",
-        headers: buildAuthHeaders(),
-        signal,
-      },
+    const response = await fetchArtifact(
+      downloadArtifactPath(artifactPath(sessionId, artifactId)),
+      signal,
     );
-    if (!response.ok) {
-      const error = new Error(`产物下载失败（${response.status}）`);
-      (error as Error & { status?: number }).status = response.status;
-      throw error;
-    }
     return response.blob();
+  },
+
+  readArtifact: async (
+    sessionId: string,
+    artifactId: string,
+    signal?: AbortSignal,
+  ): Promise<string> => {
+    const response = await fetchArtifact(
+      artifactPath(sessionId, artifactId),
+      signal,
+    );
+    return response.text();
+  },
+
+  downloadStageReportArtifact: async (
+    sessionId: string,
+    identity: WPlusSopStageArtifactIdentity,
+    signal?: AbortSignal,
+  ): Promise<Blob> => {
+    const response = await fetchArtifact(
+      downloadArtifactPath(stageArtifactPath(sessionId, identity)),
+      signal,
+    );
+    return response.blob();
+  },
+
+  readStageReportArtifact: async (
+    sessionId: string,
+    identity: WPlusSopStageArtifactIdentity,
+    signal?: AbortSignal,
+  ): Promise<string> => {
+    const response = await fetchArtifact(
+      stageArtifactPath(sessionId, identity),
+      signal,
+    );
+    return response.text();
+  },
+
+  downloadCumulativeArtifact: async (
+    sessionId: string,
+    identity: WPlusSopCumulativeArtifactIdentity,
+    signal?: AbortSignal,
+  ): Promise<Blob> => {
+    const response = await fetchArtifact(
+      downloadArtifactPath(cumulativeArtifactPath(sessionId, identity)),
+      signal,
+    );
+    return response.blob();
+  },
+
+  readCumulativeArtifact: async (
+    sessionId: string,
+    identity: WPlusSopCumulativeArtifactIdentity,
+    signal?: AbortSignal,
+  ): Promise<string> => {
+    const response = await fetchArtifact(
+      cumulativeArtifactPath(sessionId, identity),
+      signal,
+    );
+    return response.text();
   },
 
   subscribeSessionEvents(

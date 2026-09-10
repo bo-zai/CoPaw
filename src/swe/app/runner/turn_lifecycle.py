@@ -5,13 +5,21 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any, AsyncGenerator, Protocol
 
 from agentscope.message import Msg
 from agentscope_runtime.engine.schemas.agent_schemas import AgentRequest
 
+from .assistant_response import (
+    project_candidate_assistant_response,
+    replace_candidate_assistant_response,
+)
 from ...agents.tool_guard_mixin import PreToolUseTerminalStop
 from ...agents.hook_runtime.models import HookDecision, MergedHookResult
+
+logger = logging.getLogger(__name__)
 
 
 class TurnLifecycleOwner(Protocol):
@@ -199,6 +207,7 @@ async def stream_completion_lifecycle(
     if goal_id:
         async for event in _stream_goal_completion_lifecycle(
             owner,
+            request=request,
             goal_id=goal_id,
             runtime=runtime,
             plan=plan,
@@ -278,7 +287,10 @@ async def _begin_goal_turn(
                 role="assistant",
                 content="The requested Goal is not available in this chat.",
             )
-        return service, await service.begin_turn(goal_id)
+        msgid = str(
+            getattr(runtime.agent, "_request_context", {}).get("msgid") or "",
+        ).strip()
+        return service, await service.begin_turn(goal_id, msgid=msgid or None)
     except ValueError:
         state = getattr(getattr(current_goal, "state", None), "value", None)
         return Msg(
@@ -406,9 +418,151 @@ async def _wait_for_goal_wake(
     return settled
 
 
+async def _stream_one_goal_turn(
+    owner: TurnLifecycleOwner,
+    *,
+    goal_id: str,
+    service: Any,
+    runtime: Any,
+    plan: Any,
+    outcome: Any,
+) -> AsyncGenerator[tuple[Msg, bool], None]:
+    """Stream one Goal turn and preserve cancellation cleanup."""
+    try:
+        async for msg, _last in owner._stream_agent_turns(
+            runtime=runtime,
+            plan=plan,
+            outcome=outcome,
+        ):
+            observations = getattr(
+                runtime.agent,
+                "_request_context",
+                {},
+            ).get("_goal_turn_tool_observations")
+            if isinstance(observations, list):
+                owner._append_goal_tool_observations(observations, msg)
+            yield msg, False
+    except asyncio.CancelledError:
+        await service.abandon_turn(
+            goal_id,
+            "Goal turn stopped before settlement",
+        )
+        raise
+
+
+async def _wait_for_goal_wake_after_cancel(
+    owner: TurnLifecycleOwner,
+    *,
+    service: Any,
+    runtime: Any,
+    reviewer: Any,
+    goal_id: str,
+    plan: Any,
+    settled: Any,
+) -> Any:
+    """Wait for a Goal wake and interrupt the matching turn on cancellation."""
+    try:
+        return await _wait_for_goal_wake(
+            owner,
+            service=service,
+            reviewer=reviewer,
+            goal_id=goal_id,
+            plan=plan,
+            settled=settled,
+        )
+    except asyncio.CancelledError:
+        msgid = str(
+            getattr(runtime.agent, "_request_context", {}).get("msgid") or "",
+        ).strip()
+        interrupt = getattr(service, "interrupt_turn_if_matches", None)
+        if callable(interrupt) and msgid:
+            await interrupt(
+                goal_id,
+                msgid,
+                "Goal turn stopped while waiting for wake",
+            )
+        else:
+            await service.abandon_turn(
+                goal_id,
+                "Goal turn stopped while waiting for wake",
+            )
+        raise
+
+
+async def _stream_goal_finalization(
+    owner: TurnLifecycleOwner,
+    *,
+    request: AgentRequest,
+    runtime: Any,
+    plan: Any,
+    outcome: Any,
+    settled: Any,
+) -> AsyncGenerator[tuple[Msg, bool], None]:
+    """Stream finalization turns, including Stop retries and buffering."""
+    outcome.stop_follow_up_turns = 0
+    outcome.max_stop_turns = owner._resolve_max_stop_turns(
+        getattr(runtime, "agent_config", None),
+    )
+    stop_rejection_reason: str | None = None
+    while True:
+        outcome.goal_finalization_fallback = False
+        outcome.assistant_memory_start = len(
+            getattr(getattr(runtime.agent, "memory", None), "content", []),
+        )
+        outcome.stop_output_buffer_required = (
+            owner._requires_stop_output_buffer(
+                request=request,
+                runtime=runtime,
+                plan=plan,
+            )
+        )
+        finalization_msg: Msg | None = None
+        async for msg, last in owner._stream_goal_finalization_turn(
+            runtime=runtime,
+            goal=settled,
+            stop_rejection_reason=stop_rejection_reason,
+        ):
+            if last:
+                finalization_msg = msg
+            elif not outcome.stop_output_buffer_required:
+                yield msg, False
+        if finalization_msg is None:
+            return
+        metadata = getattr(finalization_msg, "metadata", None)
+        outcome.goal_finalization_fallback = bool(
+            isinstance(metadata, dict)
+            and metadata.get("goal_finalization_fallback"),
+        )
+        outcome.assistant_response = (
+            project_candidate_assistant_response(finalization_msg) or ""
+        )
+        retry_finalization, incomplete_msg, retry_reason = (
+            await _resolve_goal_finalization_stop_gate(
+                owner,
+                request=request,
+                runtime=runtime,
+                plan=plan,
+                outcome=outcome,
+            )
+        )
+        if retry_finalization:
+            stop_rejection_reason = retry_reason
+            continue
+        if incomplete_msg is not None:
+            yield incomplete_msg, True
+        else:
+            _replace_buffered_assistant_text(
+                finalization_msg,
+                outcome.assistant_response,
+            )
+            yield finalization_msg, True
+        return
+
+
 async def _stream_goal_completion_lifecycle(
     owner: TurnLifecycleOwner,
     *,
+    request: AgentRequest,
     goal_id: str,
     runtime: Any,
     plan: Any,
@@ -428,19 +582,15 @@ async def _stream_goal_completion_lifecycle(
         service, goal = started
         _prepare_goal_turn_context(owner, runtime=runtime, goal=goal)
         outcome.stop_hook_active = False
-        async for msg, _last in owner._stream_agent_turns(
+        async for msg, last in _stream_one_goal_turn(
+            owner,
+            goal_id=goal_id,
+            service=service,
             runtime=runtime,
             plan=plan,
             outcome=outcome,
         ):
-            observations = getattr(
-                runtime.agent,
-                "_request_context",
-                {},
-            ).get("_goal_turn_tool_observations")
-            if isinstance(observations, list):
-                owner._append_goal_tool_observations(observations, msg)
-            yield msg, False
+            yield msg, last
         if outcome.pre_tool_terminal_stop:
             await service.abandon_turn(
                 goal_id,
@@ -465,9 +615,10 @@ async def _stream_goal_completion_lifecycle(
             )
             continue
         if settled.state.value == "WAITING":
-            settled = await _wait_for_goal_wake(
+            settled = await _wait_for_goal_wake_after_cancel(
                 owner,
                 service=service,
+                runtime=runtime,
                 reviewer=reviewer,
                 goal_id=goal_id,
                 plan=plan,
@@ -477,15 +628,56 @@ async def _stream_goal_completion_lifecycle(
                 continue
         if settled.state.value == "INTERRUPTED":
             return
-        async for (
-            finalization_msg,
-            last,
-        ) in owner._stream_goal_finalization_turn(
+        async for msg, last in _stream_goal_finalization(
+            owner,
+            request=request,
             runtime=runtime,
-            goal=settled,
+            plan=plan,
+            outcome=outcome,
+            settled=settled,
         ):
-            yield finalization_msg, last
+            yield msg, last
         return
+
+
+async def _resolve_goal_finalization_stop_gate(
+    owner: TurnLifecycleOwner,
+    *,
+    request: AgentRequest,
+    runtime: Any,
+    plan: Any,
+    outcome: Any,
+) -> tuple[bool, Msg | None, str | None]:
+    """Apply Stop to formal Goal delivery without reopening Goal execution."""
+    stop_result = await owner._emit_stop_hook_if_needed(
+        request=request,
+        runtime=runtime,
+        plan=plan,
+        outcome=outcome,
+    )
+    if stop_result is None or stop_result.decision != HookDecision.BLOCK:
+        outcome.stop_hook_active = False
+        return False, None, None
+    reason = (
+        stop_result.blocking_failure_reason
+        if stop_result.has_blocking_failure
+        else stop_result.reason
+    ) or "Stop blocked completion"
+    if (
+        not stop_result.has_blocking_failure
+        and outcome.stop_follow_up_turns < outcome.max_stop_turns
+    ):
+        outcome.stop_follow_up_turns += 1
+        outcome.stop_hook_active = False
+        return True, None, reason
+    outcome.task_completed = False
+    outcome.completion_blocked = True
+    outcome.completion_block_reason = reason
+    outcome.completion_marked_incomplete = True
+    outcome.stop_hook_active = False
+    incomplete_msg = owner._build_stop_incomplete_msg(reason)
+    await runtime.agent.memory.add(incomplete_msg)
+    return False, incomplete_msg, None
 
 
 async def _resolve_stop_gate(
@@ -552,7 +744,23 @@ async def _stream_standard_completion_lifecycle(
         ):
             yield msg, last
         if outcome.pre_tool_terminal_stop:
+            logger.warning(
+                "[STOP-DEBUG] skipped reason=pre_tool_terminal_stop "
+                "trace_id=%s turn_id=%s",
+                getattr(request, "trace_id", None),
+                (getattr(request, "channel_meta", None) or {}).get("turn_id"),
+            )
             return
+        logger.warning(
+            "[STOP-DEBUG] before_stop_gate trace_id=%s turn_id=%s "
+            "response_len=%d pre_tool_terminal_stop=%s "
+            "plan_interaction_turn_boundary=%s",
+            getattr(request, "trace_id", None),
+            (getattr(request, "channel_meta", None) or {}).get("turn_id"),
+            len(outcome.assistant_response or ""),
+            outcome.pre_tool_terminal_stop,
+            outcome.plan_interaction_turn_boundary,
+        )
         should_continue, incomplete_msg = await _resolve_stop_gate(
             owner,
             request=request,
@@ -577,48 +785,8 @@ async def _stream_standard_completion_lifecycle(
 
 
 def _is_bufferable_assistant_text(msg: Msg) -> bool:
-    if msg.role != "assistant" or _is_live_assistant_event(msg):
-        return False
-    if isinstance(msg.content, str):
-        return True
-    if not isinstance(msg.content, list):
-        return False
-    return bool(msg.content) and all(
-        _content_block_has_text(block) for block in msg.content
-    )
-
-
-def _is_live_assistant_event(msg: Msg) -> bool:
-    metadata = getattr(msg, "metadata", None)
-    if not isinstance(metadata, dict):
-        return False
-    values = " ".join(
-        str(metadata.get(key, ""))
-        for key in ("event_type", "message_type", "kind", "type")
-    ).lower()
-    return any(token in values for token in ("progress", "tool", "approval"))
-
-
-def _content_block_has_text(block: Any) -> bool:
-    if isinstance(block, dict):
-        return block.get("type") == "text" and isinstance(
-            block.get("text"),
-            str,
-        )
-    return getattr(block, "type", None) == "text" and isinstance(
-        getattr(block, "text", None),
-        str,
-    )
+    return project_candidate_assistant_response(msg) is not None
 
 
 def _replace_buffered_assistant_text(msg: Msg, response: str) -> None:
-    if isinstance(msg.content, str):
-        msg.content = response
-        return
-    if not isinstance(msg.content, list):
-        return
-    for index, block in enumerate(msg.content):
-        if isinstance(block, dict):
-            block["text"] = response if index == 0 else ""
-        else:
-            block.text = response if index == 0 else ""
+    replace_candidate_assistant_response(msg, response)

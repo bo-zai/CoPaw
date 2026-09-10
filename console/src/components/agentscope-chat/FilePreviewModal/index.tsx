@@ -5,12 +5,9 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { Modal, message, Tooltip, Spin, Tabs } from "antd";
-import { FullscreenOutlined } from "@ant-design/icons";
-import {
-  SparkFalseLine,
-  SparkDownloadLine,
-} from "@agentscope-ai/icons";
+import { Button, Drawer, message, Modal, Tooltip, Spin, Tabs } from "antd";
+import { ArrowLeftOutlined, FullscreenOutlined } from "@ant-design/icons";
+import { SparkFalseLine, SparkDownloadLine } from "@agentscope-ai/icons";
 import { IconButton } from "@agentscope-ai/design";
 import {
   getFileIcon,
@@ -32,8 +29,24 @@ import {
   type ClawFilePlanItem,
 } from "@/api/modules/dynamicRender";
 import { useIframeStore } from "@/stores/iframeStore";
+import type { FilePreviewPresentation } from "../FilePreviewPresentationContext";
 import styles from "./index.module.less";
 
+let splitPreviewCount = 0;
+
+function acquireSplitPreviewLayout() {
+  splitPreviewCount += 1;
+  document.documentElement.classList.add("copaw-file-preview-drawer-open");
+
+  return () => {
+    splitPreviewCount = Math.max(0, splitPreviewCount - 1);
+    if (splitPreviewCount === 0) {
+      document.documentElement.classList.remove(
+        "copaw-file-preview-drawer-open",
+      );
+    }
+  };
+}
 
 export interface FilePreviewModalProps {
   open: boolean;
@@ -49,8 +62,10 @@ export interface FilePreviewModalProps {
   rootResultId?: string;
   custUid?: string | null;
   urlParams?: Record<string, string>;
+  presentation?: FilePreviewPresentation;
+  nestedPreviewMode?: "stack" | "replace";
+  onBack?: () => void;
 }
-
 
 function FilePreviewModal(props: FilePreviewModalProps) {
   const {
@@ -67,36 +82,39 @@ function FilePreviewModal(props: FilePreviewModalProps) {
     rootTemplateId,
     custUid,
     urlParams,
+    presentation = "modal",
+    nestedPreviewMode = "stack",
+    onBack,
   } = props;
   const iframeState = useIframeStore((state) => state);
   const { userId, bbk } = iframeState;
   const [copied, setCopied] = useState(false);
-  const [fullscreen, setFullscreen] = useState(true);
+  const [fullscreen, setFullscreen] = useState(presentation === "modal");
   const [blobUrl, setBlobUrl] = useState<string | null>(null);
   const [markdownContent, setMarkdownContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [nestedPreview, setNestedPreview] =
     useState<NestedHtmlPreviewRequest | null>(null);
-  const [iframeLoadKey, setIframeLoadKey] = useState(0);
   const [dynamicRenderLoading, setDynamicRenderLoading] = useState(false);
   const [isFileGenerating, setIsFileGenerating] = useState(false);
   const pollingTimerRef = useRef<NodeJS.Timeout | null>(null);
   // 存储动态渲染的 HTML 内容（直接渲染到 div 时使用）
   const [renderedHtmlContent, setRenderedHtmlContent] = useState<string | null>(
-    null
+    null,
   );
   const [templateResult, setTemplateResult] = useState<RecordDataResponse>();
   // 客户多模板状态
   const [clawFilePlanList, setClawFilePlanList] = useState<ClawFilePlanItem[]>(
-    []
+    [],
   );
   const [activeTemplate, setActiveTemplate] = useState<ClawFilePlanItem | null>(
-    null
+    null,
   );
   const [clawPlanLoading, setClawPlanLoading] = useState(false);
   const [clawPlanFailed, setClawPlanFailed] = useState(false);
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const personEventsFlagRef = useRef<boolean>(false);
   const clawPlanInitializedRef = useRef(false);
   const cleanupCaptureClickRef = useRef<(() => void) | null>(null);
   const trackingContext = useHtmlPreviewTracking();
@@ -113,19 +131,19 @@ function FilePreviewModal(props: FilePreviewModalProps) {
   const isHtmlPreview = useMemo(
     () =>
       fileType === "previewable" && getContentType(fileName) === "text/html",
-    [fileName, fileType]
+    [fileName, fileType],
   );
   // 判断是否为动态渲染类型
   const isDynamicRender = useMemo(
     () => isDynamicRenderHtmlLink(fileUrl),
-    [fileUrl]
+    [fileUrl],
   );
   const resultId = useMemo(() => {
     return extractResultIdFromUrl(fileUrl) || "";
   }, [fileUrl]);
   const templateId = useMemo(
     () => extractTemplateIdFromUrl(fileUrl) || "",
-    [fileUrl]
+    [fileUrl],
   );
   // 计算有效的 templateId 和 resultId（当 custUid 存在时使用 activeTemplate 的值）
   // 若 clawPlanFailed 为 true（接口失败或返回空），则回退到 URL 中的 templateId/resultId
@@ -133,8 +151,8 @@ function FilePreviewModal(props: FilePreviewModalProps) {
     ? activeTemplate?.templateId
       ? String(activeTemplate.templateId)
       : clawPlanFailed
-        ? templateId
-        : ""
+      ? templateId
+      : ""
     : templateId;
   const effectiveResultId = custUid
     ? activeTemplate?.resultId ?? (clawPlanFailed ? resultId : "")
@@ -148,7 +166,7 @@ function FilePreviewModal(props: FilePreviewModalProps) {
       if (effectiveTemplateId) {
         const templateIdNum = parseInt(effectiveTemplateId, 10);
         return templateList.current.find(
-          (item) => item.templateId === templateIdNum
+          (item) => item.templateId === templateIdNum,
         );
       } else {
         return null;
@@ -157,14 +175,12 @@ function FilePreviewModal(props: FilePreviewModalProps) {
     return null;
   }, [isTemplateListLoaded, effectiveTemplateId]);
 
-
   // 获取动态渲染数据的函数（带轮询逻辑）
   // 对于静态模板（templateFlag === 'no_query'），跳过数据获取，直接渲染模板内容
   const fetchDynamicRenderData = useCallback(
     async (resultId: string, templateId: string) => {
       try {
         const templateIdNum = parseInt(templateId, 10);
-
 
         // 静态模板（templateFlag === 'no_query'）：无需调用 /api/template/result 获取数据
         // 直接渲染模板内容，模板内容加载不受数据获取逻辑阻塞
@@ -177,7 +193,6 @@ function FilePreviewModal(props: FilePreviewModalProps) {
           }
           return;
         }
-
 
         // 非静态模板：需要先获取数据再渲染
         const res = await dynamicRenderApi.getRecordData(resultId, templateId);
@@ -232,9 +247,8 @@ function FilePreviewModal(props: FilePreviewModalProps) {
       renderStaticTemplate,
       isStaticTemplate,
       isTemplateListLoaded,
-    ]
+    ],
   );
-
 
   // 当 custUid 存在时，获取客户的所有报告模板列表
   const fetchClawFilePlan = useCallback(async () => {
@@ -280,11 +294,9 @@ function FilePreviewModal(props: FilePreviewModalProps) {
     }
   }, [custUid, templateId, userId, bbk]);
 
-
   useEffect(() => {
     fetchClawFilePlan();
   }, [fetchClawFilePlan]);
-
 
   // fetch 文件数据并创建 Blob URL 或动态渲染
   useEffect(() => {
@@ -293,7 +305,6 @@ function FilePreviewModal(props: FilePreviewModalProps) {
       return;
     }
 
-
     if (open && fileType === "previewable" && fileUrl) {
       setLoading(true);
       setError(null);
@@ -301,18 +312,15 @@ function FilePreviewModal(props: FilePreviewModalProps) {
       setMarkdownContent(null);
       setIsFileGenerating(false);
 
-
       // 清理之前的轮询定时器
       if (pollingTimerRef.current) {
         clearTimeout(pollingTimerRef.current);
         pollingTimerRef.current = null;
       }
 
-
       // 动态渲染逻辑
       if (isDynamicRender) {
         setDynamicRenderLoading(true);
-
 
         if (!effectiveResultId || !effectiveTemplateId) {
           setError("缺少必要的参数");
@@ -322,22 +330,18 @@ function FilePreviewModal(props: FilePreviewModalProps) {
         }
         fetchDynamicRenderData(effectiveResultId, effectiveTemplateId);
 
-
         return;
       }
-
 
       // 原有逻辑：直接加载文件
       fetch(fileUrl)
         .then(async (res) => {
           if (!res.ok) throw new Error("加载失败");
 
-
           if (isMarkdownFile) {
             setMarkdownContent(await res.text());
             return;
           }
-
 
           const blob = await res.blob();
           const contentType = getContentType(fileName);
@@ -364,7 +368,6 @@ function FilePreviewModal(props: FilePreviewModalProps) {
     effectiveTemplateId,
   ]);
 
-
   // 清理 Blob URL
   useEffect(() => {
     return () => {
@@ -374,14 +377,12 @@ function FilePreviewModal(props: FilePreviewModalProps) {
     };
   }, [blobUrl]);
 
-
   // 清理动态渲染的 HTML 内容
   useEffect(() => {
     return () => {
       setRenderedHtmlContent(null);
     };
   }, []);
-
 
   useEffect(() => {
     if (!open) {
@@ -404,7 +405,6 @@ function FilePreviewModal(props: FilePreviewModalProps) {
     }
   }, [open]);
 
-
   useEffect(() => {
     return () => {
       cleanupTrackers();
@@ -419,14 +419,15 @@ function FilePreviewModal(props: FilePreviewModalProps) {
     };
   }, []);
 
-
   useEffect(() => {
     // 记录满足该条件的模板加载时间，使用click的接口
     if (
       templateInfo?.templateFlag === "person-event" &&
       templateResult?.custUid &&
-      templateResult?.custName
+      templateResult?.custName &&
+      !personEventsFlagRef.current
     ) {
+      personEventsFlagRef.current = true;
       const payload = {
         file_url: fileUrl,
         file_name: fileName,
@@ -450,7 +451,6 @@ function FilePreviewModal(props: FilePreviewModalProps) {
     }
   }, [templateResult, templateInfo, htmlPreviewEventsApi, effectiveResultId]);
 
-
   const handleCopy = useCallback(async () => {
     try {
       await navigator.clipboard.writeText(fileUrl);
@@ -462,14 +462,12 @@ function FilePreviewModal(props: FilePreviewModalProps) {
     }
   }, [fileUrl]);
 
-
   const handleDownload = useCallback(async () => {
     // 动态渲染类型的特殊下载逻辑
     if (isDynamicRender) {
       const downloadFunc = (htmlContent: string) => {
         const blob = new Blob([htmlContent], { type: "text/html" });
         const blobUrl = URL.createObjectURL(blob);
-
 
         const link = document.createElement("a");
         link.href = blobUrl;
@@ -481,7 +479,6 @@ function FilePreviewModal(props: FilePreviewModalProps) {
         link.click();
         document.body.removeChild(link);
 
-
         // 清理Blob URL
         setTimeout(() => URL.revokeObjectURL(blobUrl), 100);
       };
@@ -491,15 +488,12 @@ function FilePreviewModal(props: FilePreviewModalProps) {
           return;
         }
 
-
         if (!effectiveTemplateId) {
           console.error("动态渲染链接缺少必要的参数: templateId");
           return;
         }
 
-
         const templateIdNum = parseInt(effectiveTemplateId, 10);
-
 
         // 静态模板：直接渲染模板内容，无需获取数据
         if (isStaticTemplate(templateIdNum)) {
@@ -519,7 +513,7 @@ function FilePreviewModal(props: FilePreviewModalProps) {
         const renderData = (
           await dynamicRenderApi.getRecordData(
             effectiveResultId,
-            effectiveTemplateId
+            effectiveTemplateId,
           )
         ).data;
         const { TRACE_ID, CRON_JOB_ID, custUid, custName, ...data } =
@@ -532,7 +526,6 @@ function FilePreviewModal(props: FilePreviewModalProps) {
           ...data,
         });
         const renderedHtml = await renderTemplate(templateIdNum, renderData);
-
 
         if (renderedHtml) {
           // 将HTML内容转换为Blob进行下载
@@ -565,20 +558,15 @@ function FilePreviewModal(props: FilePreviewModalProps) {
     effectiveTemplateId,
   ]);
 
-
   const handleFullscreen = useCallback(() => {
     setFullscreen((prev) => !prev);
   }, []);
 
-
   const handleIframeLoad = useCallback(() => {
-    setIframeLoadKey((k) => k + 1);
     reattachTrackersRef.current?.();
   }, []);
 
-
   const shouldRecordEvents = !trackingContext.disableEventRecording;
-
 
   const metaData = useMemo(
     () => ({
@@ -608,51 +596,55 @@ function FilePreviewModal(props: FilePreviewModalProps) {
       templateResult,
       effectiveResultId,
       effectiveTemplateId,
-    ]
+    ],
   );
 
-
-  const { cleanup: cleanupTrackers, reattach: reattachTrackers } = useIframeHtmlPreviewTracking(
-    iframeRef,
-    {
-      metaData,
-      load: htmlPreviewEventsApi.recordClick,
-      click:
-        isHtmlPreview && enableClickTracking
-          ? {
-            reporter: shouldRecordEvents
-              ? htmlPreviewEventsApi.recordClick
-              : () => undefined,
-            listSnapshotReporter:
-              shouldRecordEvents && enableListSnapshotTracking
-                ? htmlPreviewEventsApi.recordListSnapshot
-                : undefined,
-            onOpenNestedPreview: setNestedPreview,
-            getTemplateName: (templateId: number) => {
-              return templateList.current.find(
-                (t) => t.templateId === templateId
-              )?.templateName;
-            },
-          }
-          : null,
-      exposure: isHtmlPreview
-        ? {
-          reporter: htmlPreviewEventsApi.recordClick,
-        }
-        : null,
-    },
-    [
-      isHtmlPreview,
-      enableClickTracking,
-      enableListSnapshotTracking,
-    ]
-  );
+  const { cleanup: cleanupTrackers, reattach: reattachTrackers } =
+    useIframeHtmlPreviewTracking(
+      iframeRef,
+      {
+        metaData,
+        load: htmlPreviewEventsApi.recordClick,
+        click:
+          isHtmlPreview && enableClickTracking
+            ? {
+              reporter: shouldRecordEvents
+                ? htmlPreviewEventsApi.recordClick
+                : () => undefined,
+              listSnapshotReporter:
+                shouldRecordEvents && enableListSnapshotTracking
+                  ? htmlPreviewEventsApi.recordListSnapshot
+                  : undefined,
+              onOpenNestedPreview: setNestedPreview,
+              getTemplateName: (templateId: number) => {
+                return templateList.current.find(
+                  (t) => t.templateId === templateId
+                )?.templateName;
+              },
+            }
+            : null,
+        exposure: isHtmlPreview
+            ? {
+                reporter: htmlPreviewEventsApi.recordClick,
+            }
+            : null,
+      },
+      [isHtmlPreview, enableClickTracking, enableListSnapshotTracking],
+    );
   const reattachTrackersRef = useRef(reattachTrackers);
   reattachTrackersRef.current = reattachTrackers;
 
+  useEffect(() => {
+    if (presentation !== "drawer" || !open || fullscreen) return;
+    return acquireSplitPreviewLayout();
+  }, [fullscreen, open, presentation]);
 
-  const previewHeight = fullscreen ? "90vh" : "500px";
-
+  const previewHeight =
+    presentation === "drawer" || presentation === "workspace"
+      ? "100%"
+      : fullscreen
+      ? "90vh"
+      : "500px";
 
   const renderPreviewContent = useMemo(() => {
     if (fileType === "previewable") {
@@ -660,8 +652,8 @@ function FilePreviewModal(props: FilePreviewModalProps) {
         const tip = isFileGenerating
           ? "文件正在生成中，内容准备完成后，页面会自动展示最新预览"
           : dynamicRenderLoading
-            ? "正在渲染报告..."
-            : "加载中...";
+          ? "正在渲染报告..."
+          : "加载中...";
         return <Spin tip={tip} />;
       }
       if (error) {
@@ -734,7 +726,6 @@ function FilePreviewModal(props: FilePreviewModalProps) {
       return null;
     }
 
-
     return (
       <div
         style={{
@@ -786,7 +777,6 @@ function FilePreviewModal(props: FilePreviewModalProps) {
     handleIframeLoad,
   ]);
 
-
   const headerActions = useMemo(() => {
     const actions = [
       <Tooltip key="download" title="下载文件">
@@ -795,10 +785,10 @@ function FilePreviewModal(props: FilePreviewModalProps) {
           icon={<SparkDownloadLine />}
           onClick={handleDownload}
           bordered={false}
+          aria-label="下载文件"
         />
       </Tooltip>,
     ];
-
 
     if (fileType === "previewable") {
       actions.unshift(
@@ -808,11 +798,11 @@ function FilePreviewModal(props: FilePreviewModalProps) {
             icon={<FullscreenOutlined />}
             onClick={handleFullscreen}
             bordered={false}
+            aria-label={fullscreen ? "退出全屏" : "全屏预览"}
           />
-        </Tooltip>
+        </Tooltip>,
       );
     }
-
 
     return actions;
   }, [
@@ -824,123 +814,209 @@ function FilePreviewModal(props: FilePreviewModalProps) {
     fullscreen,
   ]);
 
+  const previewBody = (
+    <>
+      {custUid && clawPlanLoading && (
+        <div className={styles.tabsLoadingWrapper}>
+          <Spin size="small" />
+        </div>
+      )}
+      {showClawPlanEmpty ? (
+        <div className={styles.emptyWrapper}>
+          <div className={styles.emptyIcon}>
+            <svg
+              className={styles.emptyIconSvg}
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="12" y1="15" x2="12" y2="3" />
+            </svg>
+          </div>
+          <div className={styles.emptyTitle}>未查询到个人报告数据</div>
+          <div className={styles.emptyDesc}>
+            当前暂无可用报告模板，请确认信息后重试
+          </div>
+        </div>
+      ) : (
+        renderPreviewContent
+      )}
+    </>
+  );
+
+  const templateTabs =
+    custUid && !clawPlanLoading && clawFilePlanList.length > 0 ? (
+      <div className={styles.tabsWrapper}>
+        <Tabs
+          activeKey={activeTemplate?.key}
+          onChange={(key) => {
+            const next = clawFilePlanList.find((item) => item.key === key);
+            if (next) setActiveTemplate(next);
+          }}
+          items={clawFilePlanList.map((item) => ({
+            key: item.key,
+            label: item.skillName,
+          }))}
+          size="small"
+        />
+      </div>
+    ) : null;
+
+  const replaceWithNestedPreview =
+    nestedPreviewMode === "replace" && nestedPreview !== null;
+
+  const nestedPreviewContent = nestedPreview ? (
+    <FilePreviewModal
+      open
+      onClose={() => setNestedPreview(null)}
+      fileUrl={nestedPreview.fileUrl}
+      fileName={nestedPreview.fileName}
+      enableClickTracking
+      enableListSnapshotTracking={false}
+      trackingListKey={nestedPreview.listKey}
+      trackingListName={nestedPreview.listName}
+      defaultCustomerInfo={nestedPreview.customerInfo}
+      custUid={nestedPreview.custUid}
+      rootTemplateId={
+        templateInfo?.templateId ? String(templateInfo.templateId) : undefined
+      }
+      rootResultId={effectiveResultId}
+      presentation={presentation}
+      nestedPreviewMode={nestedPreviewMode}
+      onBack={
+        nestedPreviewMode === "replace"
+          ? () => setNestedPreview(null)
+          : undefined
+      }
+    />
+  ) : null;
+
+  if (replaceWithNestedPreview) return nestedPreviewContent;
 
   return (
     <>
-      <Modal
-        open={open}
-        onCancel={onClose}
-        footer={null}
-        width={fullscreen ? 1368 : 800}
-        className={styles.previewModalWrapper}
-        centered
-        closeIcon={
-          <IconButton size="small" icon={<SparkFalseLine />} bordered={false} />
-        }
-        title={
+      {presentation === "workspace" ? (
+        <div className={styles.workspacePreview}>
+          <header className={styles.workspacePreviewHeader}>
+            {onBack && (
+              <Button
+                type="text"
+                size="small"
+                icon={<ArrowLeftOutlined />}
+                onClick={onBack}
+                aria-label="返回上一级预览"
+              >
+                返回
+              </Button>
+            )}
+            <div className={styles.previewTitle} title={fileName}>
+              {fileName}
+            </div>
+            <div className={styles.headerActions}>
+              {headerActions[headerActions.length - 1]}
+            </div>
+          </header>
+          {templateTabs}
+          <div className={styles.previewContent}>{previewBody}</div>
+        </div>
+      ) : presentation === "drawer" ? (
+        <Drawer
+          open={open}
+          onClose={onClose}
+          width={
+            fullscreen
+              ? "100vw"
+              : "var(--copaw-file-preview-drawer-width, 42vw)"
+          }
+          rootClassName={styles.previewDrawerRoot}
+          placement="right"
+          mask={false}
+          push={false}
+          closable={false}
+          title={
+            <div className={styles.previewTitle} title={fileName}>
+              {fileName}
+            </div>
+          }
+          extra={
+            <div className={styles.headerActions}>
+              {headerActions}
+              <Tooltip title="关闭预览">
+                <IconButton
+                  size="small"
+                  icon={<SparkFalseLine />}
+                  bordered={false}
+                  onClick={onClose}
+                  aria-label="关闭预览"
+                />
+              </Tooltip>
+            </div>
+          }
+          styles={{
+            body: {
+              display: "flex",
+              flexDirection: "column",
+              minHeight: 0,
+              padding: 0,
+              overflow: "hidden",
+            },
+          }}
+        >
+          {templateTabs}
+          <div className={styles.previewContent}>{previewBody}</div>
+        </Drawer>
+      ) : (
+        <Modal
+          open={open}
+          onCancel={onClose}
+          footer={null}
+          width={fullscreen ? 1368 : 800}
+          className={styles.previewModalWrapper}
+          centered
+          closeIcon={
+            <IconButton
+              size="small"
+              icon={<SparkFalseLine />}
+              bordered={false}
+            />
+          }
+          title={
+            <div style={{ display: "flex", width: "100%", marginTop: "-6px" }}>
+              {templateTabs}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "12px",
+                  marginRight: "32px",
+                  marginLeft: "auto",
+                }}
+              >
+                {headerActions}
+              </div>
+            </div>
+          }
+          styles={{ content: { padding: "16px 24px" } }}
+        >
           <div
             style={{
               display: "flex",
-              width: "100%",
-              marginTop: "-6px",
+              alignItems: "center",
+              justifyContent: "center",
+              minHeight: fullscreen ? "90vh" : "200px",
+              flexDirection: "column",
             }}
           >
-            {custUid && !clawPlanLoading && clawFilePlanList.length > 0 && (
-              <div className={styles.tabsWrapper}>
-                <Tabs
-                  activeKey={activeTemplate?.key}
-                  onChange={(key) => {
-                    const next = clawFilePlanList.find(
-                      (item) => item.key === key
-                    );
-                    if (next) setActiveTemplate(next);
-                  }}
-                  items={clawFilePlanList.map((item) => ({
-                    key: item.key,
-                    label: item.skillName,
-                  }))}
-                  size="small"
-                />
-              </div>
-            )}
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "12px",
-                marginRight: "32px",
-                marginLeft: "auto",
-              }}
-            >
-              {headerActions}
-            </div>
+            {previewBody}
           </div>
-        }
-        styles={{
-          content: { padding: "16px 24px" },
-        }}
-      >
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            minHeight: fullscreen ? "90vh" : "200px",
-            flexDirection: "column",
-          }}
-        >
-          {custUid && clawPlanLoading && (
-            <div className={styles.tabsLoadingWrapper}>
-              <Spin size="small" />
-            </div>
-          )}
-          {showClawPlanEmpty ? (
-            <div className={styles.emptyWrapper}>
-              <div className={styles.emptyIcon}>
-                <svg
-                  className={styles.emptyIconSvg}
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.5"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                  <polyline points="7 10 12 15 17 10" />
-                  <line x1="12" y1="15" x2="12" y2="3" />
-                </svg>
-              </div>
-              <div className={styles.emptyTitle}>未查询到个人报告数据</div>
-              <div className={styles.emptyDesc}>
-                当前暂无可用报告模板，请确认信息后重试
-              </div>
-            </div>
-          ) : (
-            renderPreviewContent
-          )}
-        </div>
-      </Modal>
-      {nestedPreview && (
-        <FilePreviewModal
-          open
-          onClose={() => setNestedPreview(null)}
-          fileUrl={nestedPreview.fileUrl}
-          fileName={nestedPreview.fileName}
-          enableClickTracking
-          enableListSnapshotTracking={false}
-          trackingListKey={nestedPreview.listKey}
-          trackingListName={nestedPreview.listName}
-          defaultCustomerInfo={nestedPreview.customerInfo}
-          custUid={nestedPreview.custUid}
-          rootTemplateId={
-            templateInfo?.templateId
-              ? String(templateInfo.templateId)
-              : undefined
-          }
-          rootResultId={effectiveResultId}
-        />
+        </Modal>
       )}
+      {nestedPreviewContent}
     </>
   );
 }

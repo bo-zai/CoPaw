@@ -14,7 +14,13 @@ from swe.app.approvals.external import (
     submit_external_approval_decision,
 )
 from swe.app.approvals.service import ApprovalService
+from swe.app.answer_turn.models import TurnIdentity, TurnLease
 from swe.app.approvals.store import ApprovalAuditStore
+from swe.app.source_system_config.models import (
+    EffectiveSourceSystemConfig,
+    SourceSystemConfig,
+)
+from swe.app.source_system_config.runtime import bind_source_system_config
 from swe.config.context import tenant_context
 from swe.security.tool_guard.approval import ApprovalDecision
 
@@ -108,19 +114,65 @@ class _ChatManager:
 
 
 class _TaskTracker:
-    async def get_status(self, _run_key: str) -> str:
+    async def status(self, _run_key: str) -> str:
         return "idle"
 
-    async def attach_or_start(self, _run_key, _payload, _stream_fn):
+    async def attach_or_start(
+        self,
+        _identity,
+        _payload,
+        _stream_fn,
+        **_kwargs,
+    ):
         return object(), True
+
+    async def attach(self, _identity):
+        return None
+
+
+class _Coordinator:
+    def __init__(self, tracker: _TaskTracker) -> None:
+        self.tracker = tracker
+
+    async def start_or_attach(self, chat_id, payload, producer, **kwargs):
+        identity = TurnIdentity(
+            chat_id=chat_id,
+            msgid=kwargs.get("msgid") or "msg-1",
+            turn_id="turn-1",
+        )
+        queue, is_new = await self.tracker.attach_or_start(
+            identity,
+            payload,
+            producer,
+        )
+        return TurnLease(identity, queue, is_new)
 
 
 def _workspace() -> SimpleNamespace:
-    return SimpleNamespace(
+    tracker = _TaskTracker()
+    workspace = SimpleNamespace(
         agent_id="agent-a",
         channel_manager=_ChannelManager(),
         chat_manager=_ChatManager(),
-        task_tracker=_TaskTracker(),
+        task_tracker=tracker,
+    )
+    workspace.answer_turn_coordinator = _Coordinator(tracker)
+    return workspace
+
+
+def _source_config_with_zhaohu_notifications() -> EffectiveSourceSystemConfig:
+    raw_config = SourceSystemConfig.model_validate(
+        {
+            "approval_notifications": {
+                "zhaohu_tool_guard_enabled": True,
+            },
+        },
+    )
+    return EffectiveSourceSystemConfig(
+        source_id="source-a",
+        config=raw_config.merged_with_defaults(),
+        raw_config=raw_config,
+        version=1,
     )
 
 
@@ -201,19 +253,23 @@ async def test_external_submission_and_notifications_write_audit_events(
     pending = await _pending(service)
     workspace = _workspace()
 
-    await notify_cron_approval_pending(
-        pending,
-        channel_manager=workspace.channel_manager,
-    )
-    await submit_external_approval_decision(
-        workspace=workspace,
-        pending=pending,
-        decision=ExternalApprovalDecision.APPROVE,
-        source_channel="zhaohu",
-        source_user_id="approver-1",
-        source_message_id="message-1",
-        source_id="source-a",
-    )
+    with tenant_context(tenant_id="tenant-a", source_id="source-a"):
+        with bind_source_system_config(
+            _source_config_with_zhaohu_notifications(),
+        ):
+            await notify_cron_approval_pending(
+                pending,
+                channel_manager=workspace.channel_manager,
+            )
+            await submit_external_approval_decision(
+                workspace=workspace,
+                pending=pending,
+                decision=ExternalApprovalDecision.APPROVE,
+                source_channel="zhaohu",
+                source_user_id="approver-1",
+                source_message_id="message-1",
+                source_id="source-a",
+            )
     event_types = [event["event_type"] for event in audit_store.events]
     assert event_types == [
         "created",

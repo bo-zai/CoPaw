@@ -1,4 +1,7 @@
-import { sleep } from "@/components/agentscope-chat";
+import {
+  sleep,
+  type IAgentScopeRuntimeWebUIMessage,
+} from "@/components/agentscope-chat";
 import { useCallback, useEffect, useRef } from "react";
 import { useContextSelector } from "use-context-selector";
 import { ChatAnywhereInputContext } from "../../Context/ChatAnywhereInputContext";
@@ -13,6 +16,7 @@ import useChatRequest from "./useChatRequest";
 import useChatSessionHandler from "./useChatSessionHandler";
 import useSuggestionsPolling from "./useSuggestionsPolling";
 import { useChatAnywhereOptions } from "../../Context/ChatAnywhereOptionsContext";
+import { ChatAnywhereMessagesContext } from "../../Context/ChatAnywhereMessagesContext";
 import ReactDOM from "react-dom";
 import {
   FollowUpSubmitCoordinator,
@@ -38,6 +42,11 @@ export default function useChatController() {
     ChatAnywhereInputContext,
     (v) => v.setLoading,
   );
+  const setStopping = useContextSelector(
+    ChatAnywhereInputContext,
+    (v) => v.setStopping,
+  );
+  const markStopping = setStopping ?? (() => {});
   const getLoading = useContextSelector(
     ChatAnywhereInputContext,
     (v) => v.getLoading,
@@ -46,7 +55,15 @@ export default function useChatController() {
     ChatAnywhereSessionsContext,
     (v) => v.currentSessionId,
   );
+  const setSessionNotFound = useContextSelector(
+    ChatAnywhereSessionsContext,
+    (v) => v.setSessionNotFound,
+  );
   const sessionApi = useChatAnywhereOptions((v) => v.session.api);
+  const setMessages = useContextSelector(
+    ChatAnywhereMessagesContext,
+    (v) => v.setMessages,
+  );
 
   const currentQARef = useRef<CurrentQARef["current"]>({});
   const followUpCoordinatorRef = useRef<FollowUpSubmitCoordinator | null>(null);
@@ -58,6 +75,76 @@ export default function useChatController() {
 
   // 会话处理
   const sessionHandler = useChatSessionHandler();
+
+  const applyRecoverySnapshot = useCallback(
+    async (history: unknown, owner: ChatRequestOwner) => {
+      const runtimeSessionApi = sessionApi as
+        | {
+            applyChatSnapshot?: (
+              sessionId: string,
+              history: unknown,
+            ) => IAgentScopeRuntimeWebUIMessage[] | undefined;
+          }
+        | undefined;
+      const messages = runtimeSessionApi?.applyChatSnapshot?.(
+        owner.sessionId,
+        history,
+      );
+      const ownerIsActive = isActiveChatRequestOwner(
+        currentQARef.current.activeRequestOwner,
+        owner,
+      );
+      if (!ownerIsActive) {
+        return;
+      }
+      if (messages) {
+        setMessages(messages);
+      } else {
+        await sessionHandler.refreshSession(owner.sessionId, false);
+      }
+      if (
+        !isActiveChatRequestOwner(
+          currentQARef.current.activeRequestOwner,
+          owner,
+        )
+      ) {
+        return;
+      }
+      setSessionNotFound?.(false);
+      currentQARef.current.activeRequestOwner = undefined;
+      currentQARef.current.abortController = undefined;
+      currentQARef.current.response = undefined;
+      setLoading(false);
+    },
+    [sessionApi, sessionHandler, setLoading, setMessages, setSessionNotFound],
+  );
+
+  const recoverAfterNotFound = useCallback(
+    async (owner: ChatRequestOwner) => {
+      const refreshed = await sessionHandler.refreshSession(
+        owner.sessionId,
+        false,
+      );
+      const ownerIsActive = isActiveChatRequestOwner(
+        currentQARef.current.activeRequestOwner,
+        owner,
+      );
+      if (
+        !refreshed &&
+        ownerIsActive &&
+        sessionHandler.getCurrentSessionId() === owner.sessionId
+      ) {
+        setSessionNotFound?.(true);
+      }
+      if (ownerIsActive) {
+        currentQARef.current.activeRequestOwner = undefined;
+        currentQARef.current.abortController = undefined;
+        currentQARef.current.response = undefined;
+        setLoading(false);
+      }
+    },
+    [sessionHandler, setLoading, setSessionNotFound],
+  );
 
   // 建议轮询
   const { pollSuggestions } = useSuggestionsPolling({
@@ -73,10 +160,24 @@ export default function useChatController() {
       status: "finished" | "interrupted" = "finished",
       owner?: ChatRequestOwner,
     ) => {
-      if (!currentQARef.current.response) return;
+      const ownerIsActive =
+        !owner ||
+        isActiveChatRequestOwner(currentQARef.current.activeRequestOwner, owner);
+      if (!currentQARef.current.response) {
+        if (ownerIsActive && !currentQARef.current.stopPending) {
+          setLoading(false);
+        }
+        if (ownerIsActive) {
+          currentQARef.current.activeRequestOwner = undefined;
+          currentQARef.current.abortController = undefined;
+        }
+        return;
+      }
 
       currentQARef.current.response.msgStatus = status;
-      setLoading(false);
+      if (!currentQARef.current.stopPending) {
+        setLoading(false);
+      }
       ReactDOM.flushSync(() => {
         messageHandler.updateMessage(currentQARef.current.response);
       });
@@ -110,6 +211,8 @@ export default function useChatController() {
     hasMessage: messageHandler.hasMessage,
     getCurrentSessionId: sessionHandler.getCurrentSessionId,
     onFinish: (owner) => finishResponse("finished", owner),
+    applyRecoverySnapshot,
+    recoverAfterNotFound,
   });
 
   const createRequestOwner = useCallback(
@@ -208,20 +311,40 @@ export default function useChatController() {
 
   const stopActiveRunInBackground = useCallback(async () => {
     const owner = currentQARef.current.activeRequestOwner;
-    await cancelActiveRequest();
+    currentQARef.current.stopPending = true;
+    markStopping(true, owner?.sessionId);
+    setLoading(true);
+    try {
+      await cancelActiveRequest();
 
-    if (currentQARef.current.response) {
-      currentQARef.current.response.msgStatus = "finished";
-      ReactDOM.flushSync(() => {
-        messageHandler.updateMessage(currentQARef.current.response!);
-      });
+      if (currentQARef.current.response) {
+        currentQARef.current.response.msgStatus = "finished";
+        ReactDOM.flushSync(() => {
+          messageHandler.updateMessage(currentQARef.current.response!);
+        });
+      }
+
+      await sessionHandler.syncSessionMessagesForSession(
+        owner?.sessionId,
+        messageHandler.getMessages(),
+      );
+    } finally {
+      currentQARef.current.stopPending = false;
+      markStopping(false, owner?.sessionId);
+      if (
+        !owner?.sessionId ||
+        owner.sessionId === sessionHandler.getCurrentSessionId()
+      ) {
+        setLoading(false);
+      }
     }
-
-    await sessionHandler.syncSessionMessagesForSession(
-      owner?.sessionId,
-      messageHandler.getMessages(),
-    );
-  }, [cancelActiveRequest, messageHandler, sessionHandler]);
+  }, [
+    cancelActiveRequest,
+    markStopping,
+    messageHandler,
+    sessionHandler,
+    setLoading,
+  ]);
 
   if (!followUpCoordinatorRef.current) {
     followUpCoordinatorRef.current = new FollowUpSubmitCoordinator({
@@ -331,9 +454,28 @@ export default function useChatController() {
    */
   const handleCancel = useCallback(async () => {
     const owner = currentQARef.current.activeRequestOwner;
-    await cancelActiveRequest();
-    finishResponse("interrupted", owner);
-  }, [cancelActiveRequest, finishResponse]);
+    currentQARef.current.stopPending = true;
+    markStopping(true, owner?.sessionId);
+    setLoading(true);
+    try {
+      await cancelActiveRequest();
+    } finally {
+      currentQARef.current.stopPending = false;
+      markStopping(false, owner?.sessionId);
+      if (
+        !owner?.sessionId ||
+        owner.sessionId === sessionHandler.getCurrentSessionId()
+      ) {
+        finishResponse("interrupted", owner);
+      }
+    }
+  }, [
+    cancelActiveRequest,
+    finishResponse,
+    markStopping,
+    sessionHandler,
+    setLoading,
+  ]);
 
   const handleSuggestionSubmit = useCallback(
     async (data: FollowUpSubmitData) => {

@@ -55,6 +55,7 @@ export interface BlockedSkillFinding {
   file_path: string;
   line_number: number | null;
   rule_id: string;
+  analyzer?: string;
 }
 
 export interface BlockedSkillRecord {
@@ -65,6 +66,9 @@ export interface BlockedSkillRecord {
   findings: BlockedSkillFinding[];
   content_hash: string;
   action: "blocked" | "warned";
+  source_id?: string;
+  user_id?: string;
+  bbk_id?: string;
 }
 
 export interface BlockedSkillHistoryPage {

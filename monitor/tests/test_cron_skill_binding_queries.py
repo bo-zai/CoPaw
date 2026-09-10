@@ -20,7 +20,7 @@ class FakeDb:
 
     async def fetch_one(self, sql, params=()):
         self.calls.append(("fetch_one", sql, params))
-        return {"count": 0, "skill_count": 0}
+        return {"count": 0, "skill_count": 0, "user_name": "manager-1"}
 
     @property
     def last_sql(self):
@@ -109,6 +109,7 @@ async def test_branch_skill_manager_query_filters_by_bound_skill_id():
     assert "JOIN swe_tracing_traces" not in sql
     assert "JSON_CONTAINS(t.skills_used" not in sql
     assert "FIND_IN_SET(s.skill_id, j.skill_ids)" in sql
+    assert "c.event_type = 'button_click'" in sql
     assert "swe_marketplace_skills" in sql
     assert "include_in_statistics = 1" in sql
     assert "GROUP BY source_id, skill_id" in sql
@@ -117,6 +118,70 @@ async def test_branch_skill_manager_query_filters_by_bound_skill_id():
         "COALESCE(NULLIF(s.cn_name, ''), NULLIF(s.skill_name, ''), s.skill_id)"
         in sql
     )
+
+
+@pytest.mark.asyncio
+async def test_manager_customer_detail_filters_button_click_events():
+    """客户经理客户明细应只统计按钮点击事件。"""
+    db = FakeDb()
+    service = QueryService()
+    import monitor.app.services.cron.query_service as query_service_module
+
+    query_service_module.get_db_connection = lambda: db
+
+    await service.get_manager_customers(
+        bbk_id="100",
+        user_id="manager-1",
+        skill_name="保险营销客户分析技能",
+        start_date="2026-07-01",
+        end_date="2026-07-02",
+        source_id="default",
+    )
+
+    sql = db.last_sql
+    assert "c.event_type = 'button_click'" in sql
+    assert "FIND_IN_SET(s.skill_id, j.skill_ids)" in sql
+
+
+@pytest.mark.asyncio
+async def test_branch_skill_manager_customer_detail_filters_button_click_events():
+    """分行技能客户明细应只统计按钮点击事件。"""
+    db = FakeDb()
+    service = QueryService()
+    import monitor.app.services.cron.query_service as query_service_module
+
+    query_service_module.get_db_connection = lambda: db
+
+    await service.get_branch_skill_manager_customers(
+        bbk_id="100",
+        skill_name="保险营销客户分析技能",
+        user_id="manager-1",
+        start_date="2026-07-01",
+        end_date="2026-07-02",
+        source_id="default",
+    )
+
+    sql = db.last_sql
+    assert "c.event_type = 'button_click'" in sql
+    assert "FIND_IN_SET(s.skill_id, j.skill_ids)" in sql
+
+
+@pytest.mark.asyncio
+async def test_manager_contact_stats_filters_button_click_events():
+    """客户经理接触统计应只统计按钮点击事件。"""
+    db = FakeDb()
+    service = QueryService()
+
+    await service._fetch_manager_contact_stats(
+        db,
+        "100",
+        datetime(2026, 7, 1),
+        datetime(2026, 7, 2),
+        "default",
+    )
+
+    sql = db.last_sql
+    assert "a.event_type = 'button_click'" in sql
 
 
 @pytest.mark.asyncio
@@ -306,3 +371,5 @@ async def test_cron_detail_skill_view_queries_do_not_depend_on_tracing_skills_us
     assert "skills_used" not in sql_text
     assert "swe_marketplace_skills" in sql_text
     assert "FIND_IN_SET" in sql_text
+    assert "event_type = 'button_click'" in sql_text
+    assert "a.event_type = 'button_click'" in sql_text

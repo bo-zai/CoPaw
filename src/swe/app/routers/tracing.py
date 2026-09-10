@@ -147,7 +147,11 @@ async def get_user_chat(
         chat_spec.session_id,
         chat_spec.user_id,
     )
-    status = await workspace.task_tracker.get_status(chat_id)
+    coordinator = getattr(workspace, "answer_turn_coordinator", None)
+    turn_status = (
+        await coordinator.status(chat_id) if coordinator is not None else None
+    )
+    status = turn_status.value if turn_status is not None else "idle"
     task_messages = _task_session_messages_from_state(state)
     if not state:
         return ChatHistory(messages=task_messages, status=status)

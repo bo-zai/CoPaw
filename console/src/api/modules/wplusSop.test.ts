@@ -94,11 +94,104 @@ describe("wplusSopApi", () => {
       wplusSopApi.downloadArtifact("sop/1", "render/md"),
     ).resolves.toBe(blob);
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/wplus-sop/sessions/sop%2F1/artifacts/render%2Fmd",
+      "/api/wplus-sop/sessions/sop%2F1/artifacts/render%2Fmd?download=true",
       expect.objectContaining({
         method: "GET",
         headers: { Authorization: "Bearer test" },
       }),
+    );
+  });
+
+  it("reads final, stage report, and cumulative artifacts with full identity", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      text: vi.fn().mockResolvedValue("artifact body"),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      wplusSopApi.readArtifact("sop/1", "render/html"),
+    ).resolves.toBe("artifact body");
+    await expect(
+      wplusSopApi.readStageReportArtifact("sop/1", {
+        stageId: "stage/一",
+        revision: 3,
+        reportNo: 2,
+        artifactId: "stage/html",
+      }),
+    ).resolves.toBe("artifact body");
+    await expect(
+      wplusSopApi.readCumulativeArtifact("sop/1", {
+        previewVersion: 4,
+        artifactId: "cumulative/html",
+      }),
+    ).resolves.toBe("artifact body");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/wplus-sop/sessions/sop%2F1/artifacts/render%2Fhtml",
+      expect.objectContaining({
+        method: "GET",
+        headers: { Authorization: "Bearer test" },
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/wplus-sop/sessions/sop%2F1/stage-report-artifacts/stage%2Fhtml?stage_id=stage%2F%E4%B8%80&revision=3&report_no=2",
+      expect.objectContaining({
+        method: "GET",
+        headers: { Authorization: "Bearer test" },
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      "/api/wplus-sop/sessions/sop%2F1/cumulative-artifacts/cumulative%2Fhtml?preview_version=4",
+      expect.objectContaining({
+        method: "GET",
+        headers: { Authorization: "Bearer test" },
+      }),
+    );
+  });
+
+  it("downloads stage and cumulative artifacts with their version identity", async () => {
+    const stageBlob = new Blob(["stage"], { type: "text/html" });
+    const cumulativeBlob = new Blob(["cumulative"], { type: "text/html" });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        blob: vi.fn().mockResolvedValue(stageBlob),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        blob: vi.fn().mockResolvedValue(cumulativeBlob),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      wplusSopApi.downloadStageReportArtifact("sop-1", {
+        stageId: "stage-1",
+        revision: 2,
+        reportNo: 7,
+        artifactId: "stage_sop_html",
+      }),
+    ).resolves.toBe(stageBlob);
+    await expect(
+      wplusSopApi.downloadCumulativeArtifact("sop-1", {
+        previewVersion: 5,
+        artifactId: "cumulative_html",
+      }),
+    ).resolves.toBe(cumulativeBlob);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/wplus-sop/sessions/sop-1/stage-report-artifacts/stage_sop_html?stage_id=stage-1&revision=2&report_no=7&download=true",
+      expect.any(Object),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/wplus-sop/sessions/sop-1/cumulative-artifacts/cumulative_html?preview_version=5&download=true",
+      expect.any(Object),
     );
   });
 

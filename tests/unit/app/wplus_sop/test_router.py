@@ -3,8 +3,9 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,10 +16,15 @@ from swe.app.wplus_sop import router as wplus_router
 from swe.app.wplus_sop import service as service_module
 from swe.app.wplus_sop.models import (
     CommandReceipt,
+    ConfirmedStageSnapshot,
+    CumulativePreview,
     FinalSopResult,
     OwnershipTuple,
     SessionProjection,
     SessionState,
+    Stage,
+    StageReport,
+    StageStatus,
 )
 from swe.app.wplus_sop.runtime import get_wplus_safe_stream_trace_registry
 from swe.app.wplus_sop.service import (
@@ -32,6 +38,7 @@ from swe.app.wplus_sop.store import WPlusSopStore
 def _build_client(tmp_path, monkeypatch) -> TestClient:
     app = FastAPI()
     app.include_router(wplus_router.router)
+    app.include_router(wplus_router.router, prefix="/api")
 
     @app.middleware("http")
     async def add_identity(request: Request, call_next):
@@ -85,6 +92,77 @@ def _build_client(tmp_path, monkeypatch) -> TestClient:
                 "copied_by": "copy_file_to_static",
             },
         )
+    stage_artifacts = []
+    stage_contents = {
+        "stage-1-r1-v1.json": '{"stage":"客户识别"}',
+        "stage-1-r1-v1.md": "# 客户识别",
+        "stage-1-r1-v1.html": "<h1>客户识别</h1>",
+    }
+    stage_artifact_ids = {
+        "stage-1-r1-v1.json": ("stage_sop_json", "stage_sop.json"),
+        "stage-1-r1-v1.md": ("stage_sop_md", "stage_sop.md"),
+        "stage-1-r1-v1.html": ("stage_sop_html", "stage_sop.html"),
+    }
+    for name, content in stage_contents.items():
+        raw = content.encode("utf-8")
+        (static_dir / name).write_bytes(raw)
+        artifact_id, logical_name = stage_artifact_ids[name]
+        stage_artifacts.append(
+            {
+                "artifact_id": artifact_id,
+                "name": logical_name,
+                "static_file_name": name,
+                "static_url": f"http://files.local/static/tenant-1/agent-1/{name}",
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "copied_by": "copy_file_to_static",
+            },
+        )
+    cumulative_artifacts = []
+    cumulative_contents = {
+        "cumulative-v1.json": '{"stages":["客户识别"]}',
+        "cumulative-v1.md": "# 累计 SOP\n\n## 客户识别",
+        "cumulative-v1.html": "<h1>累计 SOP</h1><h2>客户识别</h2>",
+    }
+    cumulative_artifact_ids = {
+        "cumulative-v1.json": ("stage_sop_json", "stage_sop.json"),
+        "cumulative-v1.md": ("stage_sop_md", "stage_sop.md"),
+        "cumulative-v1.html": ("stage_sop_html", "stage_sop.html"),
+    }
+    for name, content in cumulative_contents.items():
+        raw = content.encode("utf-8")
+        (static_dir / name).write_bytes(raw)
+        artifact_id, logical_name = cumulative_artifact_ids[name]
+        cumulative_artifacts.append(
+            {
+                "artifact_id": artifact_id,
+                "name": logical_name,
+                "static_file_name": name,
+                "static_url": f"http://files.local/static/tenant-1/agent-1/{name}",
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "copied_by": "copy_file_to_static",
+            },
+        )
+    stage_id = "stage/客户 1"
+    stage_report = StageReport(
+        stage_id=stage_id,
+        report_no=1,
+        revision=1,
+        artifacts=stage_artifacts,
+        validation={
+            "schema_validator": "scripts/validate_stage_sop.py",
+            "schema_exit_code": 0,
+            "renderers": [
+                "scripts/render_stage_md.py",
+                "scripts/render_stage_sop.py",
+            ],
+        },
+    )
+    confirmed_snapshot = ConfirmedStageSnapshot(
+        stage_id=stage_id,
+        report_no=1,
+        revision=1,
+        artifact_sha256=stage_artifacts[0]["sha256"],
+    )
     store.create_session(
         SessionProjection(
             sop_session_id="sop-1",
@@ -100,6 +178,21 @@ def _build_client(tmp_path, monkeypatch) -> TestClient:
             state=SessionState.COMPLETED,
             state_version=20,
             title="客户经营 SOP",
+            stages=[
+                Stage(
+                    stage_id=stage_id,
+                    name="客户识别",
+                    status=StageStatus.CONFIRMED,
+                ),
+            ],
+            stage_reports=[stage_report],
+            confirmed_snapshots=[confirmed_snapshot],
+            cumulative_preview=CumulativePreview(
+                preview_version=1,
+                stage_order=[stage_id],
+                snapshots=[confirmed_snapshot],
+                artifacts=cumulative_artifacts,
+            ),
             final_result=FinalSopResult(
                 sop_spec={"name": "客户经营 SOP", "version": 1},
                 readable_sop="# 客户经营 SOP",
@@ -132,21 +225,293 @@ def test_completed_artifacts_have_authenticated_downloads(
 ) -> None:
     client = _build_client(tmp_path, monkeypatch)
 
-    projection = client.get("/wplus-sop/sessions/sop-1")
-    spec_url = projection.json()["artifacts"][0]["download_url"]
+    projection = client.get("/api/wplus-sop/sessions/sop-1")
+    snapshot = projection.json()
+    spec_url = snapshot["artifacts"][0]["download_url"]
     downloaded = client.get(
-        "/wplus-sop/sessions/sop-1/artifacts/sop_spec",
+        "/api/wplus-sop/sessions/sop-1/artifacts/sop_spec",
         follow_redirects=False,
     )
 
     assert projection.status_code == 200
     assert spec_url == (
-        "http://files.local/static/tenant-1/agent-1/sop_spec.json"
+        "/api/wplus-sop/sessions/sop-1/artifacts/sop_spec?download=true"
     )
-    assert downloaded.status_code == 307
-    assert downloaded.headers["location"] == (
-        "http://files.local/static/tenant-1/agent-1/sop_spec.json"
+    assert snapshot["result_preview"]["markdown_url"].endswith(
+        "/artifacts/sop_render_md?download=true",
     )
+    assert snapshot["stage_reports"][0]["artifacts"][0]["download_url"] == (
+        "/api/wplus-sop/sessions/sop-1/stage-report-artifacts/"
+        "stage_sop_json?stage_id=stage%2F%E5%AE%A2%E6%88%B7+1&revision=1"
+        "&report_no=1&download=true"
+    )
+    assert snapshot["cumulative_preview"]["artifacts"][0][
+        "download_url"
+    ] == (
+        "/api/wplus-sop/sessions/sop-1/cumulative-artifacts/"
+        "stage_sop_json?preview_version=1&download=true"
+    )
+    assert "static_url" not in json.dumps(snapshot)
+    assert downloaded.status_code == 200
+    assert downloaded.text == '{"name": "客户经营 SOP", "version": 1}'
+    assert downloaded.headers["content-type"].startswith(
+        "text/plain; charset=utf-8",
+    )
+    assert downloaded.headers["cache-control"] == "private, no-store"
+    assert downloaded.headers["x-content-type-options"] == "nosniff"
+    assert downloaded.headers["content-security-policy"] == (
+        "default-src 'none'; sandbox"
+    )
+
+
+@pytest.mark.parametrize(
+    ("artifact_id", "expected"),
+    [
+        ("stage_sop_json", '{"stage":"客户识别"}'),
+        ("stage_sop_md", "# 客户识别"),
+        ("stage_sop_html", "<h1>客户识别</h1>"),
+    ],
+)
+def test_stage_report_artifact_reads_exact_authenticated_version(
+    tmp_path,
+    monkeypatch,
+    artifact_id,
+    expected,
+) -> None:
+    client = _build_client(tmp_path, monkeypatch)
+
+    response = client.get(
+        f"/api/wplus-sop/sessions/sop-1/stage-report-artifacts/{artifact_id}",
+        params={"stage_id": "stage/客户 1", "revision": 1, "report_no": 1},
+    )
+
+    assert response.status_code == 200
+    assert response.text == expected
+    assert response.headers["content-type"].startswith(
+        "text/plain; charset=utf-8",
+    )
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["content-security-policy"] == (
+        "default-src 'none'; sandbox"
+    )
+
+
+def test_cumulative_artifact_reads_exact_authenticated_version(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    client = _build_client(tmp_path, monkeypatch)
+
+    response = client.get(
+        "/api/wplus-sop/sessions/sop-1/cumulative-artifacts/stage_sop_html",
+        params={"preview_version": 1},
+    )
+
+    assert response.status_code == 200
+    assert response.text == "<h1>累计 SOP</h1><h2>客户识别</h2>"
+    assert response.headers["content-type"].startswith(
+        "text/plain; charset=utf-8",
+    )
+    assert response.headers["cache-control"] == "private, no-store"
+
+
+@pytest.mark.parametrize(
+    ("url", "content_type", "filename"),
+    [
+        (
+            "/api/wplus-sop/sessions/sop-1/artifacts/sop_spec?download=true",
+            "application/json",
+            "sop_spec.json",
+        ),
+        (
+            "/api/wplus-sop/sessions/sop-1/stage-report-artifacts/"
+            "stage_sop_md?stage_id=stage%2F%E5%AE%A2%E6%88%B7+1&revision=1"
+            "&report_no=1&download=true",
+            "text/markdown",
+            "stage_sop.md",
+        ),
+        (
+            "/api/wplus-sop/sessions/sop-1/cumulative-artifacts/"
+            "stage_sop_html?preview_version=1&download=true",
+            "text/html",
+            "stage_sop.html",
+        ),
+    ],
+)
+def test_artifact_downloads_are_attachments_with_safe_headers(
+    tmp_path,
+    monkeypatch,
+    url,
+    content_type,
+    filename,
+) -> None:
+    client = _build_client(tmp_path, monkeypatch)
+
+    response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith(content_type)
+    assert response.headers["content-disposition"] == (
+        f"attachment; filename*=UTF-8''{filename}"
+    )
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["cache-control"] == "private, no-store"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        (
+            "/wplus-sop/sessions/sop-1/stage-report-artifacts/"
+            "stage_sop_md?stage_id=unknown&revision=1&report_no=1"
+        ),
+        (
+            "/wplus-sop/sessions/sop-1/stage-report-artifacts/"
+            "stage_sop_md?stage_id=stage%2F%E5%AE%A2%E6%88%B7+1"
+            "&revision=1&report_no=99"
+        ),
+        (
+            "/wplus-sop/sessions/sop-1/cumulative-artifacts/"
+            "stage_sop_md?preview_version=99"
+        ),
+        "/wplus-sop/sessions/sop-1/artifacts/unknown",
+    ],
+)
+def test_artifact_reads_fail_closed_for_unknown_identity(
+    tmp_path,
+    monkeypatch,
+    url,
+) -> None:
+    client = _build_client(tmp_path, monkeypatch)
+
+    response = client.get(url)
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "W+ SOP artifact not found"}
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["missing", "hash_mismatch", "escaped_symlink"],
+)
+def test_artifact_reads_fail_closed_for_file_integrity(
+    tmp_path,
+    monkeypatch,
+    failure,
+) -> None:
+    client = _build_client(tmp_path, monkeypatch)
+    target = tmp_path / "static" / "stage-1-r1-v1.md"
+    if failure == "missing":
+        target.unlink()
+    elif failure == "escaped_symlink":
+        outside = tmp_path / "outside.md"
+        outside.write_text("# escaped", encoding="utf-8")
+        target.unlink()
+        try:
+            target.symlink_to(outside)
+        except (NotImplementedError, OSError) as exc:
+            pytest.skip(f"OS denied symlink creation: {exc}")
+    else:
+        target.write_text("tampered", encoding="utf-8")
+
+    response = client.get(
+        "/wplus-sop/sessions/sop-1/stage-report-artifacts/stage_sop_md",
+        params={"stage_id": "stage/客户 1", "revision": 1, "report_no": 1},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "W+ SOP artifact not found"}
+
+
+def test_artifact_containment_rejects_parent_path_without_symlinks(
+    tmp_path: Path,
+) -> None:
+    static_root = tmp_path / "static"
+    static_root.mkdir()
+    outside = tmp_path / "outside.md"
+    raw = b"# outside"
+    outside.write_bytes(raw)
+    artifact = SimpleNamespace(
+        static_file_name="../outside.md",
+        sha256=hashlib.sha256(raw).hexdigest(),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        wplus_router._verify_artifact_file(
+            static_root,
+            artifact,
+            read_content=False,
+        )
+
+    assert exc_info.value.status_code == 404
+
+
+def test_artifact_preview_rejects_content_over_five_mib(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    client = _build_client(tmp_path, monkeypatch)
+    monkeypatch.setattr(wplus_router, "MAX_ARTIFACT_PREVIEW_BYTES", 1)
+
+    preview = client.get(
+        "/api/wplus-sop/sessions/sop-1/stage-report-artifacts/stage_sop_md",
+        params={"stage_id": "stage/客户 1", "revision": 1, "report_no": 1},
+    )
+    download = client.get(
+        "/api/wplus-sop/sessions/sop-1/stage-report-artifacts/stage_sop_md",
+        params={
+            "stage_id": "stage/客户 1",
+            "revision": 1,
+            "report_no": 1,
+            "download": "true",
+        },
+    )
+
+    assert wplus_router.DEFAULT_MAX_ARTIFACT_PREVIEW_BYTES == 5 * 1024 * 1024
+    assert preview.status_code == 413
+    assert preview.json() == {
+        "detail": "W+ SOP artifact preview exceeds 5 MiB limit",
+    }
+    assert download.status_code == 200
+
+
+def test_artifact_file_io_runs_off_the_event_loop(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+    original_to_thread = wplus_router.asyncio.to_thread
+
+    async def tracked_to_thread(func, *args, **kwargs):
+        calls.append(func.__name__)
+        return await original_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(wplus_router.asyncio, "to_thread", tracked_to_thread)
+    client = _build_client(tmp_path, monkeypatch)
+
+    response = client.get(
+        "/api/wplus-sop/sessions/sop-1/artifacts/sop_spec",
+    )
+
+    assert response.status_code == 200
+    assert "_verify_artifact_file" in calls
+
+
+def test_stage_artifact_read_is_fail_closed_for_another_user(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    client = _build_client(tmp_path, monkeypatch)
+
+    response = client.get(
+        "/wplus-sop/sessions/sop-1/stage-report-artifacts/stage_sop_html",
+        params={"stage_id": "stage/客户 1", "revision": 1, "report_no": 1},
+        headers={"X-Test-User": "attacker"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "W+ SOP Session not found"}
 
 
 def test_artifact_download_is_fail_closed_for_another_user(

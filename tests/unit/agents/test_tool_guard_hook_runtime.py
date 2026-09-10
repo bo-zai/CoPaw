@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import json
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +30,7 @@ from swe.agents.tool_guard_mixin import (
     PreToolUseTerminalStop,
     ToolGuardMixin,
 )
+from swe.agents.tool_failure import TOOL_GOVERNANCE_MESSAGE_METADATA_FIELD
 from swe.security.tool_guard.models import (
     GuardFinding,
     GuardSeverity,
@@ -393,6 +395,8 @@ async def test_tool_guard_pending_extra_includes_request_scope_ids(
             "agent_id": "agent-a",
             "tenant_id": "tenant-a",
             "source_id": "source-a",
+            "chat_id": "chat-a",
+            "msgid": "msg-a",
         },
     )
     approval_service = _RecordingApprovalService()
@@ -403,11 +407,17 @@ async def test_tool_guard_pending_extra_includes_request_scope_ids(
         notify,
     )
 
+    from swe.app.runner.operation_group import OPERATION_GROUP_INTERNAL_FIELD
+
     await agent._acting_with_approval(
         {
             "id": "tool-1",
             "name": "execute_shell_command",
             "input": {"cmd": "echo hi"},
+            OPERATION_GROUP_INTERNAL_FIELD: {
+                "id": "inspect",
+                "title": "检查图片",
+            },
         },
         "execute_shell_command",
         ToolGuardResult(
@@ -421,6 +431,17 @@ async def test_tool_guard_pending_extra_includes_request_scope_ids(
     assert extra["agent_id"] == "agent-a"
     assert extra["tenant_id"] == "tenant-a"
     assert extra["source_id"] == "source-a"
+    assert extra["operation_group"] == {
+        "id": "inspect",
+        "title": "检查图片",
+    }
+    assert OPERATION_GROUP_INTERNAL_FIELD not in extra["tool_call"]
+    assert agent.printed[0].content[0]["_swe_tool_governance"] == "pending"
+    assert agent.printed[0].metadata[
+        TOOL_GOVERNANCE_MESSAGE_METADATA_FIELD
+    ] == {"tool-1": "pending"}
+    assert extra["chat_id"] == "chat-a"
+    assert extra["msgid"] == "msg-a"
 
 
 @pytest.mark.asyncio
@@ -443,7 +464,9 @@ async def test_tool_guard_pending_extra_carries_goal_id_only_in_goal_mode(
         ToolGuardResult(tool_name="execute_shell_command", params={}),
     )
 
-    assert approval_service.create_pending_kwargs["extra"]["goal_id"] == "goal-1"
+    assert (
+        approval_service.create_pending_kwargs["extra"]["goal_id"] == "goal-1"
+    )
 
 
 @pytest.mark.asyncio
@@ -1304,6 +1327,10 @@ async def test_unsafe_guard_finding_auto_denies_without_approval_context(
     assert result is None
     agent._run_tool_call_with_hard_timeout.assert_not_awaited()
     assert "tool_guard_denied" in str(agent.printed[0].content)
+    assert agent.printed[0].content[0]["_swe_tool_governance"] == "blocked"
+    assert agent.printed[0].metadata[
+        TOOL_GOVERNANCE_MESSAGE_METADATA_FIELD
+    ] == {"tool-1": "blocked"}
 
 
 @pytest.mark.asyncio
@@ -1889,6 +1916,35 @@ async def test_skill_activation_loads_hooks_for_later_tool_event(
     registry = SkillToolRegistry()
     registry.register_skill_tools("xlsx", ["read_file"])
     loaded_state = HookSessionState()
+    skill_root = tmp_path / "skills" / "xlsx"
+    (skill_root / "hooks").mkdir(parents=True)
+    (skill_root / "scripts").mkdir()
+    (skill_root / "scripts" / "post.py").write_text(
+        "print('{}')\n",
+        encoding="utf-8",
+    )
+    (skill_root / "hooks" / "hooks.json").write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "events": {
+                    "PostToolUse": [
+                        {
+                            "id": "post",
+                            "hooks": [
+                                {
+                                    "id": "post-hook",
+                                    "type": "command",
+                                    "argv": ["python", "scripts/post.py"],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            },
+        ),
+        encoding="utf-8",
+    )
 
     async def load_skill_hooks(skill_name: str) -> None:
         nonlocal loaded_state
@@ -1897,10 +1953,8 @@ async def test_skill_activation_loads_hooks_for_later_tool_event(
                 LoadedSkillHookSource(
                     source_id=f"skill:{skill_name}",
                     skill_name=skill_name,
-                    skill_root=str(tmp_path / "skills" / skill_name),
-                    source_path=str(
-                        tmp_path / "skills" / skill_name / "hooks/hooks.json",
-                    ),
+                    skill_root=str(skill_root),
+                    source_path=str(skill_root / "hooks" / "hooks.json"),
                     hook_config=HookConfig(
                         enabled=True,
                         events={
@@ -1933,6 +1987,12 @@ async def test_skill_activation_loads_hooks_for_later_tool_event(
     detector.set_enabled_skills(["xlsx"])
     agent._request_context["_skill_invocation_detector"] = detector
     agent._request_context["_hook_overlay_model"] = loaded_state
+    await detector.start_skill(
+        "xlsx",
+        trigger_tool="read_file",
+        trigger_reason="declared",
+        load_hooks=True,
+    )
     calls = []
 
     async def fake_execute_handler(handler, context, *, workspace_dir):

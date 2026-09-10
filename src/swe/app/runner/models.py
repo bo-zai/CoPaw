@@ -95,6 +95,10 @@ class ChatHistory(BaseModel):
         default="idle",
         description="Conversation status: idle, running, or stopping",
     )
+    turn_status: str | None = Field(
+        default=None,
+        description="Terminal status for the requested answer turn",
+    )
     archive: ChatArchiveMetadata = Field(default_factory=ChatArchiveMetadata)
 
 

@@ -74,6 +74,27 @@ def test_fallback_trace_fields_accept_source_id() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_fallback_b3_context_is_callable_with_complete_headers() -> None:
+    result = _import_app_without_trace_sdk(
+        allow_fallback=True,
+        additional_code=(
+            "\nfrom swe.tracing.agent_trace_sdk import ("
+            "TraceFields, use_b3_trace_context)"
+            "\nfields = TraceFields("
+            "'task-1', 'user-1', 'session-1', 'agent-1', '1.0', 'source-a'"
+            ")"
+            "\nwith use_b3_trace_context({"
+            "'X-B3-Traceid': 'trace-id',"
+            "'X-B3-Spanid': 'span-id',"
+            "'X-B3-Sampled': '1'"
+            "}, fields):"
+            "\n    pass"
+        ),
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_app_keeps_missing_trace_sdk_as_a_startup_error_by_default() -> None:
     result = _import_app_without_trace_sdk(allow_fallback=False)
 

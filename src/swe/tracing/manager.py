@@ -556,6 +556,9 @@ class TraceManager:
         skill_runtime_profiles: Optional[dict[str, Any]] = None,
         workspace_dir: Optional[Path] = None,
         skill_tool_registry: Optional[Any] = None,
+        skill_metadata: Optional[dict[str, Any]] = None,
+        skill_dirs: Optional[dict[str, Path]] = None,
+        skill_signatures: Optional[dict[str, str]] = None,
     ) -> None:
         """Set up skill invocation detector for a trace.
 
@@ -597,8 +600,10 @@ class TraceManager:
                 user_name=ctx.user_name,
                 bbk_id=ctx.bbk_id,
                 workspace_dir=workspace_dir,
+                skill_dirs=skill_dirs,
+                skill_signatures=skill_signatures,
             )
-            detector.set_enabled_skills(enabled_skills)
+            detector.set_enabled_skills(enabled_skills, skill_metadata)
             if skill_runtime_profiles:
                 detector.set_skill_runtime_profiles(skill_runtime_profiles)
 
@@ -623,6 +628,15 @@ class TraceManager:
         """
         if not self.enabled:
             return
+
+        # End skill detection before the final span flush because cleanup may
+        # update existing spans or emit a final skill span.
+        ctx = get_current_trace()
+        if ctx and ctx.trace_id == trace_id and ctx.skill_detector:
+            try:
+                await ctx.skill_detector.on_reasoning_end()
+            except Exception as e:
+                logger.warning("Failed to end skill detection: %s", e)
 
         # Flush pending spans before ending trace with retry mechanism
         # 确保所有 spans 写入完成，避免 trace 结束后 spans 丢失
@@ -660,14 +674,6 @@ class TraceManager:
                 max_flush_retries,
                 [s.span_id[:8] for s in final_pending[:5]],
             )
-
-        # End skill detection
-        ctx = get_current_trace()
-        if ctx and ctx.trace_id == trace_id and ctx.skill_detector:
-            try:
-                await ctx.skill_detector.on_reasoning_end()
-            except Exception as e:
-                logger.warning("Failed to end skill detection: %s", e)
 
         trace = self._active_traces.pop(
             trace_id,
@@ -1049,6 +1055,8 @@ class TraceManager:
                     primary_skill = self._resolve_skill_name_for_tool_span(
                         detector=detector,
                         primary_skill=primary_skill,
+                        tool_name=tool_name,
+                        tool_input=tool_input or {},
                     )
                 else:
                     # Fallback to registry-based attribution
@@ -1089,10 +1097,27 @@ class TraceManager:
         *,
         detector: Any,
         primary_skill: Optional[str],
+        tool_name: str,
+        tool_input: dict[str, Any],
     ) -> Optional[str]:
         """仅在 tracing 写出层过滤 tool span 的 skill_name。"""
         if not primary_skill:
             return None
+
+        skill_from_md_read = getattr(
+            detector,
+            "_detect_skill_from_skill_md_read",
+            None,
+        )
+        if (
+            callable(skill_from_md_read)
+            and skill_from_md_read(
+                tool_name,
+                tool_input,
+            )
+            == primary_skill
+        ):
+            return primary_skill
 
         profile = None
         getter = getattr(detector, "get_skill_runtime_profile", None)

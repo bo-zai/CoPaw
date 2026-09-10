@@ -10,7 +10,10 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 
-import type { WPlusSopSession } from "@/api/types/wplusSop";
+import type {
+  WPlusSopSession,
+  WPlusSopStageReport,
+} from "@/api/types/wplusSop";
 import WPlusSopWorkspace from "./index";
 import styles from "./index.module.less";
 
@@ -18,6 +21,11 @@ const apiMock = vi.hoisted(() => ({
   getSession: vi.fn(),
   sendCommand: vi.fn(),
   downloadArtifact: vi.fn(),
+  downloadStageReportArtifact: vi.fn(),
+  downloadCumulativeArtifact: vi.fn(),
+  readArtifact: vi.fn(),
+  readStageReportArtifact: vi.fn(),
+  readCumulativeArtifact: vi.fn(),
   subscribeSessionEvents: vi.fn(),
 }));
 
@@ -93,6 +101,16 @@ function renderPage(options: { withSessionSwitcher?: boolean } = {}) {
   );
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function emitSafeStreamTrace({
   runId,
   sequence,
@@ -161,6 +179,19 @@ describe("WPlusSopWorkspace", () => {
     apiMock.getSession.mockResolvedValue(makeSession());
     apiMock.downloadArtifact.mockResolvedValue(
       new Blob(["artifact"], { type: "text/plain" }),
+    );
+    apiMock.downloadStageReportArtifact.mockResolvedValue(
+      new Blob(["stage artifact"], { type: "text/plain" }),
+    );
+    apiMock.downloadCumulativeArtifact.mockResolvedValue(
+      new Blob(["cumulative artifact"], { type: "text/plain" }),
+    );
+    apiMock.readArtifact.mockResolvedValue("<article>最终 SOP</article>");
+    apiMock.readStageReportArtifact.mockResolvedValue(
+      "<article>阶段 SOP v2</article>",
+    );
+    apiMock.readCumulativeArtifact.mockResolvedValue(
+      "<article>累计 SOP v1</article>",
     );
     apiMock.sendCommand.mockImplementation(async (_sessionId, command) => ({
       command_request_id: command.command_request_id,
@@ -273,6 +304,11 @@ describe("WPlusSopWorkspace", () => {
   );
 
   it("previews and confirms generated outputs before memory review", async () => {
+    apiMock.readArtifact.mockImplementation(async (_sessionId, artifactId) =>
+      artifactId === "sop_render_html"
+        ? "<article><h1>客户经营 SOP</h1></article>"
+        : "# 客户经营 SOP\n\n执行复核。",
+    );
     apiMock.getSession.mockResolvedValue(
       makeSession({
         state: "OutputReview",
@@ -282,6 +318,13 @@ describe("WPlusSopWorkspace", () => {
           html: "<article><h1>客户经营 SOP</h1></article>",
         },
         artifacts: [
+          {
+            artifact_id: "sop_render_html",
+            name: "sop_render.html",
+            format: "html",
+            status: "validated",
+            download_url: "/download/sop_render_html",
+          },
           {
             artifact_id: "sop_render_md",
             name: "sop_render.md",
@@ -297,20 +340,15 @@ describe("WPlusSopWorkspace", () => {
     expect(
       await screen.findByRole("heading", { name: "检查最终结果" }),
     ).toBeInTheDocument();
-    expect(
-      screen.getByText((_, element) =>
-        Boolean(
-          element?.tagName === "PRE" &&
-            element.textContent?.includes("# 客户经营 SOP"),
-        ),
-      ),
-    ).toBeInTheDocument();
-    const htmlPreview = screen.getByTitle("HTML 结果预览");
+    const htmlPreview = await screen.findByTitle("HTML 最终 SOP 预览");
     expect(htmlPreview).toHaveAttribute("sandbox", "");
-    expect(htmlPreview).toHaveAttribute(
-      "srcdoc",
+    expect(htmlPreview.getAttribute("srcdoc")).toContain(
       "<article><h1>客户经营 SOP</h1></article>",
     );
+    fireEvent.click(screen.getByRole("button", { name: "Markdown" }));
+    expect(
+      await screen.findByText("执行复核。", { exact: false }),
+    ).toBeVisible();
 
     fireEvent.click(screen.getByRole("button", { name: "确认结果并继续" }));
     await waitFor(() =>
@@ -321,25 +359,15 @@ describe("WPlusSopWorkspace", () => {
     );
   });
 
-  it("uses artifact URLs for generated output previews", async () => {
-    const markdownUrl =
-      "https://files.example.test/static/sop_render.md?signature=a%2Bb&expires=9#markdown";
-    const htmlUrl =
-      "https://files.example.test/static/sop_render.html?signature=c%2Fd&expires=9#preview";
+  it("uses the authenticated artifact API for generated output previews", async () => {
     const markdownSha = "a".repeat(64);
     const htmlSha = "b".repeat(64);
     const htmlBody = "<article><h1>Fetched HTML</h1></article>";
-    const fetchMock = vi.fn().mockImplementation((url: string) =>
-      Promise.resolve({
-        ok: true,
-        text: vi
-          .fn()
-          .mockResolvedValue(
-            url === htmlUrl ? htmlBody : "# URL-backed SOP\n\nFetched body",
-          ),
-      }),
+    apiMock.readArtifact.mockImplementation(async (_sessionId, artifactId) =>
+      artifactId === "sop_render_html"
+        ? htmlBody
+        : "# API-backed SOP\n\nFetched body",
     );
-    vi.stubGlobal("fetch", fetchMock);
     apiMock.getSession.mockResolvedValue(
       makeSession({
         state: "OutputReview",
@@ -347,77 +375,210 @@ describe("WPlusSopWorkspace", () => {
         result_preview: {
           markdown: "https://ignored.example.test/sop_render_6.md",
           html: "https://ignored.example.test/sop_render_6.html",
-          markdown_url: markdownUrl,
-          html_url: htmlUrl,
+          markdown_url: "https://ignored.example.test/sop_render.md",
+          html_url: "https://ignored.example.test/sop_render.html",
           markdown_sha256: markdownSha,
           html_sha256: htmlSha,
         },
+        artifacts: [
+          {
+            artifact_id: "sop_render_html",
+            name: "sop_render.html",
+            format: "html",
+            status: "validated",
+          },
+          {
+            artifact_id: "sop_render_md",
+            name: "sop_render.md",
+            format: "markdown",
+            status: "validated",
+          },
+        ],
+      }),
+    );
+
+    renderPage();
+
+    const htmlPreview = await screen.findByTitle("HTML 最终 SOP 预览");
+    expect(htmlPreview).toHaveAttribute("sandbox", "");
+    expect(htmlPreview.getAttribute("srcdoc")).toContain(htmlBody);
+    expect(htmlPreview).not.toHaveAttribute("src");
+    fireEvent.click(screen.getByRole("button", { name: "Markdown" }));
+    expect(
+      await screen.findByText("Fetched body", { exact: false }),
+    ).toBeVisible();
+    expect(apiMock.readArtifact).toHaveBeenCalledWith(
+      "sop-1",
+      "sop_render_md",
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("sanitizes HTML previews and injects a restrictive CSP", async () => {
+    apiMock.readArtifact.mockResolvedValue(
+      '<script>window.pwned=true</script><link rel="stylesheet" href="https://evil.test/x.css"><meta http-equiv="refresh" content="0;url=https://evil.test"><iframe src="https://evil.test"></iframe><object data="https://evil.test"></object><embed src="https://evil.test"><article><img src="data:image/png;base64,AA=="><style>article{color:red}</style>安全正文</article>',
+    );
+    apiMock.getSession.mockResolvedValue(
+      makeSession({
+        state: "OutputReview",
+        artifacts: [
+          {
+            artifact_id: "sop_render_html",
+            name: "sop_render.html",
+            format: "html",
+            status: "validated",
+          },
+        ],
+      }),
+    );
+
+    renderPage();
+
+    const preview = await screen.findByTitle("HTML 最终 SOP 预览");
+    const srcDoc = preview.getAttribute("srcdoc") || "";
+    expect(srcDoc).toContain(
+      "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; font-src data:",
+    );
+    expect(srcDoc).toContain("安全正文");
+    expect(srcDoc).toContain("data:image/png;base64,AA==");
+    expect(srcDoc).not.toMatch(/<(script|link|iframe|object|embed)\b/i);
+    expect(srcDoc).not.toMatch(/http-equiv=["']refresh/i);
+    expect(srcDoc).not.toContain("https://evil.test");
+  });
+
+  it("does not render a stale preview body after switching formats", async () => {
+    const html = deferred<string>();
+    const markdown = deferred<string>();
+    apiMock.readArtifact.mockImplementation((_sessionId, artifactId) =>
+      artifactId === "sop_render_html" ? html.promise : markdown.promise,
+    );
+    apiMock.getSession.mockResolvedValue(
+      makeSession({
+        state: "OutputReview",
+        artifacts: [
+          {
+            artifact_id: "sop_render_html",
+            name: "sop_render.html",
+            format: "html",
+            status: "validated",
+          },
+          {
+            artifact_id: "sop_render_md",
+            name: "sop_render.md",
+            format: "markdown",
+            status: "validated",
+          },
+        ],
+      }),
+    );
+
+    renderPage();
+    await waitFor(() => expect(apiMock.readArtifact).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "Markdown" }));
+    markdown.resolve("# 当前 Markdown\n\n不能被旧 HTML 覆盖");
+    expect(await screen.findByText(/不能被旧 HTML 覆盖/)).toBeVisible();
+
+    html.resolve("<article>过期 HTML</article>");
+    await act(async () => {
+      await html.promise;
+    });
+    expect(screen.getByText(/不能被旧 HTML 覆盖/)).toBeVisible();
+    expect(screen.queryByTitle("HTML 最终 SOP 预览")).not.toBeInTheDocument();
+  });
+
+  it("previews only the three explicit final SOP artifacts when outputs are reordered", async () => {
+    apiMock.readArtifact.mockImplementation(async (_sessionId, artifactId) =>
+      artifactId === "sop_render_html"
+        ? "<article>最终 SOP 正文</article>"
+        : artifactId === "sop_render_md"
+        ? "# 最终 SOP 正文"
+        : '{"title":"最终 SOP 正文"}',
+    );
+    apiMock.getSession.mockResolvedValue(
+      makeSession({
+        state: "OutputReview",
+        artifacts: [
+          {
+            artifact_id: "example_result_html",
+            name: "example_result.html",
+            format: "html",
+            status: "validated",
+          },
+          {
+            artifact_id: "sop_render_md",
+            name: "sop_render.md",
+            format: "markdown",
+            status: "validated",
+          },
+          {
+            artifact_id: "sop_spec",
+            name: "sop_spec.json",
+            format: "json",
+            status: "validated",
+          },
+          {
+            artifact_id: "sop_render_html",
+            name: "sop_render.html",
+            format: "html",
+            status: "validated",
+          },
+        ],
       }),
     );
 
     renderPage();
 
     expect(
-      await screen.findByText("Fetched body", { exact: false }),
-    ).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledWith(
-      markdownUrl,
-      expect.objectContaining({ cache: "no-store" }),
+      (await screen.findByTitle("HTML 最终 SOP 预览")).getAttribute("srcdoc"),
+    ).toContain("<article>最终 SOP 正文</article>");
+    expect(apiMock.readArtifact).toHaveBeenCalledWith(
+      "sop-1",
+      "sop_render_html",
+      expect.any(AbortSignal),
     );
-    expect(fetchMock).toHaveBeenCalledWith(
-      htmlUrl,
-      expect.objectContaining({ cache: "no-store" }),
+    expect(apiMock.readArtifact).not.toHaveBeenCalledWith(
+      "sop-1",
+      "example_result_html",
+      expect.any(AbortSignal),
     );
-    const htmlPreview = screen.getByTitle("HTML 结果预览");
-    expect(htmlPreview).toHaveAttribute("sandbox", "");
-    expect(htmlPreview).toHaveAttribute("srcdoc", htmlBody);
-    expect(htmlPreview).not.toHaveAttribute("src");
   });
 
-  it("refreshes URL-backed previews when artifact hashes change", async () => {
-    const markdownUrl =
-      "https://files.example.test/static/sop_render.md?signature=a%2Bb&expires=9#markdown";
-    const htmlUrl =
-      "https://files.example.test/static/sop_render.html?signature=c%2Fd&expires=9#preview";
+  it("refreshes authenticated previews when artifact hashes change", async () => {
     const firstMarkdownSha = "1".repeat(64);
     const firstHtmlSha = "2".repeat(64);
     const nextMarkdownSha = "3".repeat(64);
     const nextHtmlSha = "4".repeat(64);
-    const markdownBodies = ["# First SOP", "# Updated SOP"];
     const htmlBodies = [
       "<article>First HTML</article>",
       "<article>Updated HTML</article>",
     ];
-    const fetchMock = vi.fn().mockImplementation((url: string) => {
-      const bodies = url === htmlUrl ? htmlBodies : markdownBodies;
-      return Promise.resolve({
-        ok: true,
-        text: vi.fn().mockResolvedValue(bodies.shift()),
-      });
-    });
-    vi.stubGlobal("fetch", fetchMock);
+    apiMock.readArtifact.mockImplementation(async () => htmlBodies.shift());
     const firstSession = makeSession({
       state: "OutputReview",
       state_version: 20,
       result_preview: {
         markdown: "ignored",
         html: "ignored",
-        markdown_url: markdownUrl,
-        html_url: htmlUrl,
+        markdown_url: "https://ignored.example.test/sop_render.md",
+        html_url: "https://ignored.example.test/sop_render.html",
         markdown_sha256: firstMarkdownSha,
         html_sha256: firstHtmlSha,
       },
+      artifacts: [
+        {
+          artifact_id: "sop_render_html",
+          name: "sop_render.html",
+          format: "html",
+          status: "validated",
+        },
+      ],
     });
     apiMock.getSession.mockResolvedValue(firstSession);
     renderPage();
 
-    expect(
-      await screen.findByText("First SOP", { exact: false }),
-    ).toBeInTheDocument();
-    const firstHtmlPreview = await screen.findByTitle("HTML 结果预览");
+    const firstHtmlPreview = await screen.findByTitle("HTML 最终 SOP 预览");
     await waitFor(() =>
-      expect(firstHtmlPreview).toHaveAttribute(
-        "srcdoc",
+      expect(firstHtmlPreview.getAttribute("srcdoc")).toContain(
         "<article>First HTML</article>",
       ),
     );
@@ -440,21 +601,71 @@ describe("WPlusSopWorkspace", () => {
       });
     });
 
-    expect(
-      await screen.findByText("Updated SOP", { exact: false }),
-    ).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenLastCalledWith(
-      htmlUrl,
-      expect.objectContaining({ cache: "no-store" }),
-    );
-    const nextHtmlPreview = screen.getByTitle("HTML 结果预览");
+    const nextHtmlPreview = await screen.findByTitle("HTML 最终 SOP 预览");
     await waitFor(() =>
-      expect(nextHtmlPreview).toHaveAttribute(
-        "srcdoc",
+      expect(nextHtmlPreview.getAttribute("srcdoc")).toContain(
         "<article>Updated HTML</article>",
       ),
     );
-    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(apiMock.readArtifact).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps one artifact request alive across equivalent SSE snapshots", async () => {
+    const html = deferred<string>();
+    const requestSignals: AbortSignal[] = [];
+    apiMock.readArtifact.mockImplementation(
+      (_sessionId, _artifactId, signal: AbortSignal) => {
+        requestSignals.push(signal);
+        return html.promise;
+      },
+    );
+    const session = makeSession({
+      state: "OutputReview",
+      state_version: 20,
+      result_preview: {
+        markdown: "ignored",
+        html: "ignored",
+        markdown_sha256: "a".repeat(64),
+        html_sha256: "b".repeat(64),
+      },
+      artifacts: [
+        {
+          artifact_id: "sop_render_html",
+          name: "sop_render.html",
+          format: "html",
+          status: "validated",
+          sha256: "b".repeat(64),
+        },
+      ],
+    });
+    apiMock.getSession.mockResolvedValue(session);
+    renderPage();
+
+    await waitFor(() => expect(apiMock.readArtifact).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(subscriptionCallbacks).toHaveLength(1));
+    act(() => {
+      subscriptionCallbacks[0].onEvent({
+        event_id: "snapshot:sop-1:21",
+        session_id: "sop-1",
+        state_version: 21,
+        kind: "snapshot",
+        snapshot: makeSession({
+          ...session,
+          state_version: 21,
+          artifacts: session.artifacts?.map((artifact) => ({ ...artifact })),
+          result_preview: { ...session.result_preview! },
+        }),
+      });
+    });
+
+    expect(apiMock.readArtifact).toHaveBeenCalledTimes(1);
+    expect(requestSignals).toHaveLength(1);
+    expect(requestSignals[0].aborted).toBe(false);
+
+    html.resolve("<article>稳定预览</article>");
+    expect(
+      (await screen.findByTitle("HTML 最终 SOP 预览")).getAttribute("srcdoc"),
+    ).toContain("稳定预览");
   });
 
   it("shows full memory content, target, failure retry, and write receipt", async () => {
@@ -1513,7 +1724,7 @@ describe("WPlusSopWorkspace", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("navigates back to the receipt Chat after saving and exiting", async () => {
+  it("does not expose save and exit from the workspace header", async () => {
     apiMock.getSession.mockResolvedValue(
       makeSession({
         state: "AwaitingAnswer",
@@ -1525,24 +1736,15 @@ describe("WPlusSopWorkspace", () => {
         },
       }),
     );
-    apiMock.sendCommand.mockResolvedValue({
-      command_request_id: "save-1",
-      accepted: true,
-      session: makeSession({
-        chat_id: "chat-from-receipt",
-        state: "Paused",
-        state_version: 8,
-      }),
-    });
     renderPage();
 
-    fireEvent.click(await screen.findByRole("button", { name: "保存并退出" }));
-
-    expect(await screen.findByText("所属 Chat")).toBeInTheDocument();
-    expect(apiMock.sendCommand).toHaveBeenCalledWith(
-      "sop-1",
-      expect.objectContaining({ command: "save_and_exit" }),
-    );
+    expect(
+      await screen.findByRole("heading", { name: "客户经营 SOP" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "保存并退出" }),
+    ).not.toBeInTheDocument();
+    expect(apiMock.sendCommand).not.toHaveBeenCalled();
   });
 
   it("isolates answer drafts by session and question batch", async () => {
@@ -1820,6 +2022,43 @@ describe("WPlusSopWorkspace", () => {
     expect(screen.getByRole("heading", { name: "新会话" })).toBeInTheDocument();
     expect(
       screen.queryByRole("heading", { name: "旧会话覆盖" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("ignores an old-session recovery failure and aborts it on navigation", async () => {
+    const oldRecovery = deferred<WPlusSopSession>();
+    apiMock.getSession
+      .mockResolvedValueOnce(makeSession({ title: "旧会话" }))
+      .mockImplementationOnce(() => oldRecovery.promise)
+      .mockResolvedValueOnce(
+        makeSession({ session_id: "sop-2", title: "新会话" }),
+      );
+    renderPage({ withSessionSwitcher: true });
+
+    await waitFor(() => expect(subscriptionCallbacks).toHaveLength(1));
+    act(() => subscriptionCallbacks[0].onError(new Error("stream ended")));
+    await waitFor(() => expect(apiMock.getSession).toHaveBeenCalledTimes(2));
+    const recoverySignal = apiMock.getSession.mock.calls[1][1] as
+      | AbortSignal
+      | undefined;
+    expect(recoverySignal).toBeInstanceOf(AbortSignal);
+    expect(recoverySignal?.aborted).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "切换测试 Session" }));
+    expect(
+      await screen.findByRole("heading", { name: "新会话" }),
+    ).toBeInTheDocument();
+    expect(recoverySignal?.aborted).toBe(true);
+
+    await act(async () => {
+      oldRecovery.reject(
+        Object.assign(new Error("old session not found"), { status: 404 }),
+      );
+      await oldRecovery.promise.catch(() => undefined);
+    });
+    expect(screen.getByRole("heading", { name: "新会话" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "无法访问这个工作台" }),
     ).not.toBeInTheDocument();
   });
 
@@ -2269,11 +2508,103 @@ describe("WPlusSopWorkspace", () => {
       expect(apiMock.downloadArtifact).toHaveBeenCalledWith(
         "sop-1",
         "sop_render_md",
+        expect.any(AbortSignal),
       ),
     );
     expect(createObjectURL).toHaveBeenCalled();
     expect(click).toHaveBeenCalled();
     expect(revokeObjectURL).toHaveBeenCalledWith("blob:wplus-artifact");
+  });
+
+  it("tracks concurrent downloads independently", async () => {
+    const htmlDownload = deferred<Blob>();
+    const jsonDownload = deferred<Blob>();
+    apiMock.downloadArtifact.mockImplementation((_sessionId, artifactId) =>
+      artifactId === "sop_render_html"
+        ? htmlDownload.promise
+        : jsonDownload.promise,
+    );
+    apiMock.getSession.mockResolvedValue(
+      makeSession({
+        state: "Completed",
+        artifacts: [
+          {
+            artifact_id: "sop_render_html",
+            name: "sop_render.html",
+            format: "html",
+            status: "validated",
+          },
+          {
+            artifact_id: "sop_spec",
+            name: "sop_spec.json",
+            format: "json",
+            status: "validated",
+          },
+        ],
+      }),
+    );
+    vi.stubGlobal("URL", {
+      createObjectURL: vi.fn(() => "blob:download"),
+      revokeObjectURL: vi.fn(),
+    });
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    renderPage();
+
+    const htmlButton = await screen.findByRole("button", {
+      name: "sop_render.html",
+    });
+    const jsonButton = screen.getByRole("button", { name: "sop_spec.json" });
+    fireEvent.click(htmlButton);
+    fireEvent.click(jsonButton);
+    expect(htmlButton).toHaveClass("ant-btn-loading");
+    expect(jsonButton).toHaveClass("ant-btn-loading");
+
+    htmlDownload.resolve(new Blob(["html"]));
+    await waitFor(() => expect(htmlButton).not.toHaveClass("ant-btn-loading"));
+    expect(jsonButton).toHaveClass("ant-btn-loading");
+    jsonDownload.resolve(new Blob(["json"]));
+    await waitFor(() => expect(jsonButton).not.toHaveClass("ant-btn-loading"));
+  });
+
+  it("aborts downloads on session switch and suppresses stale errors", async () => {
+    let downloadSignal: AbortSignal | undefined;
+    apiMock.downloadArtifact.mockImplementation(
+      (_sessionId, _artifactId, signal) => {
+        downloadSignal = signal;
+        return new Promise((_resolve, reject) => {
+          signal?.addEventListener("abort", () =>
+            reject(new DOMException("Aborted", "AbortError")),
+          );
+        });
+      },
+    );
+    apiMock.getSession.mockImplementation(async (requestedSessionId) =>
+      makeSession({
+        session_id: requestedSessionId,
+        state: "Completed",
+        artifacts: [
+          {
+            artifact_id: "sop_render_md",
+            name: `${requestedSessionId}.md`,
+            format: "markdown",
+            status: "validated",
+          },
+        ],
+      }),
+    );
+    renderPage({ withSessionSwitcher: true });
+
+    fireEvent.click(await screen.findByRole("button", { name: "sop-1.md" }));
+    await waitFor(() => expect(downloadSignal).toBeDefined());
+    fireEvent.click(screen.getByRole("button", { name: "切换测试 Session" }));
+
+    await waitFor(() => expect(downloadSignal?.aborted).toBe(true));
+    expect(
+      await screen.findByRole("button", { name: "sop-2.md" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByText("产物下载失败，请稍后重试。"),
+    ).not.toBeInTheDocument();
   });
 
   it("shows the completed memory snapshot as read-only history", async () => {
@@ -2387,5 +2718,436 @@ describe("WPlusSopWorkspace", () => {
       await screen.findByRole("heading", { name: "无法访问这个工作台" }),
     ).toBeInTheDocument();
     expect(screen.queryByText("not found")).not.toBeInTheDocument();
+  });
+
+  it("shows the latest stage report and confirms the stage once validated", async () => {
+    const stageReports: WPlusSopStageReport[] = [
+      {
+        stage_id: "stage-1",
+        report_no: 1,
+        revision: 1,
+        superseded_by: 2,
+        created_at: "2026-08-21T01:00:00Z",
+        artifacts: [
+          {
+            artifact_id: "stage_sop_json",
+            name: "stage_sop.json",
+            format: "json",
+            status: "validated",
+            download_url: "/static/stage-1-v1.json",
+            sha256: "a".repeat(64),
+          },
+          {
+            artifact_id: "stage_sop_md",
+            name: "stage_sop.md",
+            format: "markdown",
+            status: "validated",
+            download_url: "/static/stage-1-v1.md",
+            sha256: "a".repeat(64),
+          },
+          {
+            artifact_id: "stage_sop_html",
+            name: "stage_sop.html",
+            format: "html",
+            status: "validated",
+            download_url: "/static/stage-1-v1.html",
+            sha256: "a".repeat(64),
+          },
+        ],
+      },
+      {
+        stage_id: "stage-1",
+        report_no: 2,
+        revision: 1,
+        superseded_by: null,
+        created_at: "2026-08-21T02:00:00Z",
+        artifacts: [
+          {
+            artifact_id: "stage_sop_json",
+            name: "stage_sop.json",
+            format: "json",
+            status: "validated",
+            download_url: "/static/stage-1-v2.json",
+            sha256: "b".repeat(64),
+          },
+          {
+            artifact_id: "stage_sop_md",
+            name: "stage_sop.md",
+            format: "markdown",
+            status: "validated",
+            download_url: "/static/stage-1-v2.md",
+            sha256: "b".repeat(64),
+          },
+          {
+            artifact_id: "stage_sop_html",
+            name: "stage_sop.html",
+            format: "html",
+            status: "validated",
+            download_url: "/static/stage-1-v2.html",
+            sha256: "b".repeat(64),
+          },
+        ],
+      },
+    ];
+    apiMock.getSession.mockResolvedValue(
+      makeSession({
+        state: "AwaitingStageConfirmation",
+        state_version: 8,
+        stage_reports: stageReports,
+        cumulative_preview: {
+          preview_version: 1,
+          stage_order: [],
+          snapshots: [],
+          artifacts: [],
+          rendered_sha256: {},
+        },
+      }),
+    );
+    renderPage();
+
+    expect(
+      await screen.findByRole("heading", { name: /已通过预跑/ }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("版本 v2（最新）")).toBeInTheDocument();
+    expect(screen.getByText("最新版本")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(apiMock.readStageReportArtifact).toHaveBeenCalledWith(
+        "sop-1",
+        {
+          stageId: "stage-1",
+          revision: 1,
+          reportNo: 2,
+          artifactId: "stage_sop_html",
+        },
+        expect.any(AbortSignal),
+      ),
+    );
+    expect(
+      screen.getByTitle("HTML 阶段 SOP v2 预览").getAttribute("srcdoc"),
+    ).toContain("<article>阶段 SOP v2</article>");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "查看版本 v1（修订 1）" }),
+    );
+    await waitFor(() =>
+      expect(apiMock.readStageReportArtifact).toHaveBeenCalledWith(
+        "sop-1",
+        expect.objectContaining({ revision: 1, reportNo: 1 }),
+        expect.any(AbortSignal),
+      ),
+    );
+    expect(screen.getByText("历史版本只读，不能用于确认环节。")).toBeVisible();
+
+    const confirmButton = screen.getByRole("button", {
+      name: "确认并锁定本环节",
+    });
+    expect(confirmButton).toBeDisabled();
+    fireEvent.click(
+      screen.getByRole("button", { name: "查看版本 v2（修订 1）" }),
+    );
+    expect(confirmButton).toBeEnabled();
+    await waitFor(() => {
+      fireEvent.click(confirmButton);
+      expect(apiMock.sendCommand).toHaveBeenCalledWith(
+        "sop-1",
+        expect.objectContaining({ command: "confirm_stage" }),
+      );
+    });
+  });
+
+  it.each([
+    ["补充澄清", "clarify"],
+    ["按反馈重新预跑", "rerun"],
+  ])(
+    "submits stage report feedback through %s",
+    async (buttonLabel, nextAction) => {
+      apiMock.getSession.mockResolvedValue(
+        makeSession({
+          state: "AwaitingStageConfirmation",
+          state_version: 8,
+          trial: {
+            run_id: "run-stage-report",
+            status: "completed",
+            steps: [],
+          },
+          stage_reports: [
+            {
+              stage_id: "stage-1",
+              report_no: 1,
+              revision: 1,
+              superseded_by: null,
+              created_at: "2026-08-21T01:00:00Z",
+              artifacts: [
+                {
+                  artifact_id: "stage_sop_json",
+                  name: "stage_sop.json",
+                  format: "json",
+                  status: "validated",
+                },
+                {
+                  artifact_id: "stage_sop_md",
+                  name: "stage_sop.md",
+                  format: "markdown",
+                  status: "validated",
+                },
+                {
+                  artifact_id: "stage_sop_html",
+                  name: "stage_sop.html",
+                  format: "html",
+                  status: "validated",
+                },
+              ],
+            },
+          ],
+        }),
+      );
+      renderPage();
+
+      fireEvent.change(await screen.findByLabelText("阶段 SOP 反馈"), {
+        target: { value: "补充异常处理规则后继续" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: buttonLabel }));
+
+      await waitFor(() =>
+        expect(apiMock.sendCommand).toHaveBeenCalledWith(
+          "sop-1",
+          expect.objectContaining({
+            command: "submit_trial_feedback",
+            payload: {
+              feedback: "补充异常处理规则后继续",
+              rerun_of_run_id: "run-stage-report",
+              next_action: nextAction,
+            },
+          }),
+        ),
+      );
+    },
+  );
+
+  it("switches stage preview formats, pretty prints JSON, and downloads the selected version", async () => {
+    const createObjectURL = vi.fn(() => "blob:stage-artifact");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal("URL", { createObjectURL, revokeObjectURL });
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    apiMock.readStageReportArtifact.mockImplementation(
+      async (_sessionId, identity) =>
+        identity.artifactId === "stage_sop_json"
+          ? '{"title":"阶段 SOP","steps":[1,2]}'
+          : identity.artifactId === "stage_sop_md"
+          ? "# 阶段 SOP\n\n执行步骤"
+          : "<article>阶段 SOP</article>",
+    );
+    apiMock.getSession.mockResolvedValue(
+      makeSession({
+        state: "AwaitingStageConfirmation",
+        stage_reports: [
+          {
+            stage_id: "stage-1",
+            report_no: 3,
+            revision: 2,
+            superseded_by: null,
+            created_at: "2026-08-21T02:00:00Z",
+            artifacts: [
+              {
+                artifact_id: "stage_sop_json",
+                name: "stage_sop.json",
+                format: "json",
+                status: "validated",
+                download_url: "/ignored",
+              },
+              {
+                artifact_id: "stage_sop_md",
+                name: "stage_sop.md",
+                format: "markdown",
+                status: "validated",
+                download_url: "/ignored",
+              },
+              {
+                artifact_id: "stage_sop_html",
+                name: "stage_sop.html",
+                format: "html",
+                status: "validated",
+                download_url: "/ignored",
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    renderPage();
+
+    expect(await screen.findByTitle("HTML 阶段 SOP v3 预览")).toHaveAttribute(
+      "sandbox",
+      "",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "JSON" }));
+    expect(await screen.findByText(/"title": "阶段 SOP"/)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "下载 JSON" }));
+    await waitFor(() =>
+      expect(apiMock.downloadStageReportArtifact).toHaveBeenCalledWith(
+        "sop-1",
+        {
+          stageId: "stage-1",
+          revision: 2,
+          reportNo: 3,
+          artifactId: "stage_sop_json",
+        },
+        expect.any(AbortSignal),
+      ),
+    );
+  });
+
+  it("loads the cumulative preview by version and offers retry after an error", async () => {
+    apiMock.readCumulativeArtifact
+      .mockRejectedValueOnce(new Error("network"))
+      .mockResolvedValueOnce("<article>累计 SOP 已恢复</article>");
+    apiMock.getSession.mockResolvedValue(
+      makeSession({
+        state: "AwaitingStageConfirmation",
+        stage_reports: [],
+        cumulative_preview: {
+          preview_version: 6,
+          stage_order: ["stage-1"],
+          snapshots: [
+            {
+              stage_id: "stage-1",
+              report_no: 2,
+              revision: 1,
+              artifact_sha256: "a".repeat(64),
+              confirmed_at: "2026-08-21T02:00:00Z",
+            },
+          ],
+          artifacts: [
+            {
+              artifact_id: "cumulative_html",
+              name: "cumulative.html",
+              format: "html",
+              status: "validated",
+              download_url: "/ignored",
+            },
+          ],
+          rendered_sha256: { html: "a".repeat(64) },
+        },
+      }),
+    );
+    renderPage();
+
+    expect(await screen.findByText("HTML 预览加载失败。")).toBeVisible();
+    expect(apiMock.readCumulativeArtifact).toHaveBeenCalledWith(
+      "sop-1",
+      { previewVersion: 6, artifactId: "cumulative_html" },
+      expect.any(AbortSignal),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "重试 HTML 预览" }));
+    expect(
+      (await screen.findByTitle("HTML 累计 SOP v6 预览")).getAttribute(
+        "srcdoc",
+      ),
+    ).toContain("<article>累计 SOP 已恢复</article>");
+  });
+
+  it("hides the cumulative preview while the next stage is in progress", async () => {
+    apiMock.getSession.mockResolvedValue(
+      makeSession({
+        state: "GeneratingQuestions",
+        current_stage_id: "stage-2",
+        stages: [
+          {
+            stage_id: "stage-1",
+            title: "确认名单范围",
+            description: "确定产品和时间窗口",
+            status: "confirmed",
+          },
+          {
+            stage_id: "stage-2",
+            title: "创建后续任务",
+            description: "确认任务字段",
+            status: "current",
+          },
+        ],
+        cumulative_preview: {
+          preview_version: 1,
+          stage_order: ["stage-1"],
+          snapshots: [
+            {
+              stage_id: "stage-1",
+              report_no: 2,
+              revision: 1,
+              artifact_sha256: "a".repeat(64),
+              confirmed_at: "2026-08-21T02:00:00Z",
+            },
+          ],
+          artifacts: [
+            {
+              artifact_id: "cumulative_html",
+              name: "cumulative.html",
+              format: "html",
+              status: "validated",
+            },
+          ],
+          rendered_sha256: { html: "a".repeat(64) },
+        },
+      }),
+    );
+
+    renderPage();
+
+    expect(
+      await screen.findByRole("heading", { name: "客户经营 SOP" }),
+    ).toBeVisible();
+    expect(screen.queryByText("累计 SOP 预览")).not.toBeInTheDocument();
+    expect(apiMock.readCumulativeArtifact).not.toHaveBeenCalled();
+  });
+
+  it("blocks stage confirmation until the latest report is fully validated", async () => {
+    apiMock.getSession.mockResolvedValue(
+      makeSession({
+        state: "AwaitingStageConfirmation",
+        state_version: 8,
+        stage_reports: [
+          {
+            stage_id: "stage-1",
+            report_no: 1,
+            revision: 1,
+            superseded_by: null,
+            created_at: "2026-08-21T01:00:00Z",
+            artifacts: [
+              {
+                artifact_id: "stage_sop_json",
+                name: "stage_sop.json",
+                format: "json",
+                status: "validated" as const,
+                download_url: "/static/stage-1.json",
+                sha256: "a".repeat(64),
+              },
+              {
+                artifact_id: "stage_sop_md",
+                name: "stage_sop.md",
+                format: "markdown",
+                status: "failed" as const,
+                download_url: null,
+                sha256: null,
+              },
+              {
+                artifact_id: "stage_sop_html",
+                name: "stage_sop.html",
+                format: "html",
+                status: "validated" as const,
+                download_url: "/static/stage-1.html",
+                sha256: "a".repeat(64),
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    renderPage();
+
+    expect(await screen.findByText("环节报告尚未校验完成")).toBeInTheDocument();
+    const confirmButton = screen.getByRole("button", {
+      name: "确认并锁定本环节",
+    });
+    expect(confirmButton).toBeDisabled();
+    expect(apiMock.sendCommand).not.toHaveBeenCalled();
   });
 });

@@ -200,8 +200,16 @@ Visual priority for future chat work remains:
 
 - Preserve the existing conversation sidebar width until a later approved chat migration changes it.
 - Preserve its collapse behavior.
+- In ordinary chats, open generated-file and HTML previews in a non-modal right-side panel on desktop so the conversation remains visible and interactive. The panel may use a full-width overlay when the host is too narrow to keep both surfaces usable, and explicit full-screen preview remains available as a secondary action. Scheduled-task HTML results retain the existing centered modal presentation.
 - Future chat redesigns may reuse base accessibility and spacing roles while evolving its visual theme independently from management pages.
 - Future chat redesigns must work both with and without the global navigation.
+
+### Chat Dictation
+
+- The new-chat and active-chat composers share an always-discoverable microphone control immediately before Send. This short dictation workflow is independent of the existing allowlisted recording item in the quick menu.
+- During dictation, replace the quick-action row with Cancel, a neutral dotted audio waveform, and Stop. Keep Send visible but disabled until recognition ends. Show the recognition preview above the waveform; Stop appends it to the existing draft without submitting, while Cancel discards only this dictation.
+- Waveform history follows actual microphone amplitude, with quiet audio rendered as dots and speech as rounded vertical marks. Under reduced motion, retain static dots and textual recording state. Controls retain the Conversation Workspace focus color.
+- Permission requests, unavailable browsers, recognition failures, cancellation, and stopping must have explicit states. Release microphone tracks on stop, cancellation, errors, composer disablement, and conversation changes.
 
 ### Content-Only Conversation Workspace
 

@@ -67,7 +67,18 @@ class StopCommandHandler(BaseControlCommandHandler):
                 f"`{target_session_id[:40]}`."
             )
 
-        stopped = await workspace.task_tracker.request_stop(chat_id)
+        coordinator = getattr(workspace, "answer_turn_coordinator", None)
+        identity = (
+            await coordinator.current_identity(chat_id)
+            if coordinator is not None
+            else None
+        )
+        claim = (
+            await coordinator.claim_stop(identity, internal=True)
+            if coordinator is not None and identity is not None
+            else None
+        )
+        stopped = bool(claim and claim.accepted)
 
         cleared = await workspace.channel_manager.clear_queue(
             channel_id,

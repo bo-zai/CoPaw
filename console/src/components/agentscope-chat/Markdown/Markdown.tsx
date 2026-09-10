@@ -17,12 +17,16 @@ import { CursorComponent, cursorExtension } from "./core/plugins/cursor";
 import markedFootnote from "marked-footnote";
 import Link from "./core/components/Link";
 import CompatibleMarkdownFallback from "./compatibleMarkdown";
-import { renderSafeMarkdownHtmlToken } from "./compatibleMarkdownHtml";
+import { createTableScopedHtmlRenderer } from "./compatibleMarkdownHtml";
 
 // 缓存不变的 dompurify 配置
 const EMPTY_DOMPURIFY_CONFIG = {
   ALLOWED_TAGS: [],
 };
+
+function escapeHtmlTag(value: string): string {
+  return value.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
 
 /**
  * 检测浏览器是否支持正则表达式的 lookbehind assertions
@@ -97,12 +101,7 @@ export default memo(function (props: MarkdownProps) {
       walkTokens,
       // 当 allowHtml 为 false 时，转义 HTML 标签使其显示为字符串
       ...(!allowHtml && {
-        renderer: {
-          html(token: { text?: string; raw?: string }) {
-            const text = token.text || token.raw || "";
-            return renderSafeMarkdownHtmlToken(text);
-          },
-        },
+        renderer: createTableScopedHtmlRenderer(escapeHtmlTag),
       }),
     }),
     [extensions, allowHtml],

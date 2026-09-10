@@ -213,7 +213,7 @@ Goal Runtime 为每个未满足的 Criterion 运行独立 `Verification Run`：
 - `PAUSED`、`BLOCKED`、`LIMITED`、`CANCELLED`：生成简短状态、原因和下一步说明；
 - Finalization Turn 是只读、无工具、不计 Main Agent Turn Budget，且不得推进 Goal。
 
-若 Finalization Turn 因模型或基础设施失败无法产生文本，Runtime 不重试、不改变 Goal 状态，发送固定的最小系统提示并关闭请求；用户可在 Monitor 查看真实状态。
+Finalization Turn 产出的当前轮 `assistant` 文本是唯一的 Goal Stop 候选：它在关闭流前触发一次 Stop。`block` 只能发起无工具的 Finalization 重试，使用独立于 Goal Turn Budget 的 `max_stop_turns` 计数；重试不得重新执行、验证或变更 Goal 状态。若 Finalization Turn 因模型或基础设施失败无法产生文本，Runtime 不重试、不改变 Goal 状态，发送固定的最小系统提示并关闭请求；该 Fallback 不是 Stop 候选，用户可在 Monitor 查看真实状态。
 
 ## 持久化与运行所有权
 

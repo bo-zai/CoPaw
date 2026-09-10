@@ -62,6 +62,7 @@ interface LoadSessionMessagesOptions {
   getCurrentSessionId: () => string | undefined;
   setSessionLoading?: (loading: boolean) => void;
   setSessionNotFound?: (notFound: boolean) => void;
+  reconnectIfGenerating?: boolean;
 }
 
 // Exported for focused loader regression coverage.
@@ -75,6 +76,7 @@ export async function loadSessionMessages({
   getCurrentSessionId,
   setSessionLoading,
   setSessionNotFound,
+  reconnectIfGenerating = true,
 }: LoadSessionMessagesOptions): Promise<boolean> {
   if (!requestedSessionId || !options.api) {
     if (clearBeforeLoad) {
@@ -127,7 +129,7 @@ export async function loadSessionMessages({
       }),
     );
 
-    if (session?.generating) {
+    if (session?.generating && reconnectIfGenerating) {
       emit({
         type: "handleReconnect",
         data: { session_id: requestedSessionId },
@@ -437,7 +439,7 @@ export const useChatAnywhereSessions = () => {
   }, []);
 
   const refreshSession = React.useCallback(
-    async (sessionId?: string) => {
+    async (sessionId?: string, reconnectIfGenerating = true) => {
       const requestedSessionId = sessionId ?? getCurrentSessionId();
       return loadSessionMessages({
         requestedSessionId,
@@ -445,6 +447,7 @@ export const useChatAnywhereSessions = () => {
         options,
         setMessages,
         getCurrentSessionId,
+        reconnectIfGenerating,
       });
     },
     [getCurrentSessionId, options, setMessages],

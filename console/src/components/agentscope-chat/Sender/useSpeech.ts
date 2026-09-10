@@ -1,133 +1,178 @@
-import { useEvent, useMergedState } from "rc-util";
-import React from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useEvent } from "rc-util";
 
-// Ensure that the SpeechRecognition API is available in the browser
-let SpeechRecognition: any;
+import {
+  BrowserPcmCapture,
+  isBrowserPcmCaptureSupported,
+} from "@/components/GlobalVoiceRecorder/browserPcmCapture";
+import { mergePcmChunks } from "@/components/GlobalVoiceRecorder/audio";
+import {
+  isVoiceTranscriptionConfigured,
+  transcribeRecording,
+} from "@/components/GlobalVoiceRecorder/transcription";
+import { createVoiceRecordingFile } from "@/components/GlobalVoiceRecorder/wav";
 
-if (!SpeechRecognition && typeof window !== "undefined") {
-  SpeechRecognition =
-    (window as any).SpeechRecognition ||
-    (window as any).webkitSpeechRecognition;
+type SpeechStatus = "idle" | "requesting" | "listening" | "transcribing";
+
+const TRANSCRIPTION_NOT_CONFIGURED = "语音转写服务尚未配置，请稍后重试。";
+const TRANSCRIPTION_FAILED = "语音转写失败，请重试；原有草稿已保留。";
+
+interface DictationSession {
+  capture: BrowserPcmCapture;
+  chunks: Float32Array[];
+  abortController: AbortController | null;
+  timer: ReturnType<typeof setTimeout>;
+  finalizing: boolean;
 }
 
-export type ControlledSpeechConfig = {
-  recording?: boolean;
-  onRecordingChange: (recording: boolean) => void;
-};
+function captureErrorMessage(error: unknown): string {
+  const name =
+    error instanceof Error || error instanceof DOMException ? error.name : "";
+  if (name === "NotAllowedError" || name === "PermissionDeniedError") {
+    return "无法使用麦克风，请在浏览器设置中允许麦克风权限后重试。";
+  }
+  if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+    return "未找到可用的麦克风，请检查设备连接。";
+  }
+  return "无法启动语音输入，请检查麦克风是否被占用后重试。";
+}
 
-export type AllowSpeech = boolean | ControlledSpeechConfig;
+export default function useSpeech(onSpeech: (transcript: string) => void) {
+  const onResult = useEvent(onSpeech);
+  const supported = isBrowserPcmCaptureSupported();
+  const [status, setStatus] = useState<SpeechStatus>("idle");
+  const [error, setError] = useState("");
+  const [stream, setStream] = useState<MediaStream | null>(null);
+  const sessionRef = useRef<DictationSession | null>(null);
+  const statusRef = useRef<SpeechStatus>("idle");
 
-export default function useSpeech(
-  onSpeech: (transcript: string) => void,
-  allowSpeech?: AllowSpeech,
-) {
-  const onEventSpeech = useEvent(onSpeech);
-
-  // ========================== Speech Config ==========================
-  const [controlledRecording, onControlledRecordingChange, speechInControlled] =
-    React.useMemo(() => {
-      if (typeof allowSpeech === "object") {
-        return [
-          allowSpeech.recording,
-          allowSpeech.onRecordingChange,
-          typeof allowSpeech.recording === "boolean",
-        ] as const;
-      }
-
-      return [undefined, undefined, false] as const;
-    }, [allowSpeech]);
-
-  // ======================== Speech Permission ========================
-  const [permissionState, setPermissionState] =
-    React.useState<PermissionState | null>(null);
-
-  React.useEffect(() => {
-    if (typeof navigator !== "undefined" && "permissions" in navigator) {
-      let lastPermission: PermissionStatus | null = null;
-
-      (navigator as any).permissions
-        .query({ name: "microphone" })
-        .then((permissionStatus: PermissionStatus) => {
-          setPermissionState(permissionStatus.state);
-
-          // Keep the last permission status.
-          permissionStatus.onchange = function () {
-            setPermissionState(this.state);
-          };
-
-          lastPermission = permissionStatus;
-        });
-
-      return () => {
-        // Avoid memory leaks
-        if (lastPermission) {
-          lastPermission.onchange = null;
-        }
-      };
-    }
+  const setSpeechStatus = useCallback((nextStatus: SpeechStatus) => {
+    statusRef.current = nextStatus;
+    setStatus(nextStatus);
   }, []);
 
-  // Convert permission state to a simple type
-  const mergedAllowSpeech = SpeechRecognition && permissionState !== "denied";
-
-  // ========================== Speech Events ==========================
-  const recognitionRef = React.useRef<any | null>(null);
-  const [recording, setRecording] = useMergedState(false, {
-    value: controlledRecording,
-  });
-
-  const forceBreakRef = React.useRef(false);
-
-  const ensureRecognition = () => {
-    if (mergedAllowSpeech && !recognitionRef.current) {
-      const recognition = new SpeechRecognition();
-
-      recognition.onstart = () => {
-        setRecording(true);
-      };
-
-      recognition.onend = () => {
-        setRecording(false);
-      };
-
-      recognition.onresult = (event: SpeechRecognitionResult) => {
-        if (!forceBreakRef.current) {
-          const transcript = (event as any).results?.[0]?.[0]?.transcript;
-          onEventSpeech(transcript);
-        }
-
-        forceBreakRef.current = false;
-      };
-
-      recognitionRef.current = recognition;
+  const cancel = useCallback(() => {
+    const session = sessionRef.current;
+    sessionRef.current = null;
+    if (session) {
+      clearTimeout(session.timer);
+      session.abortController?.abort();
+      void session.capture.stop();
     }
-  };
+    setStream(null);
+    setSpeechStatus("idle");
+  }, [setSpeechStatus]);
 
-  const triggerSpeech = useEvent((forceBreak: boolean) => {
-    // Ignore if `forceBreak` but is not recording
-    if (forceBreak && !recording) {
+  useEffect(() => cancel, [cancel]);
+
+  const finish = useCallback(
+    async (session: DictationSession) => {
+      if (sessionRef.current !== session || session.finalizing) return;
+      session.finalizing = true;
+      clearTimeout(session.timer);
+      setSpeechStatus("transcribing");
+      try {
+        await session.capture.stop();
+        const samples = mergePcmChunks(session.chunks);
+        if (!samples.length) {
+          throw new Error("empty-audio");
+        }
+        const file = createVoiceRecordingFile(samples);
+        session.abortController = new AbortController();
+        const text = await transcribeRecording(
+          file,
+          undefined,
+          fetch,
+          session.abortController.signal,
+        );
+        if (sessionRef.current === session && text) {
+          sessionRef.current = null;
+          setStream(null);
+          setSpeechStatus("idle");
+          onResult(text);
+        }
+      } catch (cause) {
+        if (sessionRef.current !== session) return;
+        sessionRef.current = null;
+        setStream(null);
+        setSpeechStatus("idle");
+        setError(
+          cause instanceof Error && cause.message === "empty-audio"
+            ? "未识别到语音，请靠近麦克风后重试。"
+            : TRANSCRIPTION_FAILED,
+        );
+      }
+    },
+    [onResult, setSpeechStatus],
+  );
+
+  const start = useCallback(async () => {
+    if (!supported || sessionRef.current) return;
+    if (!isVoiceTranscriptionConfigured()) {
+      setError(TRANSCRIPTION_NOT_CONFIGURED);
       return;
     }
-
-    forceBreakRef.current = forceBreak;
-
-    if (speechInControlled) {
-      // If in controlled mode, do nothing
-      onControlledRecordingChange?.(!recording);
-    } else {
-      ensureRecognition();
-
-      if (recognitionRef.current) {
-        if (recording) {
-          recognitionRef.current.stop();
-          onControlledRecordingChange?.(false);
-        } else {
-          recognitionRef.current.start();
-          onControlledRecordingChange?.(true);
+    setError("");
+    setSpeechStatus("requesting");
+    const session = {} as DictationSession;
+    const capture = new BrowserPcmCapture({
+      onSamples: (samples) => {
+        if (
+          sessionRef.current === session &&
+          statusRef.current === "listening"
+        ) {
+          session.chunks.push(samples);
         }
+      },
+      onDeviceEnded: () => void finish(session),
+      onStreamChange: (nextStream) => {
+        if (sessionRef.current === session) setStream(nextStream);
+      },
+    });
+    Object.assign(session, {
+      capture,
+      chunks: [],
+      abortController: null,
+      timer: setTimeout(() => {
+        if (sessionRef.current !== session) return;
+        cancel();
+        setError("启动语音输入超时，请检查麦克风权限后重试。");
+      }, 20_000),
+      finalizing: false,
+    });
+    sessionRef.current = session;
+    try {
+      await capture.start();
+      if (sessionRef.current !== session) {
+        await capture.stop();
+        return;
       }
+      clearTimeout(session.timer);
+      setSpeechStatus("listening");
+    } catch (cause) {
+      if (sessionRef.current !== session) return;
+      sessionRef.current = null;
+      clearTimeout(session.timer);
+      setStream(null);
+      setSpeechStatus("idle");
+      setError(captureErrorMessage(cause));
     }
-  });
+  }, [cancel, finish, setSpeechStatus, supported]);
 
-  return [mergedAllowSpeech, triggerSpeech, recording] as const;
+  const stop = useCallback(() => {
+    const session = sessionRef.current;
+    if (!session || statusRef.current !== "listening") return;
+    void finish(session);
+  }, [finish]);
+
+  return {
+    supported,
+    status,
+    preview: "",
+    error,
+    stream,
+    start,
+    stop,
+    cancel,
+  };
 }

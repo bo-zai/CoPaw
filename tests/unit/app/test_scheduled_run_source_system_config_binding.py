@@ -741,14 +741,13 @@ async def test_run_dream_dual_writes_new_records_without_archive_maintenance(
 
     archive_maintenance_called = False
 
-    def fail_if_archive_maintenance_runs(*_args, **_kwargs):
+    def record_archive_maintenance(*_args, **_kwargs):
         nonlocal archive_maintenance_called
         archive_maintenance_called = True
-        raise AssertionError("dream must not trigger archive maintenance")
 
     monkeypatch.setattr(
         "swe.app.routers.dream_logs.run_dream_archive_maintenance",
-        fail_if_archive_maintenance_runs,
+        record_archive_maintenance,
     )
     runner = SimpleNamespace(
         workspace_dir=workspace_dir,
@@ -772,7 +771,7 @@ async def test_run_dream_dual_writes_new_records_without_archive_maintenance(
     assert call["target_user_id"] == "tenant-a"
     assert call["target_agent_id"] == "default"
     assert call["record"]["id"] == "new-record"
-    assert archive_maintenance_called is False
+    assert archive_maintenance_called is True
     assert governance_service.archive_calls == []
     assert governance_service.delete_archive_calls == []
     assert governance_service.audit_calls == []

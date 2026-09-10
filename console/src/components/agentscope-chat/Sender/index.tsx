@@ -13,9 +13,10 @@ import { ActionButtonContext } from "./components/ActionButton";
 import ClearButton from "./components/ClearButton";
 import LoadingButton from "./components/LoadingButton";
 import SendButton from "./components/SendButton";
-import SpeechButton from "./components/SpeechButton";
+import DictationControl from "../DictationControl";
+import dictationStyles from "../DictationControl/index.module.less";
+import { appendChatInputText } from "../chatInputDraft";
 import Style from "./style";
-import useSpeech, { type AllowSpeech } from "./useSpeech";
 import ModeSelect from "./ModeSelect";
 import type {
   InputRef as AntdInputRef,
@@ -32,6 +33,8 @@ export type SubmitType = "enter" | "shiftEnter" | false;
 type TextareaProps = GetProps<typeof Input.TextArea>;
 type SuggestionItems = Exclude<GetProp<typeof Suggestion, "items">, () => void>;
 
+const SHOW_LENGTH_COUNTER = false;
+
 export interface SenderComponents {
   input?: React.ComponentType<TextareaProps>;
 }
@@ -42,7 +45,7 @@ export type ActionsRender = (
     components: {
       SendButton: React.ComponentType<ButtonProps>;
       ClearButton: React.ComponentType<ButtonProps>;
-      LoadingButton: React.ComponentType<ButtonProps>;
+      LoadingButton: typeof LoadingButton;
     };
   },
 ) => React.ReactNode;
@@ -189,6 +192,8 @@ export interface SenderProps
    * @descriptionEn Prefix UI
    */
   prefix?: React.ReactNode | React.ReactNode[];
+  /** Custom content or renderer for the send/stop action area. */
+  actions?: React.ReactNode | ActionsRender;
   /**
    * @description 头部 UI
    * @descriptionEn Header UI
@@ -293,7 +298,6 @@ const ForwardSender = React.forwardRef<SenderRef, SenderProps>((props, ref) => {
     onChange,
     onFocus,
     onBlur,
-    // @ts-ignore
     actions,
     onKeyPress,
     onKeyDown,
@@ -313,6 +317,7 @@ const ForwardSender = React.forwardRef<SenderRef, SenderProps>((props, ref) => {
   } = props;
 
   const [focus, setFocus] = useState(false);
+  const [speechRecording, setSpeechRecording] = useState(false);
   const autoSize = React.useMemo(() => ({ maxRows: 5, minRows: 2 }), []);
 
   const { direction, getPrefixCls } = useProviderContext();
@@ -398,12 +403,6 @@ const ForwardSender = React.forwardRef<SenderRef, SenderProps>((props, ref) => {
     }
   };
 
-  const [speechPermission, triggerSpeech, speechRecording] = useSpeech(
-    (transcript) => {
-      triggerValueChange(`${innerValue} ${transcript}`);
-    },
-    allowSpeech,
-  );
   const hasSuggestions =
     !skillMentions && Array.isArray(suggestions) && suggestions.length > 0;
   const slashCommandKeyword = React.useMemo(
@@ -541,15 +540,32 @@ const ForwardSender = React.forwardRef<SenderRef, SenderProps>((props, ref) => {
     );
   }, [props.prefix]);
 
-  let actionNode: React.ReactNode = (
-    <Flex className={`${actionListCls}-presets`}>
-      {loading ? (
-        <LoadingButton loading={loading} disabled={!!disabled} />
-      ) : (
-        <SendButton disabled={!!disabled} />
-      )}
-    </Flex>
+  const dictationControl = allowSpeech ? (
+    <DictationControl
+      disabled={!!disabled || !!readOnly || !!loading}
+      onActiveChange={setSpeechRecording}
+      onTranscript={(text) => {
+        const next = appendChatInputText(innerValue, text);
+        triggerValueChange(
+          props.maxLength ? next.slice(0, props.maxLength) : next,
+        );
+        (tokenEditorRef.current || inputRef.current)?.focus();
+      }}
+    />
+  ) : null;
+  const defaultActionNode = (
+    <>
+      {dictationControl}
+      <Flex className={`${actionListCls}-presets`}>
+        {loading ? (
+          <LoadingButton loading={loading} disabled={!!disabled} />
+        ) : (
+          <SendButton disabled={!!disabled} />
+        )}
+      </Flex>
+    </>
   );
+  let actionNode: React.ReactNode = defaultActionNode;
 
   if (typeof actions === "function") {
     actionNode = actions(actionNode, {
@@ -560,7 +576,12 @@ const ForwardSender = React.forwardRef<SenderRef, SenderProps>((props, ref) => {
       },
     });
   } else if (actions) {
-    actionNode = actions;
+    actionNode = (
+      <>
+        {dictationControl}
+        {actions}
+      </>
+    );
   }
 
   const contextValue = {
@@ -568,13 +589,14 @@ const ForwardSender = React.forwardRef<SenderRef, SenderProps>((props, ref) => {
     onSend: triggerSend,
     onSendDisabled:
       ((!innerValue || !innerValue.trim()) && !allowEmptySubmit) ||
-      sendDisabled,
+      sendDisabled ||
+      speechRecording,
     onClear: triggerClear,
     onClearDisabled: !innerValue,
     onCancel,
     onCancelDisabled: !loading,
-    onSpeech: () => triggerSpeech(false),
-    onSpeechDisabled: !speechPermission,
+    onSpeech: () => undefined,
+    onSpeechDisabled: true,
     speechRecording,
     disabled: !!disabled,
   };
@@ -675,8 +697,6 @@ const ForwardSender = React.forwardRef<SenderRef, SenderProps>((props, ref) => {
               suggestionProps?.onTrigger?.(false);
             }
           }
-
-          triggerSpeech(true);
         }}
         onKeyPress={onKeyPress}
         onPressEnter={onInternalPressEnter}
@@ -756,34 +776,37 @@ const ForwardSender = React.forwardRef<SenderRef, SenderProps>((props, ref) => {
           )}
 
           <div className={`${prefixCls}-content-bottom`}>
-            {prefix.length > 0 && (
-              <div
-                className={classnames(`${prefixCls}-prefix`, classNames.prefix)}
-                style={styles.prefix}
-              >
-                <Flex gap={8}>
-                  {/* {allowSpeech && (
-                    <ActionButtonContext.Provider value={contextValue}>
-                      <SpeechButton />
-                    </ActionButtonContext.Provider>
-                  )} */}
-                  {prefix}
-                </Flex>
-              </div>
-            )}
-            <div
-              className={classnames(actionListCls, classNames.actions)}
-              style={styles.actions}
-            >
-              {props.maxLength ? (
-                <div className={`${actionListCls}-length`}>
-                  {Math.min(innerValue.length, props.maxLength)}/
-                  {props.maxLength}
+            <div className={dictationStyles.toolbar}>
+              {!speechRecording && prefix.length > 0 && (
+                <div
+                  className={classnames(
+                    `${prefixCls}-prefix`,
+                    classNames.prefix,
+                  )}
+                  style={styles.prefix}
+                >
+                  <Flex gap={8}>{prefix}</Flex>
                 </div>
-              ) : null}
-              <ActionButtonContext.Provider value={contextValue}>
-                {actionNode}
-              </ActionButtonContext.Provider>
+              )}
+              <div
+                className={classnames(
+                  actionListCls,
+                  classNames.actions,
+                  dictationStyles.send,
+                  speechRecording && dictationStyles.actionGroupActive,
+                )}
+                style={styles.actions}
+              >
+                {SHOW_LENGTH_COUNTER && props.maxLength ? (
+                  <div className={`${actionListCls}-length`}>
+                    {Math.min(innerValue.length, props.maxLength)}/
+                    {props.maxLength}
+                  </div>
+                ) : null}
+                <ActionButtonContext.Provider value={contextValue}>
+                  {actionNode}
+                </ActionButtonContext.Provider>
+              </div>
             </div>
           </div>
         </div>

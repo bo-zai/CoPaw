@@ -7,4 +7,10 @@ describe("Console navigation constants", () => {
     expect(KEY_TO_PATH["hook-management"]).toBe("/hook-management");
     expect(KEY_TO_LABEL["hook-management"]).toBe("nav.hookManagement");
   });
+
+  it("maps Scenario preset management into the System Settings route", () => {
+    expect(KEY_TO_PATH["scenario-presets-management"]).toBe(
+      "/scenario-presets-management",
+    );
+  });
 });

@@ -13,7 +13,7 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -110,6 +110,8 @@ class _ActiveRun:
     scope: BackgroundSubAgentScope
     process: Any
     stderr_log_path: Path
+    parent_chat_id: str = ""
+    parent_msgid: str = ""
 
 
 def _worker_parent_agent_config(
@@ -177,6 +179,8 @@ class BackgroundSubAgentSupervisor:
         runtime_policy: PermissionPolicy | None = None,
         request_context: dict[str, Any] | None = None,
         effective_skill_names: list[str] | None = None,
+        skill_snapshot_signatures: dict[str, str] | None = None,
+        skill_snapshot_dirs: Mapping[str, Path] | None = None,
         definition: SubAgentDefinition | None = None,
         start_request: SubAgentStartRequest | None = None,
         definition_match: DefinitionMatchMetadata | None = None,
@@ -202,6 +206,7 @@ class BackgroundSubAgentSupervisor:
         effective_budget = _effective_budget(definition.budget, spec.budget)
         nickname = assign_subagent_nickname(definition.nickname)
         run_id = f"subagent-{uuid4().hex[:12]}"
+        parent_skill_snapshot_dirs = skill_snapshot_dirs
         try:
             session_dependency_view = resolve_community_expert_dependency_view(
                 workspace_dir=workspace_dir,
@@ -213,10 +218,11 @@ class BackgroundSubAgentSupervisor:
             )
             if session_dependency_view is not None:
                 (
-                    skill_snapshot_dirs,
+                    snapshotted_skill_paths,
                     private_mcp_snapshot_path,
                     diagnostics,
-                ) = capture_community_expert_session_dependencies(
+                ) = await asyncio.to_thread(
+                    capture_community_expert_session_dependencies,
                     run_store_dir=scope.run_store_dir,
                     run_id=run_id,
                     dependency_view_root=session_dependency_view,
@@ -224,15 +230,20 @@ class BackgroundSubAgentSupervisor:
                     parent_agent_config=parent_agent_config,
                 )
             else:
-                skill_snapshot_dirs, private_mcp_snapshot_path, diagnostics = (
-                    capture_launch_dependencies(
-                        run_store_dir=scope.run_store_dir,
-                        run_id=run_id,
-                        workspace_dir=workspace_dir,
-                        parent_agent_config=parent_agent_config,
-                        definition=definition,
-                        effective_skill_names=effective_skill_names or [],
-                    )
+                (
+                    snapshotted_skill_paths,
+                    private_mcp_snapshot_path,
+                    diagnostics,
+                ) = await asyncio.to_thread(
+                    capture_launch_dependencies,
+                    run_store_dir=scope.run_store_dir,
+                    run_id=run_id,
+                    workspace_dir=workspace_dir,
+                    parent_agent_config=parent_agent_config,
+                    definition=definition,
+                    effective_skill_names=effective_skill_names or [],
+                    skill_snapshot_signatures=skill_snapshot_signatures,
+                    skill_snapshot_dirs=parent_skill_snapshot_dirs,
                 )
         except OSError as exc:
             record = await store.create(
@@ -327,7 +338,7 @@ class BackgroundSubAgentSupervisor:
             request_context=worker_context,
             stderr_log_path=str(stderr_log_path),
             launch_snapshot=SubAgentLaunchSnapshot(
-                skill_snapshot_dirs=skill_snapshot_dirs,
+                skill_snapshot_dirs=snapshotted_skill_paths,
                 private_mcp_snapshot_path=private_mcp_snapshot_path,
                 private_model_snapshot_path=private_model_snapshot_path,
             ),
@@ -398,8 +409,38 @@ class BackgroundSubAgentSupervisor:
             scope=scope,
             process=process,
             stderr_log_path=stderr_log_path,
+            parent_chat_id=spec.parent_chat_id,
+            parent_msgid=spec.parent_msgid,
         )
         return running
+
+    async def cancel_turn_runs(
+        self,
+        scope: BackgroundSubAgentScope,
+        *,
+        chat_id: str,
+        msgid: str,
+    ) -> list[str]:
+        """Best-effort cancel active runs owned by one chat answer turn."""
+        if not chat_id or not msgid:
+            return []
+        await self._reap_scope(scope)
+        active = self._active_for_scope(scope)
+        run_ids = [
+            run_id
+            for run_id, handle in active.items()
+            if handle.parent_chat_id == chat_id
+            and handle.parent_msgid == msgid
+        ]
+        cancelled: list[str] = []
+        for run_id in run_ids:
+            result = await self.cancel(scope, run_id)
+            if result is not None and not isinstance(
+                result,
+                BackgroundSubAgentNotManageable,
+            ):
+                cancelled.append(run_id)
+        return cancelled
 
     async def wait(
         self,
@@ -431,7 +472,9 @@ class BackgroundSubAgentSupervisor:
         active = self._active_for_scope(scope)
         handle = active.get(run_id)
         if handle is None:
-            return await PerRunSubAgentRunStore(scope.run_store_dir).get(run_id)
+            return await PerRunSubAgentRunStore(scope.run_store_dir).get(
+                run_id,
+            )
         await asyncio.to_thread(handle.process.wait)
         terminal_runs = await self._reap_scope(scope)
         return next(

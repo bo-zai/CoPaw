@@ -67,6 +67,12 @@ _ALLOWED_ZIP_TYPES = {
 }
 
 
+async def _flush_skill_scan_history(request: Request) -> None:
+    recorder = getattr(request.app.state, "skill_scan_history_recorder", None)
+    if recorder is not None:
+        await recorder.flush()
+
+
 async def _read_validated_zip_upload(file: UploadFile) -> bytes:
     """Validate and read uploaded zip file."""
     if file.content_type and file.content_type not in _ALLOWED_ZIP_TYPES:
@@ -203,10 +209,21 @@ def _extract_zip_skills(
 
 def _scan_found_skills_or_raise(
     found_skills: list[tuple[Path, str]],
+    *,
+    source_id: str = "",
+    user_id: str = "",
+    bbk_id: str = "",
 ) -> None:
     """强制扫描解包后的技能目录，命中高危时阻断导入."""
     for skill_dir, skill_name in found_skills:
-        scan_skill_directory(skill_dir, skill_name=skill_name, block=True)
+        scan_skill_directory(
+            skill_dir,
+            skill_name=skill_name,
+            block=True,
+            source_id=source_id,
+            user_id=user_id,
+            bbk_id=bbk_id,
+        )
 
 
 def _infer_skill_name_from_zip_filename(filename: str) -> str:
@@ -549,7 +566,12 @@ def _import_skill_from_zip(
 
     try:
         tmp_dir, found_skills = _extract_zip_skills(data, zip_filename)
-        _scan_found_skills_or_raise(found_skills)
+        _scan_found_skills_or_raise(
+            found_skills,
+            source_id=source_id,
+            user_id=user_id,
+            bbk_id=bbk_id,
+        )
         existing_names = _get_existing_skill_names(skills_dir)
 
         for skill_dir, original_name in found_skills:
@@ -1334,21 +1356,25 @@ async def upload_skill_to_workspace(
     data = await _read_validated_zip_upload(file)
 
     # Import skill
-    result = await asyncio.to_thread(
-        _import_skill_from_zip,
-        skills_dir,
-        data,
-        x_user_id,
-        user_name,
-        bbk_id,
-        overwrite=overwrite,
-        target_name=target_name,
-        rename_map=parsed_rename_map,
-        category_id=category_id,
-        zip_filename=file.filename,
-        cn_name=cn_name,
-        source_id=source_id,
-    )
+    try:
+        result = await asyncio.to_thread(
+            _import_skill_from_zip,
+            skills_dir,
+            data,
+            x_user_id,
+            user_name,
+            bbk_id,
+            overwrite=overwrite,
+            target_name=target_name,
+            rename_map=parsed_rename_map,
+            category_id=category_id,
+            zip_filename=file.filename,
+            cn_name=cn_name,
+            source_id=source_id,
+        )
+    except (SkillScanError, HTTPException):
+        await _flush_skill_scan_history(request)
+        raise
 
     # Log upload operation
     imported_skills = result.get("imported") or []
@@ -1768,6 +1794,7 @@ async def enable_my_skill(
     request: Request,
     x_source_id: Optional[str] = Header(default=None, alias="X-Source-Id"),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+    x_bbk_id: Optional[str] = Header(default=None, alias="X-Bbk-Id"),
     agent_id: str = "default",
 ):
     """启用技能（含安全扫描）."""
@@ -1787,9 +1814,16 @@ async def enable_my_skill(
     )
 
     svc = request.app.state.marketplace
-    result = await svc.enable_skill(x_user_id, skill_name, agent_id, source_id)
+    result = await svc.enable_skill(
+        x_user_id,
+        skill_name,
+        agent_id,
+        source_id,
+        x_bbk_id or "",
+    )
     if not result.get("success"):
         if result.get("reason") == "security_scan_failed":
+            await _flush_skill_scan_history(request)
             raise HTTPException(
                 status_code=422,
                 detail=result,
@@ -1894,6 +1928,7 @@ async def batch_enable_my_skills(
     request: Request,
     x_source_id: Optional[str] = Header(default=None, alias="X-Source-Id"),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+    x_bbk_id: Optional[str] = Header(default=None, alias="X-Bbk-Id"),
     agent_id: str = "default",
 ):
     """批量启用技能."""
@@ -1918,7 +1953,13 @@ async def batch_enable_my_skills(
         body.skills,
         agent_id,
         source_id,
+        x_bbk_id or "",
     )
+    if any(
+        result.get("reason") == "security_scan_failed"
+        for result in results.values()
+    ):
+        await _flush_skill_scan_history(request)
     success_count = sum(1 for r in results.values() if r.get("success"))
     return BatchOperationResponse(
         results=results,

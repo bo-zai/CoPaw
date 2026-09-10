@@ -31,19 +31,25 @@ import {
   Wrench,
   X,
 } from "lucide-react";
+import DOMPurify from "dompurify";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { wplusSopApi } from "@/api/modules/wplusSop";
 import type {
   WPlusSopAnswerValue,
+  WPlusSopArtifact,
   WPlusSopCommandType,
+  WPlusSopCumulativeArtifactIdentity,
+  WPlusSopCumulativePreview,
   WPlusSopCustomAnswerValue,
   WPlusSopMemoryCandidate,
   WPlusSopQuestion,
   WPlusSopSafeStreamTrace,
   WPlusSopSession,
   WPlusSopStage,
+  WPlusSopStageArtifactIdentity,
+  WPlusSopStageReport,
 } from "@/api/types/wplusSop";
 import { getToolDisplayName } from "@/components/agentscope-chat/AgentScopeRuntimeWebUI/core/AgentScopeRuntime/Response/ToolTitle";
 import {
@@ -116,132 +122,533 @@ interface ActiveSafeStreamTrace extends WPlusSopSafeStreamTrace {
   run_id: string;
 }
 
-function ResultPreview({
-  preview,
+type PreviewFormat = "html" | "markdown" | "json";
+
+const PREVIEW_FORMATS: Array<{ value: PreviewFormat; label: string }> = [
+  { value: "html", label: "HTML" },
+  { value: "markdown", label: "Markdown" },
+  { value: "json", label: "JSON" },
+];
+
+const FINAL_PREVIEW_ARTIFACT_IDS = new Set([
+  "sop_spec",
+  "sop_render_md",
+  "sop_render_html",
+]);
+const HTML_PREVIEW_CSP =
+  "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; font-src data:";
+
+function sanitizeHtmlPreview(body: string): string {
+  const sanitized = DOMPurify.sanitize(body, {
+    FORBID_TAGS: ["script", "link", "meta", "iframe", "object", "embed"],
+    FORBID_ATTR: ["srcdoc"],
+  });
+  return `<meta http-equiv="Content-Security-Policy" content="${HTML_PREVIEW_CSP}">${sanitized}`;
+}
+
+function artifactFormat(artifact: WPlusSopArtifact): PreviewFormat | null {
+  if (artifact.format === "html" || artifact.format === "json") {
+    return artifact.format;
+  }
+  return artifact.format === "markdown" || artifact.format === "md"
+    ? "markdown"
+    : null;
+}
+
+function firstPreviewFormat(
+  artifacts: WPlusSopArtifact[],
+): PreviewFormat | null {
+  for (const format of PREVIEW_FORMATS) {
+    if (
+      artifacts.some((artifact) => artifactFormat(artifact) === format.value)
+    ) {
+      return format.value;
+    }
+  }
+  return null;
+}
+
+function previewBody(
+  format: PreviewFormat,
+  body: string,
+): {
+  content: string;
+  formattingWarning: boolean;
+} {
+  if (format !== "json") return { content: body, formattingWarning: false };
+  try {
+    return {
+      content: JSON.stringify(JSON.parse(body), null, 2),
+      formattingWarning: false,
+    };
+  } catch {
+    return { content: body, formattingWarning: true };
+  }
+}
+
+function ArtifactPreview({
+  artifacts,
+  identityKey,
+  title,
+  loadArtifact,
+  pendingDownloadKeys,
+  artifactDownloadKey,
+  canDownloadArtifact = () => true,
+  onDownload,
 }: {
-  preview: WPlusSopSession["result_preview"];
+  artifacts: WPlusSopArtifact[];
+  identityKey: string;
+  title: string;
+  loadArtifact: (
+    artifact: WPlusSopArtifact,
+    signal: AbortSignal,
+  ) => Promise<string>;
+  pendingDownloadKeys: ReadonlySet<string>;
+  artifactDownloadKey: (artifact: WPlusSopArtifact) => string;
+  canDownloadArtifact?: (artifact: WPlusSopArtifact) => boolean;
+  onDownload: (artifact: WPlusSopArtifact) => void;
 }) {
-  const [remoteMarkdown, setRemoteMarkdown] = useState<string | null>(null);
-  const [markdownFailed, setMarkdownFailed] = useState(false);
-  const [markdownLoading, setMarkdownLoading] = useState(false);
-  const [remoteHtml, setRemoteHtml] = useState<string | null>(null);
-  const [htmlFailed, setHtmlFailed] = useState(false);
-  const [htmlLoading, setHtmlLoading] = useState(false);
-  const markdownUrl = preview?.markdown_url || null;
-  const htmlUrl = preview?.html_url || null;
+  const availableArtifacts = useMemo(
+    () =>
+      artifacts.filter(
+        (artifact) =>
+          artifact.status === "validated" && artifactFormat(artifact),
+      ),
+    [artifacts],
+  );
+  const initialFormat = firstPreviewFormat(availableArtifacts);
+  const [selectedFormat, setSelectedFormat] = useState<PreviewFormat | null>(
+    initialFormat,
+  );
+  const [loadedBody, setLoadedBody] = useState<{
+    requestKey: string;
+    content: string;
+  } | null>(null);
+  const [status, setStatus] = useState<"loading" | "ready" | "error" | "empty">(
+    "loading",
+  );
+  const [retryToken, setRetryToken] = useState(0);
+  const loadArtifactRef = useRef(loadArtifact);
+  const requestRef = useRef<{
+    requestKey: string;
+    artifact: WPlusSopArtifact;
+  } | null>(null);
 
   useEffect(() => {
-    setRemoteMarkdown(null);
-    setMarkdownFailed(false);
-    setMarkdownLoading(Boolean(markdownUrl));
-    if (!markdownUrl) return;
+    loadArtifactRef.current = loadArtifact;
+  }, [loadArtifact]);
 
+  useEffect(() => {
+    setSelectedFormat(firstPreviewFormat(availableArtifacts));
+  }, [availableArtifacts, identityKey]);
+
+  const selectedArtifact = availableArtifacts.find(
+    (artifact) => artifactFormat(artifact) === selectedFormat,
+  );
+  const requestKey = selectedArtifact
+    ? `${identityKey}:${selectedFormat || ""}:${selectedArtifact.artifact_id}:${
+        selectedArtifact.sha256 || ""
+      }`
+    : null;
+  requestRef.current =
+    requestKey && selectedArtifact
+      ? { requestKey, artifact: selectedArtifact }
+      : null;
+
+  useEffect(() => {
+    setLoadedBody(null);
+    const request = requestRef.current;
+    if (!requestKey || !request || request.requestKey !== requestKey) {
+      setStatus("empty");
+      return;
+    }
     const controller = new AbortController();
     let disposed = false;
-    void fetch(markdownUrl, { signal: controller.signal, cache: "no-store" })
-      .then((response) => {
-        if (!response.ok) throw new Error("Markdown preview request failed");
-        return response.text();
-      })
-      .then((body) => {
+    setStatus("loading");
+    void loadArtifactRef
+      .current(request.artifact, controller.signal)
+      .then((content) => {
         if (!disposed) {
-          setRemoteMarkdown(body);
-          setMarkdownLoading(false);
+          setLoadedBody({ requestKey, content });
+          setStatus(content ? "ready" : "empty");
         }
       })
       .catch((error: unknown) => {
         if (error instanceof Error && error.name === "AbortError") return;
-        if (!disposed) {
-          setMarkdownFailed(true);
-          setMarkdownLoading(false);
-        }
+        if (!disposed) setStatus("error");
       });
     return () => {
       disposed = true;
       controller.abort();
     };
-  }, [markdownUrl, preview?.markdown_sha256]);
+  }, [requestKey, retryToken]);
 
-  useEffect(() => {
-    setRemoteHtml(null);
-    setHtmlFailed(false);
-    setHtmlLoading(Boolean(htmlUrl));
-    if (!htmlUrl) return;
-
-    const controller = new AbortController();
-    let disposed = false;
-    void fetch(htmlUrl, { signal: controller.signal, cache: "no-store" })
-      .then((response) => {
-        if (!response.ok) throw new Error("HTML preview request failed");
-        return response.text();
-      })
-      .then((body) => {
-        if (!disposed) {
-          setRemoteHtml(body);
-          setHtmlLoading(false);
-        }
-      })
-      .catch((error: unknown) => {
-        if (error instanceof Error && error.name === "AbortError") return;
-        if (!disposed) {
-          setHtmlFailed(true);
-          setHtmlLoading(false);
-        }
-      });
-    return () => {
-      disposed = true;
-      controller.abort();
-    };
-  }, [htmlUrl, preview?.html_sha256]);
-
-  const markdown = preview?.markdown_url
-    ? remoteMarkdown
-    : preview?.markdown || null;
-  const html = preview?.html_url ? remoteHtml : preview?.html || null;
+  const body = loadedBody?.requestKey === requestKey ? loadedBody.content : "";
+  const renderStatus = status === "ready" && !body ? "loading" : status;
+  const formatted = selectedFormat ? previewBody(selectedFormat, body) : null;
+  const formatLabel =
+    PREVIEW_FORMATS.find(({ value }) => value === selectedFormat)?.label ||
+    "产物";
 
   return (
-    <div className={styles.resultPreviewGrid}>
-      <article
-        aria-busy={markdownLoading}
+    <section className={styles.artifactPreview} aria-label={`${title}文件预览`}>
+      <div className={styles.artifactPreviewToolbar}>
+        <div
+          role="group"
+          aria-label={`${title}预览格式`}
+          className={styles.artifactFormatTabs}
+        >
+          {PREVIEW_FORMATS.map(({ value, label }) => {
+            const available = availableArtifacts.some(
+              (artifact) => artifactFormat(artifact) === value,
+            );
+            return (
+              <Button
+                key={value}
+                type={selectedFormat === value ? "primary" : "default"}
+                disabled={!available}
+                aria-pressed={selectedFormat === value}
+                onClick={() => setSelectedFormat(value)}
+              >
+                {label}
+              </Button>
+            );
+          })}
+        </div>
+        <Button
+          disabled={!selectedArtifact || !canDownloadArtifact(selectedArtifact)}
+          loading={Boolean(
+            selectedArtifact &&
+              pendingDownloadKeys.has(artifactDownloadKey(selectedArtifact)),
+          )}
+          onClick={() => selectedArtifact && onDownload(selectedArtifact)}
+        >
+          下载 {formatLabel}
+        </Button>
+      </div>
+      <div
+        className={styles.artifactPreviewBody}
+        aria-busy={renderStatus === "loading"}
         aria-live="polite"
-        className={styles.resultPreviewCard}
       >
-        <h3>Markdown 预览</h3>
-        <pre>
-          {markdown ||
-            (markdownLoading
-              ? "Markdown 预览加载中…"
-              : markdownFailed
-              ? "Markdown 预览加载失败。"
-              : "暂无 Markdown 结果。")}
-        </pre>
-      </article>
-      <article
-        aria-busy={htmlLoading}
-        aria-live="polite"
-        className={styles.resultPreviewCard}
-      >
-        <h3>HTML 预览</h3>
-        {html ? (
+        {renderStatus === "loading" && (
+          <p role="status">{formatLabel} 预览加载中…</p>
+        )}
+        {renderStatus === "error" && (
+          <div className={styles.artifactPreviewState} role="alert">
+            <p>{formatLabel} 预览加载失败。</p>
+            <Button
+              icon={<RefreshCw size={15} />}
+              onClick={() => setRetryToken((value) => value + 1)}
+            >
+              重试 {formatLabel} 预览
+            </Button>
+          </div>
+        )}
+        {renderStatus === "empty" && (
+          <Empty description={`暂无 ${formatLabel} 结果`} />
+        )}
+        {renderStatus === "ready" && selectedFormat === "html" && (
           <iframe
             className={styles.htmlPreview}
-            title="HTML 结果预览"
+            title={`HTML ${title}预览`}
             sandbox=""
-            srcDoc={html}
-          />
-        ) : (
-          <Empty
-            description={
-              htmlLoading
-                ? "HTML 预览加载中…"
-                : htmlFailed
-                ? "HTML 预览加载失败。"
-                : "暂无 HTML 结果"
-            }
+            srcDoc={sanitizeHtmlPreview(body)}
           />
         )}
+        {renderStatus === "ready" && selectedFormat !== "html" && formatted && (
+          <>
+            {formatted.formattingWarning && (
+              <Alert
+                type="warning"
+                showIcon
+                message="JSON 内容无法格式化，以下展示原始内容。"
+              />
+            )}
+            <pre>{formatted.content}</pre>
+          </>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function ResultPreview({
+  sessionId,
+  artifacts,
+  preview,
+  pendingDownloadKeys,
+  onDownload,
+}: {
+  sessionId: string;
+  artifacts: WPlusSopArtifact[];
+  preview: WPlusSopSession["result_preview"];
+  pendingDownloadKeys: ReadonlySet<string>;
+  onDownload: (artifact: WPlusSopArtifact) => void;
+}) {
+  const previewArtifacts = useMemo(() => {
+    const validated = artifacts.filter(
+      (artifact) =>
+        FINAL_PREVIEW_ARTIFACT_IDS.has(artifact.artifact_id) &&
+        artifact.status === "validated" &&
+        artifactFormat(artifact),
+    );
+    if (validated.length) return validated;
+    const fallback: WPlusSopArtifact[] = [];
+    if (preview?.html) {
+      fallback.push({
+        artifact_id: "legacy_result_html",
+        name: "sop_render.html",
+        format: "html",
+        status: "validated",
+      });
+    }
+    if (preview?.markdown) {
+      fallback.push({
+        artifact_id: "legacy_result_markdown",
+        name: "sop_render.md",
+        format: "markdown",
+        status: "validated",
+      });
+    }
+    return fallback;
+  }, [artifacts, preview?.html, preview?.markdown]);
+
+  const loadArtifact = useCallback(
+    (artifact: WPlusSopArtifact, signal: AbortSignal) => {
+      if (artifact.artifact_id === "legacy_result_html") {
+        return Promise.resolve(preview?.html || "");
+      }
+      if (artifact.artifact_id === "legacy_result_markdown") {
+        return Promise.resolve(preview?.markdown || "");
+      }
+      return wplusSopApi.readArtifact(sessionId, artifact.artifact_id, signal);
+    },
+    [preview?.html, preview?.markdown, sessionId],
+  );
+
+  return (
+    <ArtifactPreview
+      artifacts={previewArtifacts}
+      identityKey={`final:${sessionId}:${preview?.markdown_sha256 || ""}:${
+        preview?.html_sha256 || ""
+      }`}
+      title="最终 SOP "
+      loadArtifact={loadArtifact}
+      pendingDownloadKeys={pendingDownloadKeys}
+      artifactDownloadKey={(artifact) => `final:${artifact.artifact_id}`}
+      canDownloadArtifact={(artifact) =>
+        !artifact.artifact_id.startsWith("legacy_result_")
+      }
+      onDownload={onDownload}
+    />
+  );
+}
+
+function StageReportPanel({
+  sessionId,
+  reports,
+  currentStageId,
+  selectedReportKey,
+  onSelectedReportChange,
+  pendingDownloadKeys,
+  onDownload,
+}: {
+  sessionId: string;
+  reports: WPlusSopStageReport[];
+  currentStageId: string | null;
+  selectedReportKey: string | null;
+  onSelectedReportChange: (reportKey: string, latest: boolean) => void;
+  pendingDownloadKeys: ReadonlySet<string>;
+  onDownload: (report: WPlusSopStageReport, artifact: WPlusSopArtifact) => void;
+}) {
+  const currentReports = useMemo(
+    () =>
+      reports
+        .filter((report) => report.stage_id === currentStageId)
+        .sort(
+          (left, right) =>
+            right.revision - left.revision || right.report_no - left.report_no,
+        ),
+    [reports, currentStageId],
+  );
+  if (!currentReports.length) {
+    return (
+      <Alert
+        type="info"
+        showIcon
+        message="环节报告尚未生成"
+        description="预跑成功后会生成当前环节的 JSON、Markdown 与 HTML 报告，供你审阅后再确认。"
+      />
+    );
+  }
+  const latestReport =
+    currentReports.find(
+      (report) =>
+        report.superseded_by === null || report.superseded_by === undefined,
+    ) || currentReports[0];
+  const reportKey = (report: WPlusSopStageReport) =>
+    `${report.revision}:${report.report_no}`;
+  const selectedReport =
+    currentReports.find((report) => reportKey(report) === selectedReportKey) ||
+    latestReport;
+  const selectedIsLatest = selectedReport === latestReport;
+  const stageIdentity = (
+    artifact: WPlusSopArtifact,
+  ): WPlusSopStageArtifactIdentity => ({
+    stageId: selectedReport.stage_id,
+    revision: selectedReport.revision,
+    reportNo: selectedReport.report_no,
+    artifactId: artifact.artifact_id,
+  });
+  return (
+    <div className={styles.stageReportList}>
+      <div
+        className={styles.stageReportVersionBar}
+        role="group"
+        aria-label="环节报告版本"
+      >
+        {currentReports.map((report) => {
+          const latest = report === latestReport;
+          return (
+            <Button
+              key={reportKey(report)}
+              type={selectedReport === report ? "primary" : "default"}
+              aria-pressed={selectedReport === report}
+              aria-label={`查看版本 v${report.report_no}（修订 ${report.revision}）`}
+              onClick={() => onSelectedReportChange(reportKey(report), latest)}
+            >
+              v{report.report_no} · 修订 {report.revision}
+            </Button>
+          );
+        })}
+      </div>
+      <article
+        className={styles.stageReportItem}
+        data-latest={selectedIsLatest}
+      >
+        <div className={styles.stageReportMeta}>
+          <div>
+            <strong>
+              版本 v{selectedReport.report_no}
+              {selectedIsLatest ? "（最新）" : "（历史只读）"}
+            </strong>
+            <small>
+              修订 {selectedReport.revision} ·{" "}
+              {new Date(selectedReport.created_at).toLocaleString()}
+            </small>
+          </div>
+          <Space wrap>
+            <Tag color={selectedIsLatest ? "green" : "default"}>
+              {selectedIsLatest ? "最新版本" : "已被取代"}
+            </Tag>
+            {!selectedReport.artifacts.every(
+              (artifact) => artifact.status === "validated",
+            ) && <Tag color="warning">校验未完成</Tag>}
+          </Space>
+        </div>
+        {!selectedIsLatest && (
+          <Alert
+            type="info"
+            showIcon
+            message="历史版本只读，不能用于确认环节。"
+          />
+        )}
+        <ArtifactPreview
+          artifacts={selectedReport.artifacts}
+          identityKey={`stage:${sessionId}:${selectedReport.stage_id}:${selectedReport.revision}:${selectedReport.report_no}`}
+          title={`阶段 SOP v${selectedReport.report_no} `}
+          loadArtifact={(artifact, signal) =>
+            wplusSopApi.readStageReportArtifact(
+              sessionId,
+              stageIdentity(artifact),
+              signal,
+            )
+          }
+          pendingDownloadKeys={pendingDownloadKeys}
+          artifactDownloadKey={(artifact) =>
+            `stage:${selectedReport.stage_id}:${selectedReport.revision}:${selectedReport.report_no}:${artifact.artifact_id}`
+          }
+          onDownload={(artifact) => onDownload(selectedReport, artifact)}
+        />
       </article>
     </div>
+  );
+}
+
+function CumulativePreviewPanel({
+  sessionId,
+  preview,
+  stages,
+  pendingDownloadKeys,
+  onDownload,
+}: {
+  sessionId: string;
+  preview: WPlusSopCumulativePreview | null | undefined;
+  stages: WPlusSopStage[];
+  pendingDownloadKeys: ReadonlySet<string>;
+  onDownload: (
+    preview: WPlusSopCumulativePreview,
+    artifact: WPlusSopArtifact,
+  ) => void;
+}) {
+  if (!preview) {
+    return null;
+  }
+  const stageTitle = (stageId: string): string =>
+    stages.find((stage) => stage.stage_id === stageId)?.title || stageId;
+  return (
+    <section className={styles.workSection}>
+      <div className={styles.sectionHeading}>
+        <div>
+          <span className={styles.eyebrow}>累计 SOP 预览</span>
+          <h2>已确认内容（累计 v{preview.preview_version}）</h2>
+          <p>以下环节已确认并立即纳入累计结果；未确认环节不会出现在这里。</p>
+        </div>
+        <Tag color="cyan">实时累计</Tag>
+      </div>
+      <ol className={styles.cumulativeOrder}>
+        {preview.stage_order.map((stageId, index) => {
+          const snapshot = preview.snapshots.find(
+            (candidate) => candidate.stage_id === stageId,
+          );
+          return (
+            <li key={stageId}>
+              <span>{String(index + 1).padStart(2, "0")}</span>
+              <div>
+                <strong title={stageTitle(stageId)}>
+                  {stageTitle(stageId)}
+                </strong>
+                <small>
+                  已确认版本 v{snapshot?.report_no ?? "—"} · 修订{" "}
+                  {snapshot?.revision ?? "—"}
+                </small>
+              </div>
+            </li>
+          );
+        })}
+      </ol>
+      <ArtifactPreview
+        artifacts={preview.artifacts}
+        identityKey={`cumulative:${sessionId}:${preview.preview_version}`}
+        title={`累计 SOP v${preview.preview_version} `}
+        loadArtifact={(artifact, signal) =>
+          wplusSopApi.readCumulativeArtifact(
+            sessionId,
+            {
+              previewVersion: preview.preview_version,
+              artifactId: artifact.artifact_id,
+            },
+            signal,
+          )
+        }
+        pendingDownloadKeys={pendingDownloadKeys}
+        artifactDownloadKey={(artifact) =>
+          `cumulative:${preview.preview_version}:${artifact.artifact_id}`
+        }
+        onDownload={(artifact) => onDownload(preview, artifact)}
+      />
+    </section>
   );
 }
 
@@ -408,6 +815,8 @@ function isGenerating(session: WPlusSopSession): boolean {
     "GeneratingQuestions",
     "GeneratingTrial",
     "ExecutingTrial",
+    "GeneratingStageReport",
+    "RefreshingCumulative",
     "FinalizingOutputs",
     "WritingMemory",
     "PendingExit",
@@ -432,6 +841,12 @@ function conclusionMilestoneProjection(session: WPlusSopSession): {
 } {
   if (session.state === "Completed") {
     return { status: "confirmed", label: "已完成" };
+  }
+  if (session.state === "GeneratingStageReport") {
+    return { status: "current", label: "生成环节报告" };
+  }
+  if (session.state === "RefreshingCumulative") {
+    return { status: "current", label: "刷新累计" };
   }
   if (session.state === "FinalizingOutputs") {
     return { status: "current", label: "生成中" };
@@ -588,9 +1003,9 @@ function StageQueueEditor({
           icon={<Check size={16} />}
           loading={busy}
           disabled={
-            !validation.valid
-            || session.state !== "AwaitingQueueConfirmation"
-            || !runtimeReady
+            !validation.valid ||
+            session.state !== "AwaitingQueueConfirmation" ||
+            !runtimeReady
           }
           onClick={onConfirm}
         >
@@ -958,9 +1373,7 @@ function TrialPanel({
               disabled={!feedback.trim() || !runtimeReady}
               onClick={onRerun}
             >
-              {runtimeReady
-                ? "提交反馈并重新预跑"
-                : "正在完成上一轮处理"}
+              {runtimeReady ? "提交反馈并重新预跑" : "正在完成上一轮处理"}
             </Button>
           </div>
         </div>
@@ -1043,6 +1456,7 @@ export default function WPlusSopWorkspace() {
     values: {},
   });
   const [feedback, setFeedback] = useState("");
+  const [stageReportFeedback, setStageReportFeedback] = useState("");
   const [memoryDecisionDraft, setMemoryDecisionDraft] =
     useState<MemoryDecisionDraft>({
       scope: null,
@@ -1053,11 +1467,46 @@ export default function WPlusSopWorkspace() {
   const [evidenceDrawerOpen, setEvidenceDrawerOpen] = useState(false);
   const [safeStreamTrace, setSafeStreamTrace] =
     useState<ActiveSafeStreamTrace | null>(null);
-  const [downloadingArtifactId, setDownloadingArtifactId] = useState<
+  const [pendingDownloadKeys, setPendingDownloadKeys] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const downloadControllersRef = useRef(new Map<string, AbortController>());
+  const [selectedStageReportKey, setSelectedStageReportKey] = useState<
     string | null
   >(null);
+  const [selectedStageReportIsLatest, setSelectedStageReportIsLatest] =
+    useState(true);
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
+  const stageReportScope = useMemo(() => {
+    const latest = (session?.stage_reports || [])
+      .filter(
+        (report) =>
+          report.stage_id === session?.current_stage_id &&
+          (report.superseded_by === null || report.superseded_by === undefined),
+      )
+      .sort((left, right) => right.report_no - left.report_no)[0];
+    return latest
+      ? `${session?.session_id}:${latest.stage_id}:${latest.revision}:${latest.report_no}`
+      : `${session?.session_id || ""}:${session?.current_stage_id || ""}`;
+  }, [session?.current_stage_id, session?.session_id, session?.stage_reports]);
+
+  useEffect(() => {
+    setSelectedStageReportKey(null);
+    setSelectedStageReportIsLatest(true);
+    setStageReportFeedback("");
+  }, [stageReportScope]);
+
+  useEffect(() => {
+    const controllers = downloadControllersRef.current;
+    controllers.forEach((controller) => controller.abort());
+    controllers.clear();
+    setPendingDownloadKeys(new Set());
+    return () => {
+      controllers.forEach((controller) => controller.abort());
+      controllers.clear();
+    };
+  }, [sessionId]);
 
   const commitSession = useCallback(
     (
@@ -1083,8 +1532,8 @@ export default function WPlusSopWorkspace() {
 
   const loadSession = useCallback(
     async (signal?: AbortSignal, options: LoadSessionOptions = {}) => {
+      const requestedSessionId = sessionId;
       try {
-        const requestedSessionId = sessionId;
         const snapshot = await wplusSopApi.getSession(
           requestedSessionId,
           signal,
@@ -1094,7 +1543,9 @@ export default function WPlusSopWorkspace() {
         setLoadState("ready");
         return snapshot;
       } catch (error) {
-        if (signal?.aborted) return null;
+        if (sessionIdRef.current !== requestedSessionId || signal?.aborted) {
+          return null;
+        }
         if (errorStatus(error) === 404) {
           setLoadState("unavailable");
         } else if (!options.background) {
@@ -1134,13 +1585,14 @@ export default function WPlusSopWorkspace() {
     let reconnectAttempts = 0;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let recovering = false;
+    const recoveryController = new AbortController();
     let subscription: ReturnType<
       typeof wplusSopApi.subscribeSessionEvents
     > | null = null;
     const recoverStream = async () => {
       if (disposed || recovering) return;
       recovering = true;
-      await loadSession(undefined, {
+      await loadSession(recoveryController.signal, {
         background: true,
         preserveStageDraft:
           sessionRef.current?.state === "AwaitingQueueConfirmation",
@@ -1231,7 +1683,7 @@ export default function WPlusSopWorkspace() {
           }
           const decision = applySessionEvent(current, event);
           if (decision.action === "reload") {
-            void loadSession(undefined, {
+            void loadSession(recoveryController.signal, {
               background: true,
               preserveStageDraft: current.state === "AwaitingQueueConfirmation",
             });
@@ -1255,6 +1707,7 @@ export default function WPlusSopWorkspace() {
     connect(initialStateVersion);
     return () => {
       disposed = true;
+      recoveryController.abort();
       if (reconnectTimer) clearTimeout(reconnectTimer);
       subscription?.close();
     };
@@ -1307,16 +1760,26 @@ export default function WPlusSopWorkspace() {
     );
   }, [memoryDecisionScope]);
 
-  const downloadArtifact = useCallback(
-    async (artifactId: string, filename: string) => {
-      if (!session) return;
-      setDownloadingArtifactId(artifactId);
+  const saveArtifact = useCallback(
+    async (
+      key: string,
+      filename: string,
+      requestedSessionId: string,
+      load: (signal: AbortSignal) => Promise<Blob>,
+    ) => {
+      downloadControllersRef.current.get(key)?.abort();
+      const controller = new AbortController();
+      downloadControllersRef.current.set(key, controller);
+      setPendingDownloadKeys((current) => new Set(current).add(key));
       setNotice(null);
       try {
-        const blob = await wplusSopApi.downloadArtifact(
-          session.session_id,
-          artifactId,
-        );
+        const blob = await load(controller.signal);
+        if (
+          controller.signal.aborted ||
+          sessionIdRef.current !== requestedSessionId
+        ) {
+          return;
+        }
         const objectUrl = URL.createObjectURL(blob);
         const anchor = document.createElement("a");
         anchor.href = objectUrl;
@@ -1326,13 +1789,90 @@ export default function WPlusSopWorkspace() {
         anchor.click();
         anchor.remove();
         URL.revokeObjectURL(objectUrl);
-      } catch {
-        setNotice("产物下载失败，请稍后重试。");
+      } catch (error) {
+        if (
+          !(error instanceof Error && error.name === "AbortError") &&
+          !controller.signal.aborted &&
+          sessionIdRef.current === requestedSessionId
+        ) {
+          setNotice("产物下载失败，请稍后重试。");
+        }
       } finally {
-        setDownloadingArtifactId(null);
+        if (downloadControllersRef.current.get(key) === controller) {
+          downloadControllersRef.current.delete(key);
+          setPendingDownloadKeys((current) => {
+            const next = new Set(current);
+            next.delete(key);
+            return next;
+          });
+        }
       }
     },
-    [session],
+    [],
+  );
+
+  const downloadArtifact = useCallback(
+    (artifact: WPlusSopArtifact) => {
+      if (!session) return;
+      void saveArtifact(
+        `final:${artifact.artifact_id}`,
+        artifact.name,
+        session.session_id,
+        (signal) =>
+          wplusSopApi.downloadArtifact(
+            session.session_id,
+            artifact.artifact_id,
+            signal,
+          ),
+      );
+    },
+    [saveArtifact, session],
+  );
+
+  const downloadStageReportArtifact = useCallback(
+    (report: WPlusSopStageReport, artifact: WPlusSopArtifact) => {
+      if (!session) return;
+      const identity: WPlusSopStageArtifactIdentity = {
+        stageId: report.stage_id,
+        revision: report.revision,
+        reportNo: report.report_no,
+        artifactId: artifact.artifact_id,
+      };
+      void saveArtifact(
+        `stage:${report.stage_id}:${report.revision}:${report.report_no}:${artifact.artifact_id}`,
+        artifact.name,
+        session.session_id,
+        (signal) =>
+          wplusSopApi.downloadStageReportArtifact(
+            session.session_id,
+            identity,
+            signal,
+          ),
+      );
+    },
+    [saveArtifact, session],
+  );
+
+  const downloadCumulativeArtifact = useCallback(
+    (preview: WPlusSopCumulativePreview, artifact: WPlusSopArtifact) => {
+      if (!session) return;
+      const identity: WPlusSopCumulativeArtifactIdentity = {
+        previewVersion: preview.preview_version,
+        artifactId: artifact.artifact_id,
+      };
+      void saveArtifact(
+        `cumulative:${preview.preview_version}:${artifact.artifact_id}`,
+        artifact.name,
+        session.session_id,
+        (signal) =>
+          wplusSopApi.downloadCumulativeArtifact(
+            session.session_id,
+            identity,
+            signal,
+          ),
+      );
+    },
+    [saveArtifact, session],
   );
 
   const sendCommand = useCallback(
@@ -1419,6 +1959,23 @@ export default function WPlusSopWorkspace() {
     }
   }, [answers, sendCommand, session]);
 
+  const submitStageReportFeedback = useCallback(
+    async (nextAction: "clarify" | "rerun") => {
+      const feedbackText = stageReportFeedback.trim();
+      if (!feedbackText) return;
+      const payload: Record<string, unknown> = {
+        feedback: feedbackText,
+        next_action: nextAction,
+      };
+      if (session?.trial?.run_id) {
+        payload.rerun_of_run_id = session.trial.run_id;
+      }
+      const next = await sendCommand("submit_trial_feedback", payload);
+      if (next) setStageReportFeedback("");
+    },
+    [sendCommand, session?.trial?.run_id, stageReportFeedback],
+  );
+
   const mainPanel = useMemo(() => {
     if (!session) return null;
     const runtimeReady = session.runtime_status?.runtime_ready === true;
@@ -1476,21 +2033,105 @@ export default function WPlusSopWorkspace() {
       const currentStage = session.stages.find(
         (stage) => stage.stage_id === session.current_stage_id,
       );
+      const stageReports = session.stage_reports || [];
+      const latestReport = [...stageReports]
+        .filter(
+          (report) =>
+            report.stage_id === session.current_stage_id &&
+            (report.superseded_by === null ||
+              report.superseded_by === undefined),
+        )
+        .sort((left, right) => right.report_no - left.report_no)[0];
+      const allValidated = latestReport
+        ? latestReport.artifacts.every(
+            (artifact) => artifact.status === "validated",
+          )
+        : false;
       return (
-        <section className={styles.decisionPanel}>
-          <CircleCheck size={34} />
-          <span className={styles.eyebrow}>环节验收</span>
-          <h2>{currentStage?.title || "当前环节"}已通过预跑</h2>
-          <p>确认后将锁定本环节事实，并进入下一个环节。</p>
-          <Button
-            type="primary"
-            size="large"
-            loading={busy}
-            disabled={!runtimeReady}
-            onClick={() => void sendCommand("confirm_stage")}
-          >
-            {runtimeReady ? "确认并继续" : "正在完成上一轮处理"}
-          </Button>
+        <section className={styles.workSection}>
+          <div className={styles.sectionHeading}>
+            <div>
+              <span className={styles.eyebrow}>环节验收</span>
+              <h2>{currentStage?.title || "当前环节"}已通过预跑</h2>
+              <p>审阅当前环节报告；确认后将锁定本环节，并立即纳入累计 SOP。</p>
+            </div>
+            <Tag color="blue">待确认</Tag>
+          </div>
+          <StageReportPanel
+            sessionId={session.session_id}
+            reports={stageReports}
+            currentStageId={session.current_stage_id}
+            selectedReportKey={selectedStageReportKey}
+            onSelectedReportChange={(reportKey, latest) => {
+              setSelectedStageReportKey(reportKey);
+              setSelectedStageReportIsLatest(latest);
+            }}
+            pendingDownloadKeys={pendingDownloadKeys}
+            onDownload={downloadStageReportArtifact}
+          />
+          <CumulativePreviewPanel
+            sessionId={session.session_id}
+            preview={session.cumulative_preview}
+            stages={session.stages}
+            pendingDownloadKeys={pendingDownloadKeys}
+            onDownload={downloadCumulativeArtifact}
+          />
+          <div className={styles.stageConfirmActions}>
+            {!allValidated && (
+              <Alert
+                type="warning"
+                showIcon
+                message="环节报告尚未校验完成"
+                description="JSON、Markdown 与 HTML 三份报告全部生成并校验通过后，才能确认本环节。"
+              />
+            )}
+            <div className={styles.feedbackBox}>
+              <label htmlFor="wplus-stage-report-feedback">阶段 SOP 反馈</label>
+              <Input.TextArea
+                id="wplus-stage-report-feedback"
+                autoSize={{ minRows: 3, maxRows: 8 }}
+                value={stageReportFeedback}
+                disabled={busy || !selectedStageReportIsLatest}
+                onChange={(event) => setStageReportFeedback(event.target.value)}
+                placeholder="例如：补充异常处理规则，或调整条件后重新预跑"
+              />
+              <div className={styles.sectionActions}>
+                <Button
+                  disabled={
+                    busy ||
+                    !runtimeReady ||
+                    !selectedStageReportIsLatest ||
+                    !stageReportFeedback.trim()
+                  }
+                  onClick={() => void submitStageReportFeedback("clarify")}
+                >
+                  补充澄清
+                </Button>
+                <Button
+                  disabled={
+                    busy ||
+                    !runtimeReady ||
+                    !selectedStageReportIsLatest ||
+                    !stageReportFeedback.trim()
+                  }
+                  onClick={() => void submitStageReportFeedback("rerun")}
+                >
+                  按反馈重新预跑
+                </Button>
+              </div>
+            </div>
+            <Button
+              type="primary"
+              size="large"
+              loading={busy}
+              disabled={
+                !runtimeReady || !allValidated || !selectedStageReportIsLatest
+              }
+              onClick={() => void sendCommand("confirm_stage")}
+            >
+              {runtimeReady ? "确认并锁定本环节" : "正在完成上一轮处理"}
+            </Button>
+          </div>
         </section>
       );
     }
@@ -1576,18 +2217,24 @@ export default function WPlusSopWorkspace() {
             </div>
             <Tag color="blue">待确认</Tag>
           </div>
-          <ResultPreview preview={preview} />
+          <ResultPreview
+            sessionId={session.session_id}
+            artifacts={session.artifacts || []}
+            preview={preview}
+            pendingDownloadKeys={pendingDownloadKeys}
+            onDownload={downloadArtifact}
+          />
           <div className={styles.artifactList}>
             {(session.artifacts || []).map((artifact) => (
               <Button
                 key={artifact.artifact_id}
                 type="text"
-                disabled={!artifact.download_url}
-                loading={downloadingArtifactId === artifact.artifact_id}
+                disabled={artifact.status !== "validated"}
+                loading={pendingDownloadKeys.has(
+                  `final:${artifact.artifact_id}`,
+                )}
                 title={artifact.name}
-                onClick={() =>
-                  void downloadArtifact(artifact.artifact_id, artifact.name)
-                }
+                onClick={() => downloadArtifact(artifact)}
               >
                 <FileCheck2 size={16} />
                 <span className={styles.artifactName}>{artifact.name}</span>
@@ -1802,12 +2449,12 @@ export default function WPlusSopWorkspace() {
               <Button
                 key={artifact.artifact_id}
                 type="text"
-                disabled={!artifact.download_url}
-                loading={downloadingArtifactId === artifact.artifact_id}
+                disabled={artifact.status !== "validated"}
+                loading={pendingDownloadKeys.has(
+                  `final:${artifact.artifact_id}`,
+                )}
                 title={artifact.name}
-                onClick={() =>
-                  void downloadArtifact(artifact.artifact_id, artifact.name)
-                }
+                onClick={() => downloadArtifact(artifact)}
               >
                 <FileCheck2 size={16} />
                 <span className={styles.artifactName}>{artifact.name}</span>
@@ -1854,13 +2501,19 @@ export default function WPlusSopWorkspace() {
     answers,
     busy,
     downloadArtifact,
-    downloadingArtifactId,
+    downloadCumulativeArtifact,
+    downloadStageReportArtifact,
+    pendingDownloadKeys,
     feedback,
     memoryDecisions,
     sendCommand,
     session,
+    selectedStageReportIsLatest,
+    selectedStageReportKey,
+    stageReportFeedback,
     stages,
     submitAnswers,
+    submitStageReportFeedback,
     answerScope,
   ]);
 
@@ -1945,17 +2598,6 @@ export default function WPlusSopWorkspace() {
           >
             {getSessionStateLabel(session)}
           </Tag>
-          {!["Completed", "Terminated", "Paused", "PendingExit"].includes(
-            session.state,
-          ) && (
-            <Button
-              icon={<Pause size={15} />}
-              disabled={busy}
-              onClick={() => void sendCommand("save_and_exit")}
-            >
-              保存并退出
-            </Button>
-          )}
         </div>
       </header>
 

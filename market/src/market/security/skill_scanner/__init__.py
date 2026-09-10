@@ -32,15 +32,14 @@ from __future__ import annotations
 
 from concurrent import futures
 import hashlib
-import json
 import logging
 import os
 import threading
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .history import BlockedSkillRecord, MarketSkillScanHistoryWriter
 from .models import (
     Finding,
     ScanResult,
@@ -68,9 +67,7 @@ __all__ = [
     "SkillScanError",
     "ThreatCategory",
     "compute_skill_content_hash",
-    "get_blocked_history",
-    "clear_blocked_history",
-    "remove_blocked_entry",
+    "install_skill_scan_history_recorder",
     "is_skill_whitelisted",
     "scan_skill_directory",
 ]
@@ -172,55 +169,15 @@ def is_skill_whitelisted(
 # Blocked history persistence
 # ---------------------------------------------------------------------------
 
-_BLOCKED_HISTORY_FILE = "skill_scanner_blocked.json"
-_history_lock = threading.Lock()
+_history_recorder: MarketSkillScanHistoryWriter | None = None
 
 
-def _get_blocked_history_path() -> Path:
-    swe_root = (
-        Path(
-            os.environ.get(
-                "SWE_WORKING_DIR",
-                os.environ.get("MARKET_SWE_ROOT", "~/.swe"),
-            ),
-        )
-        .expanduser()
-        .resolve()
-    )
-    return swe_root / _BLOCKED_HISTORY_FILE
-
-
-@dataclass
-class BlockedSkillRecord:
-    """A record of a scan alert (blocked or warned)."""
-
-    skill_name: str
-    blocked_at: str
-    max_severity: str
-    findings: list[dict[str, Any]] = field(default_factory=list)
-    content_hash: str = ""
-    action: str = "blocked"
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "skill_name": self.skill_name,
-            "blocked_at": self.blocked_at,
-            "max_severity": self.max_severity,
-            "findings": self.findings,
-            "content_hash": self.content_hash,
-            "action": self.action,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> BlockedSkillRecord:
-        return cls(
-            skill_name=data.get("skill_name", ""),
-            blocked_at=data.get("blocked_at", ""),
-            max_severity=data.get("max_severity", ""),
-            findings=data.get("findings", []),
-            content_hash=data.get("content_hash", ""),
-            action=data.get("action", "blocked"),
-        )
+def install_skill_scan_history_recorder(
+    recorder: MarketSkillScanHistoryWriter | None,
+) -> None:
+    """Install the Market application-scoped scan history writer."""
+    global _history_recorder
+    _history_recorder = recorder
 
 
 def _finding_to_dict(f: Finding) -> dict[str, Any]:
@@ -231,6 +188,7 @@ def _finding_to_dict(f: Finding) -> dict[str, Any]:
         "file_path": f.file_path,
         "line_number": f.line_number,
         "rule_id": f.rule_id,
+        "analyzer": f.analyzer,
     }
 
 
@@ -239,8 +197,11 @@ def _record_blocked_skill(
     skill_dir: Path,
     *,
     action: str = "blocked",
+    source_id: str = "",
+    user_id: str = "",
+    bbk_id: str = "",
 ) -> None:
-    """Append a scan alert to the history file."""
+    """Submit a scan alert to the database-backed history writer."""
     record = BlockedSkillRecord(
         skill_name=result.skill_name,
         blocked_at=datetime.now(timezone.utc).isoformat(),
@@ -248,64 +209,23 @@ def _record_blocked_skill(
         findings=[_finding_to_dict(f) for f in result.findings],
         content_hash=compute_skill_content_hash(skill_dir),
         action=action,
+        source_id=source_id,
+        user_id=user_id,
+        bbk_id=bbk_id,
     )
-    path = _get_blocked_history_path()
-    with _history_lock:
-        try:
-            existing: list[dict[str, Any]] = []
-            if path.is_file():
-                existing = json.loads(path.read_text(encoding="utf-8"))
-            existing.append(record.to_dict())
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(existing, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        except Exception as exc:
-            logger.warning("Failed to record blocked skill: %s", exc)
-
-
-def get_blocked_history() -> list[BlockedSkillRecord]:
-    """Load all blocked skill records from disk."""
-    path = _get_blocked_history_path()
-    if not path.is_file():
-        return []
+    recorder = _history_recorder
+    if recorder is None:
+        logger.error(
+            "Market skill scan history writer is unavailable; record was dropped",
+        )
+        return
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return [BlockedSkillRecord.from_dict(d) for d in data]
+        accepted = recorder.submit(record)
     except Exception as exc:
-        logger.warning("Failed to load blocked history: %s", exc)
-        return []
-
-
-def clear_blocked_history() -> None:
-    """Delete all blocked skill records."""
-    path = _get_blocked_history_path()
-    try:
-        if path.is_file():
-            path.unlink()
-    except OSError as exc:
-        logger.warning("Failed to clear blocked history: %s", exc)
-
-
-def remove_blocked_entry(index: int) -> bool:
-    """Remove a single blocked record by index. Returns True on success."""
-    path = _get_blocked_history_path()
-    if not path.is_file():
-        return False
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if 0 <= index < len(data):
-            data.pop(index)
-            path.write_text(
-                json.dumps(data, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            return True
-        return False
-    except Exception as exc:
-        logger.warning("Failed to remove blocked entry: %s", exc)
-        return False
+        logger.error("Failed to submit Market skill scan history: %s", exc)
+        return
+    if not accepted:
+        logger.error("Market skill scan history writer rejected record")
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +344,9 @@ def scan_skill_directory(
     skill_name: str | None = None,
     block: bool | None = None,
     timeout: float | None = None,
+    source_id: str = "",
+    user_id: str = "",
+    bbk_id: str = "",
 ) -> ScanResult | None:
     """Scan a skill directory and optionally block on unsafe results.
 
@@ -440,6 +363,8 @@ def scan_skill_directory(
     timeout:
         Maximum seconds to wait for the scan to complete before
         giving up and returning ``None``.  *None* reads from config.
+    source_id/user_id/bbk_id:
+        Optional context persisted with database scan history records.
 
     Returns
     -------
@@ -496,9 +421,23 @@ def scan_skill_directory(
     if not result.is_safe:
         should_block = block if block is not None else (mode == "block")
         if should_block:
-            _record_blocked_skill(result, resolved, action="blocked")
+            _record_blocked_skill(
+                result,
+                resolved,
+                action="blocked",
+                source_id=source_id,
+                user_id=user_id,
+                bbk_id=bbk_id,
+            )
             raise SkillScanError(result)
-        _record_blocked_skill(result, resolved, action="warned")
+        _record_blocked_skill(
+            result,
+            resolved,
+            action="warned",
+            source_id=source_id,
+            user_id=user_id,
+            bbk_id=bbk_id,
+        )
         logger.warning(
             "Skill '%s' has %d security finding(s) (max severity: %s) "
             "but blocking is disabled – proceeding anyway.",

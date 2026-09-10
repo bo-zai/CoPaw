@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import asyncio
@@ -11,7 +12,8 @@ from swe.app.approvals.external import (
     notify_cron_approval_pending,
     submit_external_approval_decision,
 )
-from swe.app.approvals.service import ApprovalService
+from swe.app.approvals.service import ApprovalService, get_approval_service
+from swe.app.answer_turn.models import TurnIdentity, TurnLease
 from swe.app.source_system_config.models import (
     EffectiveSourceSystemConfig,
     SourceSystemConfig,
@@ -97,20 +99,41 @@ class _TaskTracker:
         self.statuses = list(statuses or ["idle"])
         self.attach_calls: list[dict[str, Any]] = []
 
-    async def get_status(self, _run_key: str) -> str:
+    async def status(self, _run_key: str) -> str:
         if len(self.statuses) > 1:
             return self.statuses.pop(0)
         return self.statuses[0]
 
-    async def attach_or_start(self, run_key, payload, stream_fn):
+    async def attach_or_start(self, identity, payload, stream_fn, **_kwargs):
         self.attach_calls.append(
             {
-                "run_key": run_key,
+                "identity": identity,
                 "payload": payload,
                 "stream_fn": stream_fn,
             },
         )
         return asyncio.Queue(), True
+
+    async def attach(self, _identity):
+        return None
+
+
+class _Coordinator:
+    def __init__(self, tracker: _TaskTracker) -> None:
+        self.tracker = tracker
+
+    async def start_or_attach(self, chat_id, payload, producer, **kwargs):
+        identity = TurnIdentity(
+            chat_id=chat_id,
+            msgid=kwargs.get("msgid") or "msg-1",
+            turn_id="turn-1",
+        )
+        queue, is_new = await self.tracker.attach_or_start(
+            identity,
+            payload,
+            producer,
+        )
+        return TurnLease(identity, queue, is_new)
 
 
 class _SourceSystemConfigService:
@@ -118,7 +141,10 @@ class _SourceSystemConfigService:
         self.config = config
         self.calls: list[str] = []
 
-    async def resolve_config(self, source_id: str) -> EffectiveSourceSystemConfig:
+    async def resolve_config(
+        self,
+        source_id: str,
+    ) -> EffectiveSourceSystemConfig:
         self.calls.append(source_id)
         return self.config
 
@@ -155,7 +181,7 @@ def _workspace(
     source_system_config_service: _SourceSystemConfigService | None = None,
 ) -> SimpleNamespace:
     session = _Session()
-    return SimpleNamespace(
+    workspace = SimpleNamespace(
         agent_id="agent-a",
         channel_manager=_ChannelManager(),
         chat_manager=_ChatManager(),
@@ -164,6 +190,8 @@ def _workspace(
         session=session,
         _source_system_config_service=source_system_config_service,
     )
+    workspace.answer_turn_coordinator = _Coordinator(workspace.task_tracker)
+    return workspace
 
 
 def _source_config_without_zhaohu_tool_guard_notifications():
@@ -200,7 +228,7 @@ def _source_config_with_zhaohu_tool_guard_notifications():
 
 @pytest.mark.asyncio
 async def test_external_approve_submits_console_approve_message() -> None:
-    service = ApprovalService()
+    service = get_approval_service()
     workspace = _workspace()
 
     with tenant_context(tenant_id="tenant-a", source_id="source-a"):
@@ -239,7 +267,7 @@ async def test_external_approve_submits_console_approve_message() -> None:
 
     attach = workspace.task_tracker.attach_calls[0]
     payload = attach["payload"]
-    assert attach["run_key"] == "chat:session-1"
+    assert attach["identity"].chat_id == "chat:session-1"
     assert payload["channel_id"] == "console"
     assert payload["sender_id"] == "user-1"
     assert payload["content_parts"][0].text == f"/approve {pending.request_id}"
@@ -266,8 +294,10 @@ async def test_external_approve_submits_console_approve_message() -> None:
 
 
 @pytest.mark.asyncio
-async def test_external_decision_does_not_resubmit_completed_approval() -> None:
-    service = ApprovalService()
+async def test_external_decision_does_not_resubmit_completed_approval() -> (
+    None
+):
+    service = get_approval_service()
     workspace = _workspace()
 
     with tenant_context(tenant_id="tenant-a", source_id="source-a"):
@@ -297,8 +327,10 @@ async def test_external_decision_does_not_resubmit_completed_approval() -> None:
 
 
 @pytest.mark.asyncio
-async def test_external_decision_skips_zhaohu_result_when_source_disables_it() -> None:
-    service = ApprovalService()
+async def test_external_decision_skips_zhaohu_result_when_source_disables_it() -> (
+    None
+):
+    service = get_approval_service()
     workspace = _workspace()
 
     with tenant_context(tenant_id="tenant-a", source_id="source-a"):
@@ -332,8 +364,10 @@ async def test_external_decision_skips_zhaohu_result_when_source_disables_it() -
 
 
 @pytest.mark.asyncio
-async def test_external_decision_resolves_source_config_from_workspace_service() -> None:
-    service = ApprovalService()
+async def test_external_decision_resolves_source_config_from_workspace_service() -> (
+    None
+):
+    service = get_approval_service()
     source_config_service = _SourceSystemConfigService(
         _source_config_without_zhaohu_tool_guard_notifications(),
     )
@@ -370,7 +404,7 @@ async def test_external_decision_resolves_source_config_from_workspace_service()
 
 @pytest.mark.asyncio
 async def test_pending_notification_applies_to_all_sessions() -> None:
-    service = ApprovalService()
+    service = get_approval_service()
     workspace = _workspace()
 
     with tenant_context(tenant_id="tenant-a", source_id="source-a"):
@@ -408,8 +442,10 @@ async def test_pending_notification_applies_to_all_sessions() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pending_notification_skips_zhaohu_when_source_disables_it() -> None:
-    service = ApprovalService()
+async def test_pending_notification_skips_zhaohu_when_source_disables_it() -> (
+    None
+):
+    service = get_approval_service()
     workspace = _workspace()
 
     with tenant_context(tenant_id="tenant-a", source_id="source-a"):
@@ -437,8 +473,10 @@ async def test_pending_notification_skips_zhaohu_when_source_disables_it() -> No
 
 
 @pytest.mark.asyncio
-async def test_pending_notification_forwards_scope_metadata_from_extra() -> None:
-    service = ApprovalService()
+async def test_pending_notification_forwards_scope_metadata_from_extra() -> (
+    None
+):
+    service = get_approval_service()
     workspace = _workspace()
 
     with tenant_context(tenant_id="tenant-a", source_id="source-a"):

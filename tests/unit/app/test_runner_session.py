@@ -1100,6 +1100,33 @@ async def test_get_session_state_dict_avoids_truncated_json_during_write(
 
 
 @pytest.mark.asyncio
+async def test_persisted_snapshot_read_does_not_wait_for_active_execution(
+    tmp_path: Path,
+) -> None:
+    session = SafeJSONSession(save_dir=str(tmp_path))
+    await session.save_merged_state("shared", state={"version": "saved"})
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_execution() -> None:
+        async with session.execution("shared"):
+            entered.set()
+            await release.wait()
+
+    execution_task = asyncio.create_task(hold_execution())
+    await asyncio.wait_for(entered.wait(), timeout=1)
+
+    snapshot = await asyncio.wait_for(
+        session.get_persisted_session_state_dict("shared"),
+        timeout=0.1,
+    )
+
+    assert snapshot == {"version": "saved"}
+    release.set()
+    await execution_task
+
+
+@pytest.mark.asyncio
 async def test_load_session_state_avoids_truncated_json_during_write(
     monkeypatch,
     tmp_path: Path,

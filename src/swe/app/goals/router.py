@@ -56,9 +56,16 @@ async def _chat(workspace: Any, chat_id: str) -> Any:
     return chat
 
 
-def _scope(workspace: Any, chat: Any) -> GoalScope:
+def _scope(
+    workspace: Any,
+    chat: Any,
+    *,
+    source_id: str | None = None,
+) -> GoalScope:
     config = getattr(workspace, "config", None)
-    source_id = str(getattr(config, "source_id", "") or "default")
+    source_id = str(
+        source_id or getattr(config, "source_id", "") or "default",
+    )
     tenant_id = str(getattr(workspace, "tenant_id", "") or "default")
     model = ""
     provider_id = ""
@@ -124,7 +131,11 @@ async def create_goal(
     chat = await _chat(workspace, body.chat_id)
     try:
         return await (await _service(request)).create_goal(
-            scope=_scope(workspace, chat),
+            scope=_scope(
+                workspace,
+                chat,
+                source_id=getattr(request.state, "source_id", None),
+            ),
             contract=body.contract,
         )
     except (GoalConflictError, ValueError) as exc:

@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Task tracker for background runs: streaming, reconnect, multi-subscriber.
+"""In-memory SSE transport for active answer turns.
 
-run_key is ChatSpec.id (chat_id). Per run: task, queues, event buffer.
-Reconnects get buffer replay + new events. Cleanup when task completes.
+This adapter owns producer tasks, buffered replay, subscribers, and task
+progress.  Answer-turn admission, stopping, and settlement belong to
+``AnswerTurnCoordinator``.
 """
 
 from __future__ import annotations
@@ -12,33 +13,31 @@ import json
 import logging
 import weakref
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, Callable, Coroutine, Literal
+from typing import Any, AsyncGenerator, Callable
 
+from ..answer_turn.models import TurnIdentity
 from .task_progress import TaskProgressPayload, clone_task_progress
 from .tool_output_frames import ToolOutputFrame, bind_tool_output_emitter
 
 logger = logging.getLogger(__name__)
 
 _SENTINEL = None
+Producer = Callable[[TurnIdentity, Any], AsyncGenerator[str, None]]
 
 
 @dataclass
 class _RunState:
-    """Per-run state (task, queues, buffer), guarded by tracker lock."""
+    """Transport state for one producer and its SSE subscribers."""
 
-    task: asyncio.Future
+    task: asyncio.Task[None]
+    identity: TurnIdentity
     queues: list[asyncio.Queue] = field(default_factory=list)
     buffer: list[str] = field(default_factory=list)
-    status: Literal["running", "stopping"] = "running"
+    closed: bool = False
 
 
 class TaskTracker:
-    """Per-workspace tracker: run_key -> RunState.
-
-    All mutations to _runs under _lock. Producer broadcasts under lock.
-    Subscribers use unbounded per-connection queues; disconnect removes them
-    via :meth:`detach_subscriber`.
-    """
+    """Per-workspace stream transport keyed by :class:`TurnIdentity`."""
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -53,29 +52,31 @@ class TaskTracker:
     def lock(self) -> asyncio.Lock:
         return self._lock
 
-    async def get_status(self, run_key: str) -> str:
-        """Return ``'idle'``, ``'running'`` or ``'stopping'``."""
-        async with self._lock:
-            state = self._runs.get(run_key)
-        if state is None or state.task.done():
-            return "idle"
-        return state.status
+    @staticmethod
+    def _chat_id(identity: TurnIdentity | str) -> str:
+        return (
+            identity.chat_id
+            if isinstance(identity, TurnIdentity)
+            else identity
+        )
+
+    def _lifecycle_lock(self, identity: TurnIdentity | str) -> asyncio.Lock:
+        chat_id = self._chat_id(identity)
+        return self._lifecycle_locks.setdefault(chat_id, asyncio.Lock())
 
     async def call_if_idle(
         self,
-        run_key: str,
+        identity: TurnIdentity | str,
         callback: Callable[[], Any],
     ) -> tuple[bool, Any]:
-        """Run blocking recovery without blocking unrelated run keys."""
-
-        lifecycle_lock = self._lifecycle_locks.setdefault(
-            run_key,
-            asyncio.Lock(),
-        )
-        async with lifecycle_lock:
+        """Run recovery only when no producer is active for the chat."""
+        chat_id = self._chat_id(identity)
+        async with self._lifecycle_lock(chat_id):
             async with self._lock:
-                state = self._runs.get(run_key)
-                if state is not None and not state.task.done():
+                if any(
+                    state.identity.chat_id == chat_id and not state.task.done()
+                    for state in self._runs.values()
+                ):
                     return False, None
             operation = asyncio.create_task(asyncio.to_thread(callback))
             try:
@@ -85,46 +86,24 @@ class TaskTracker:
                     await operation
                 except Exception:
                     logger.exception(
-                        "idle callback failed after cancellation run_key=%s",
-                        run_key,
+                        "idle callback failed after cancellation chat_id=%s",
+                        chat_id,
                     )
                 raise exc
 
     async def has_active_tasks(self) -> bool:
-        """Check if any tasks are currently running.
-
-        Returns:
-            bool: True if any tasks are active, False otherwise
-        """
         async with self._lock:
-            for state in self._runs.values():
-                if not state.task.done():
-                    return True
-            return False
+            return any(not state.task.done() for state in self._runs.values())
 
     async def list_active_tasks(self) -> list[str]:
-        """List all currently running task keys.
-
-        Returns:
-            list[str]: List of active run_keys
-        """
         async with self._lock:
             return [
-                run_key
-                for run_key, state in self._runs.items()
+                state.identity.chat_id
+                for state in self._runs.values()
                 if not state.task.done()
             ]
 
     async def wait_all_done(self, timeout: float = 300.0) -> bool:
-        """Wait for all active tasks to complete.
-
-        Args:
-            timeout: Maximum time to wait in seconds (default: 300s = 5min)
-
-        Returns:
-            bool: True if all tasks completed, False if timeout occurred
-        """
-
         async def _wait_loop() -> None:
             while await self.has_active_tasks():
                 await asyncio.sleep(0.5)
@@ -135,28 +114,35 @@ class TaskTracker:
         except asyncio.TimeoutError:
             return False
 
-    async def attach(self, run_key: str) -> asyncio.Queue | None:
-        """Attach to an existing run.
-
-        Returns a new queue pre-filled with the event buffer, or ``None``
-        if no run is active for *run_key*.
-        """
+    async def attach(self, identity: TurnIdentity) -> asyncio.Queue | None:
+        """Attach a subscriber and replay the buffered SSE events."""
         async with self._lock:
-            state = self._runs.get(run_key)
-            if state is None or state.task.done():
-                return None
-            q: asyncio.Queue = asyncio.Queue()
-            for sse in state.buffer:
-                q.put_nowait(sse)
-            state.queues.append(q)
-            return q
+            return self._attach_unlocked(identity)
+
+    def _attach_unlocked(self, identity: TurnIdentity) -> asyncio.Queue | None:
+        state = self._runs.get(identity.chat_id)
+        if (
+            state is None
+            or state.identity != identity
+            or state.task.done()
+            or state.closed
+        ):
+            return None
+        queue: asyncio.Queue = asyncio.Queue()
+        for sse in state.buffer:
+            queue.put_nowait(sse)
+        state.queues.append(queue)
+        return queue
+
+    def _has_live_run_unlocked(self, chat_id: str) -> bool:
+        state = self._runs.get(chat_id)
+        return state is not None and not state.task.done()
 
     async def update_task_progress(
         self,
         run_key: str,
         payload: TaskProgressPayload,
     ) -> TaskProgressPayload:
-        """Store the latest task progress payload for a run."""
         async with self._lock:
             cloned_payload = clone_task_progress(payload)
             if cloned_payload is None:
@@ -168,21 +154,16 @@ class TaskTracker:
         self,
         run_key: str,
     ) -> TaskProgressPayload | None:
-        """Get a copy of the latest task progress payload for a run."""
         async with self._lock:
             return clone_task_progress(self._task_progress.get(run_key))
 
     async def detach_subscriber(
         self,
-        run_key: str,
+        identity: TurnIdentity,
         queue: asyncio.Queue,
     ) -> None:
-        """Remove *queue* from *run_key*'s subscriber list.
-
-        Idempotent if the run ended or *queue* was already removed.
-        """
         async with self._lock:
-            state = self._runs.get(run_key)
+            state = self._runs.get(identity.chat_id)
             if state is None:
                 return
             try:
@@ -190,50 +171,22 @@ class TaskTracker:
             except ValueError:
                 pass
 
-    async def request_stop(self, run_key: str) -> bool:
-        """Cancel the run. Returns ``True`` if it was running."""
-        async with self._lock:
-            state = self._runs.get(run_key)
-            if state is None or state.task.done():
-                return False
-            state.status = "stopping"
-            state.task.cancel()
-            return True
-
-    async def mark_stopping(self, run_key: str) -> bool:
-        """Mark an active run as stopping without cancelling it."""
-        async with self._lock:
-            state = self._runs.get(run_key)
-            if state is None or state.task.done():
-                return False
-            state.status = "stopping"
-            return True
-
     async def attach_or_start(
         self,
-        run_key: str,
+        identity: TurnIdentity,
         payload: Any,
-        stream_fn: Callable[..., Coroutine],
+        producer: Producer,
         *,
         before_start: Callable[[], None] | None = None,
     ) -> tuple[asyncio.Queue, bool]:
-        """Attach to an existing run or start a new one.
-
-        Returns ``(queue, is_new_run)``.
-        """
-        lifecycle_lock = self._lifecycle_locks.setdefault(
-            run_key,
-            asyncio.Lock(),
-        )
-        async with lifecycle_lock:
+        """Attach to *identity*'s transport or register its producer."""
+        async with self._lifecycle_lock(identity):
             async with self._lock:
-                state = self._runs.get(run_key)
-                if state is not None and not state.task.done():
-                    q: asyncio.Queue = asyncio.Queue()
-                    for sse in state.buffer:
-                        q.put_nowait(sse)
-                    state.queues.append(q)
-                    return q, False
+                queue = self._attach_unlocked(identity)
+                if queue is not None:
+                    return queue, False
+                if self._has_live_run_unlocked(identity.chat_id):
+                    raise RuntimeError("live stream belongs to another turn")
             if before_start is not None:
                 operation = asyncio.create_task(
                     asyncio.to_thread(before_start),
@@ -242,41 +195,25 @@ class TaskTracker:
                     await asyncio.shield(operation)
                 except asyncio.CancelledError:
                     logger.debug(
-                        "delaying cancellation until run registration "
-                        "run_key=%s",
-                        run_key,
+                        "delaying cancellation until stream registration chat_id=%s",
+                        identity.chat_id,
                     )
                     await operation
             async with self._lock:
-                return self._attach_or_start_unlocked(
-                    run_key,
-                    payload,
-                    stream_fn,
-                )
+                queue = self._attach_unlocked(identity)
+                if queue is not None:
+                    return queue, False
+                if self._has_live_run_unlocked(identity.chat_id):
+                    raise RuntimeError("live stream belongs to another turn")
+                return self._start_unlocked(identity, payload, producer)
 
-    def _attach_or_start_unlocked(
+    def _start_unlocked(
         self,
-        run_key: str,
+        identity: TurnIdentity,
         payload: Any,
-        stream_fn: Callable[..., Coroutine],
+        producer: Producer,
     ) -> tuple[asyncio.Queue, bool]:
-        """Attach or register while the caller holds the tracker lock."""
-
-        state = self._runs.get(run_key)
-        if state is not None and not state.task.done():
-            q: asyncio.Queue = asyncio.Queue()
-            for sse in state.buffer:
-                q.put_nowait(sse)
-            state.queues.append(q)
-            return q, False
-
-        my_queue: asyncio.Queue = asyncio.Queue()
-        run = _RunState(
-            task=asyncio.Future(),  # placeholder, replaced below
-            queues=[my_queue],
-            buffer=[],
-        )
-        self._runs[run_key] = run
+        queue: asyncio.Queue = asyncio.Queue()
         tracker_ref = weakref.ref(self)
 
         async def _producer() -> None:
@@ -285,70 +222,78 @@ class TaskTracker:
                 if tracker is None:
                     return
                 async with tracker.lock:
-                    run.buffer.append(sse)
-                    for q in run.queues:
-                        q.put_nowait(sse)
+                    state = tracker._runs.get(identity.chat_id)
+                    if state is None or state.closed:
+                        return
+                    state.buffer.append(sse)
+                    for subscriber in state.queues:
+                        subscriber.put_nowait(sse)
 
-            async def _emit_tool_output_frame(
-                frame: ToolOutputFrame,
-            ) -> None:
+            async def _emit_tool_output_frame(frame: ToolOutputFrame) -> None:
                 await _broadcast_sse(
-                    "data: "
-                    + json.dumps(frame, ensure_ascii=False)
-                    + "\n\n",
+                    "data: " + json.dumps(frame, ensure_ascii=False) + "\n\n",
                 )
 
             try:
                 with bind_tool_output_emitter(_emit_tool_output_frame):
-                    async for sse in stream_fn(payload):
+                    async for sse in producer(identity, payload):
                         await _broadcast_sse(sse)
             except asyncio.CancelledError:
-                logger.debug("run cancelled run_key=%s", run_key)
+                logger.debug("stream producer cancelled identity=%s", identity)
             except Exception:
-                logger.exception("run error run_key=%s", run_key)
-                err_sse = (
-                    "data: "
-                    f"{json.dumps({'error': 'internal server error'})}\n\n"
+                logger.exception(
+                    "stream producer failed identity=%s",
+                    identity,
                 )
-                tracker = tracker_ref()
-                if tracker is not None:
-                    await _broadcast_sse(err_sse)
+                await _broadcast_sse(
+                    "data: "
+                    f"{json.dumps({'error': 'internal server error'})}\n\n",
+                )
             finally:
                 tracker = tracker_ref()
                 if tracker is not None:
                     async with tracker.lock:
-                        for q in run.queues:
-                            q.put_nowait(_SENTINEL)
-                        current = tracker._runs.get(run_key)
-                        if current is run:
-                            tracker._task_progress.pop(run_key, None)
-                            # pylint: disable=protected-access
-                            tracker._runs.pop(
-                                run_key,
-                                None,
-                            )
+                        state = tracker._runs.get(identity.chat_id)
+                        if state is not None and state.identity == identity:
+                            for subscriber in state.queues:
+                                subscriber.put_nowait(_SENTINEL)
+                            tracker._task_progress.pop(identity.chat_id, None)
+                            tracker._runs.pop(identity.chat_id, None)
 
-        run.task = asyncio.create_task(_producer())
-        return my_queue, True
+        task = asyncio.create_task(_producer())
+        self._runs[identity.chat_id] = _RunState(
+            task=task,
+            identity=identity,
+            queues=[queue],
+        )
+        return queue, True
 
-    async def stream_from_queue(
+    async def close(self, identity: TurnIdentity) -> None:
+        """End this identity's subscriber streams without cancelling its work."""
+        async with self._lock:
+            state = self._runs.get(identity.chat_id)
+            if state is None or state.identity != identity or state.closed:
+                return
+            state.closed = True
+            subscribers = tuple(state.queues)
+            state.queues.clear()
+        for subscriber in subscribers:
+            subscriber.put_nowait(_SENTINEL)
+
+    async def stream(
         self,
+        identity: TurnIdentity,
         queue: asyncio.Queue,
-        run_key: str,
     ) -> AsyncGenerator[str, None]:
-        """Yield SSE strings from *queue* until the sentinel ``None``.
-
-        Always detaches *queue* from *run_key* when this stream ends or is
-        closed (including client disconnect), so reconnects do not leak queues.
-        """
+        """Yield transport events until the producer or transport closes."""
         try:
             while True:
                 try:
                     event = await queue.get()
-                    if event is _SENTINEL:
-                        break
-                    yield event
                 except asyncio.CancelledError:
                     break
+                if event is _SENTINEL:
+                    break
+                yield event
         finally:
-            await self.detach_subscriber(run_key, queue)
+            await self.detach_subscriber(identity, queue)

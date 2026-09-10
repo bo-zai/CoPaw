@@ -636,3 +636,48 @@
   - 首次初始化
   - 从 default 模板复制 agent 配置
   - cached tenant 删除 `agent.json` 后再次 `ensure_bootstrap()` 自愈
+
+## Cron 结果索引出现同一 trace 的重复子任务
+
+### 症状
+
+- `swe_cron_subtasks` 在同一 `trace_id` 下存在多条成功的 `list` 子任务，或同一客户存在多条成功的 `plan` 子任务
+- `/monitor/subtasks/executions/sync-async-status` 写入 `swe_cron_result_index` 时产生重复结果
+
+### 典型原因
+
+- 重试或历史写入留下脏子任务；索引流程若直接消费全部成功子任务，会把重复数据继续写入结果索引
+
+### 第一落点
+
+- [monitor/src/monitor/app/services/subtask/query_service.py](/Users/shixiangyi/code/Swe/monitor/src/monitor/app/services/subtask/query_service.py)
+- 重点看成功子任务查询是否按 `trace_id + task_type`（`list`）及 `trace_id + custuid`（`plan`）去重，并优先保留最新子任务
+
+## Cron 模型失败但执行记录显示成功
+
+- 症状：Runtime 报 `model_call_failed`，随后 Cron 日志却出现 `completed_seen=True failed_seen=False` 和 `exec_status=success`。
+- 原因：Runtime 将模型异常转换为 `response/Failed`；仅检测 `message/Failed` 会漏判，并将此前的消息完成误作执行成功。
+- 排查入口：`src/swe/app/crons/executor.py` 的 `_is_failed_message_event()` 必须同时识别消息与整轮响应失败；失败优先于此前的 Completed。
+- 回归：`tests/unit/app/test_cron_manager_completed_cancellation.py` 覆盖先收到 `message/Completed`、再收到 `response/Failed`，验证任务与执行记录均为 `error` 且保留错误详情。
+
+
+## 聊天语音输入不可用或识别失败
+
+- 入口：`console/src/components/agentscope-chat/DictationControl/` 与 `Sender/useSpeech.ts`。新会话和会话内输入框共用短听写能力；加号菜单的白名单「语音录制」仍走原独立链路。
+- 浏览器需同时支持 `SpeechRecognition`（或 `webkitSpeechRecognition`）、麦克风采集和安全上下文（HTTPS / localhost）。嵌入页面还需要宿主允许麦克风权限。浏览器提供 API 不代表其语音服务在当前网络可达。
+- `not-allowed`：检查浏览器站点麦克风权限及宿主 Permissions Policy；`audio-capture`：检查麦克风连接/占用；`network`：检查浏览器识别服务网络，不要修改录音白名单或录音服务配置来修复短听写。
+- 语音识别跟随界面语言，不能使用当前仍为 `en` 的 HTML 根语言推断中文识别参数。实时结果只作预览，停止后追加草稿且不发送；取消或识别失败保留原草稿。
+- 本地回归：`cd console && npm run test:run -- src/components/agentscope-chat/Sender/useSpeech.test.tsx`。浏览器 QA 的合成音频/模拟识别验证 UI 与生命周期，不能替代目标浏览器和部署网络上的真实语音服务联调。
+## 分享工具栏空状态错位
+
+- 入口：`console/src/pages/Chat/components/ChatActionGroup/index.tsx` 和同目录 `index.module.less`。
+- 空状态提示作为独立 Grid 子项会触发自动排布，把关闭按钮挤到下一行。提示文字应归入选择状态区域；选择、分享操作、关闭按钮使用明确的网格区域。
+- 分享栏通过 Portal 挂到 `document.body`，宽度取自 `[data-chat-messages-area]`。响应式排布应按分享栏自身容器宽度切换，不能只按浏览器视口判断嵌入区域的可用空间；固定宽度包含 padding，需使用 `box-sizing: border-box`。
+- 回归覆盖：无可分享内容、全选、部分选择、取消全选、退出分享模式、键盘焦点，以及 375px 窄容器与 768/1024/1440px 布局。禁用按钮的图标应跟随禁用文字颜色，半选框保留白底与蓝色短横。
+- 分享模式需要隐藏输入框时，保留 Input 挂载以维持草稿和附件状态；整体隐藏还要覆盖编辑器子层显式声明的可见性。输入框提交入口在异步 `beforeSubmit` 前后检查当前分享状态，防止校验期间进入分享仍发出消息。回归位于 Runtime `core/Chat/Input/index.test.tsx`，覆盖隐藏、恢复草稿与延迟提交拦截。
+
+## 聊天附件在切换会话后消失
+
+- **现象**：文字和附件一起发送时首屏正常，切换到其他会话再返回后只剩文字。
+- **典型来源**：持久化的 AgentScope 消息使用 `file_url`、`image_url`、`audio_url` 或 `video_url` 等扁平字段，而聊天历史转换只读取 `source.url`，导致恢复出的附件 URL 为空。
+- **第一落点**：检查 `src/swe/app/runner/utils.py` 的 `agentscope_msg_to_message` 是否同时兼容扁平字段和 `source` 结构，并验证 `/chats/{id}` 返回的用户消息仍包含附件 URL。

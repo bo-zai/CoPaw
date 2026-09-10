@@ -83,6 +83,7 @@ async def test_history_api_keeps_each_archived_message_source_identity(
     await store.commit(chat_id, [_message(1), _message(2)])
 
     page = await get_chat_history_page(
+        SimpleNamespace(state=SimpleNamespace(user_id="user-1")),
         chat_id,
         before=None,
         limit=50,

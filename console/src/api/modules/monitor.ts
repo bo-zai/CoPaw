@@ -303,7 +303,13 @@ export interface CronDispatchBatchDetailResponse {
   batch: CronDispatchBatchItem;
   intents: CronDispatchIntentItem[];
   intent_total: number;
+  intent_filtered_total: number;
+  intent_page: number;
+  intent_page_size: number;
   events: CronDispatchEventItem[];
+  event_total: number;
+  event_page: number;
+  event_page_size: number;
 }
 
 export interface CronDispatchPolicyItem {
@@ -460,11 +466,16 @@ export interface CronJobOverviewBranchRankingRow {
   readTasks: string;
   involvedManagers: string;
   resultViewManagers: string;
+  resultViewManagerRate: string;
   planManagers: string;
+  planManagerRate: string;
   insightManagers: string;
+  insightManagerRate: string;
   phoneManagers: string;
+  phoneManagerRate: string;
   recommendedCustomers: string;
   viewedCustomers: string;
+  viewedCustomerRate: string;
   contactedCustomers: string;
   contactRate: string;
   insightCustomers: string;
@@ -530,6 +541,20 @@ export interface CronJobOverviewDateFilters {
   end_date?: string;
   bbk_ids?: string;
 }
+
+export type CronBranchDimensionSortKey = Exclude<
+  keyof CronJobOverviewBranchRankingRow,
+  "rank" | "bbkId" | "branchName"
+>;
+
+export type CronBranchDimensionExportFilters = {
+  start_date: string;
+  end_date: string;
+  bbk_ids?: string;
+} & (
+  | { sort_by: CronBranchDimensionSortKey; sort_order: "asc" | "desc" }
+  | { sort_by?: never; sort_order?: never }
+);
 
 export interface CronOverviewStatsResponse {
   start_date: string;
@@ -779,11 +804,33 @@ function formatRatioPercentText(value: number | null | undefined) {
   return `${(Number(value ?? 0) * 100).toFixed(2)}%`;
 }
 
+function formatDivisionPercentText(
+  numerator: number | null | undefined,
+  denominator: number | null | undefined,
+) {
+  const denominatorValue = Number(denominator ?? 0);
+  if (!Number.isFinite(denominatorValue) || denominatorValue <= 0) {
+    return "0.00%";
+  }
+  const numeratorValue = Number(numerator ?? 0);
+  return `${((numeratorValue / denominatorValue) * 100).toFixed(2)}%`;
+}
+
 export function mapCronJobOverviewPageData(
   stats: CronOverviewStatsResponse,
   behavior: CronBranchRankingResponse,
   branchError: CronBranchErrorResponse,
 ): CronJobOverviewPageData {
+  return {
+    ...mapCronOverviewStats(stats),
+    ...mapCronBranchRanking(behavior),
+    ...mapCronBranchError(branchError),
+  };
+}
+
+export function mapCronOverviewStats(
+  stats: CronOverviewStatsResponse,
+): Pick<CronJobOverviewPageData, "summaryMetrics"> {
   return {
     summaryMetrics: [
       { key: "branches", value: formatInteger(stats.branch_count) },
@@ -814,6 +861,13 @@ export function mapCronJobOverviewPageData(
       { key: "insight_count", value: formatInteger(stats.insight_count) },
       { key: "phone_count", value: formatInteger(stats.phone_count) },
     ],
+  };
+}
+
+export function mapCronBranchRanking(
+  behavior: CronBranchRankingResponse,
+): Pick<CronJobOverviewPageData, "branchRankingRows"> {
+  return {
     branchRankingRows: behavior.items.map((item, index) => ({
       rank: index + 1,
       bbkId: item.bbk_id || "",
@@ -824,16 +878,46 @@ export function mapCronJobOverviewPageData(
       readTasks: formatInteger(item.read_tasks),
       involvedManagers: formatInteger(item.involved_managers),
       resultViewManagers: formatInteger(item.result_view_managers),
+      resultViewManagerRate: formatDivisionPercentText(
+        item.result_view_managers,
+        item.involved_managers,
+      ),
       planManagers: formatInteger(item.plan_managers),
+      planManagerRate: formatDivisionPercentText(
+        item.plan_managers,
+        item.result_view_managers,
+      ),
       insightManagers: formatInteger(item.insight_managers),
+      insightManagerRate: formatDivisionPercentText(
+        item.insight_managers,
+        item.plan_managers,
+      ),
       phoneManagers: formatInteger(item.phone_managers),
+      phoneManagerRate: formatDivisionPercentText(
+        item.phone_managers,
+        item.plan_managers,
+      ),
       recommendedCustomers: formatInteger(item.recommended_customers),
       viewedCustomers: formatInteger(item.viewed_customers),
+      viewedCustomerRate: formatDivisionPercentText(
+        item.viewed_customers,
+        item.recommended_customers,
+      ),
       contactedCustomers: formatInteger(item.contacted_customers ?? 0),
       contactRate: formatRatioPercentText(item.contact_rate ?? 0),
       insightCustomers: formatInteger(item.insight_customers),
       phoneCustomers: formatInteger(item.phone_customers),
     })),
+  };
+}
+
+export function mapCronBranchError(
+  branchError: CronBranchErrorResponse,
+): Pick<
+  CronJobOverviewPageData,
+  "failureReasons" | "anomalySummary" | "anomalyRankRows"
+> {
+  return {
     failureReasons: branchError.error_reasons.map((item, index) => ({
       name: item.reason || "其他",
       count: Number(item.count || 0),
@@ -929,7 +1013,12 @@ export const monitorApi = {
   getCronDispatchBatchDetail: async (
     batchId: string,
     filters?: {
+      intent_page?: string;
       intent_limit?: string;
+      intent_query?: string;
+      intent_role?: string;
+      intent_status?: string;
+      event_page?: string;
       event_limit?: string;
     },
   ): Promise<CronDispatchBatchDetailResponse> => {
@@ -1208,6 +1297,68 @@ export const monitorApi = {
       });
     }
     const url = getApiUrl(`/monitor/cron/export?${params.toString()}`);
+    const headers = new Headers(buildAuthHeaders());
+    const response = await fetch(url, { headers });
+    if (!response.ok) {
+      let errorMessage = `Export failed: ${response.status} ${response.statusText}`;
+      try {
+        const errorData = await response.json();
+        if (errorData.detail) {
+          errorMessage = errorData.detail;
+        }
+      } catch {
+        // Ignore JSON parse error
+      }
+      throw new Error(errorMessage);
+    }
+    return response.blob();
+  },
+
+  exportBranchDimension: async (
+    filters: CronBranchDimensionExportFilters,
+  ): Promise<Blob> => {
+    const response = await fetch(
+      getApiUrl(`/monitor/cron/export-branch-dimension${buildQuery(filters)}`),
+      { headers: new Headers(buildAuthHeaders()) },
+    );
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => null);
+      throw new Error(
+        typeof errorData?.detail === "string"
+          ? errorData.detail
+          : `导出失败（HTTP ${response.status}），请稍后重试`,
+      );
+    }
+    if (
+      !response.headers
+        .get("content-type")
+        ?.includes(
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    ) {
+      throw new Error("导出接口未返回 Excel 文件，请稍后重试");
+    }
+    return response.blob();
+  },
+
+  // Export overview execution/customer detail to Excel
+  exportSkillUsageDetails: async (filters?: {
+    start_date?: string;
+    end_date?: string;
+    bbk_ids?: string;
+  }): Promise<Blob> => {
+    const params = new URLSearchParams();
+    if (filters) {
+      Object.entries(filters).forEach(([key, value]) => {
+        if (value !== undefined && value !== null && value !== "") {
+          params.append(key, value);
+        }
+      });
+    }
+    const query = params.toString();
+    const url = getApiUrl(
+      `/monitor/cron/export-detail${query ? `?${query}` : ""}`,
+    );
     const headers = new Headers(buildAuthHeaders());
     const response = await fetch(url, { headers });
     if (!response.ok) {

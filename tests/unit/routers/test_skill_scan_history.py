@@ -19,13 +19,13 @@ from swe.security.skill_scanner.history import (
 class _Store:
     def __init__(self, *, available: bool = True) -> None:
         self.is_available = available
-        self.list_calls: list[tuple[int, int]] = []
+        self.list_calls: list[tuple[int, int, str]] = []
         self.warning_calls: list[tuple[str, str]] = []
         self.deleted: list[str] = []
         self.cleared = False
 
-    async def list_page(self, *, page: int, page_size: int):
-        self.list_calls.append((page, page_size))
+    async def list_page(self, *, page: int, page_size: int, source_id: str):
+        self.list_calls.append((page, page_size, source_id))
         return SkillScanHistoryPage(
             items=[
                 BlockedSkillRecord(
@@ -35,6 +35,9 @@ class _Store:
                     max_severity="HIGH",
                     findings=[],
                     action="blocked",
+                    source_id="source-a",
+                    user_id="user-a",
+                    bbk_id="bbk-a",
                 ),
             ],
             total=5000,
@@ -57,6 +60,9 @@ class _Store:
             max_severity="HIGH",
             findings=[],
             action="warned",
+            source_id="source-a",
+            user_id="user-a",
+            bbk_id="bbk-a",
         )
 
     async def clear(self) -> None:
@@ -74,10 +80,11 @@ def test_history_route_returns_requested_database_page():
     store = _Store()
     response = _client(store).get(
         "/config/security/skill-scanner/blocked-history?page=2&page_size=10",
+        headers={"X-Source-Id": "source-a"},
     )
 
     assert response.status_code == 200
-    assert store.list_calls == [(2, 10)]
+    assert store.list_calls == [(2, 10, "source-a")]
     assert response.json() == {
         "items": [
             {
@@ -88,6 +95,9 @@ def test_history_route_returns_requested_database_page():
                 "findings": [],
                 "content_hash": "",
                 "action": "blocked",
+                "source_id": "source-a",
+                "user_id": "user-a",
+                "bbk_id": "bbk-a",
             },
         ],
         "total": 5000,
@@ -103,19 +113,22 @@ def test_history_route_defaults_and_validates_page_size():
     assert (
         client.get(
             "/config/security/skill-scanner/blocked-history",
+            headers={"X-Source-Id": "source-a"},
         ).status_code
         == 200
     )
-    assert store.list_calls == [(1, 20)]
+    assert store.list_calls == [(1, 20, "source-a")]
     assert (
         client.get(
             "/config/security/skill-scanner/blocked-history?page_size=9",
+            headers={"X-Source-Id": "source-a"},
         ).status_code
         == 422
     )
     assert (
         client.get(
             "/config/security/skill-scanner/blocked-history?page_size=101",
+            headers={"X-Source-Id": "source-a"},
         ).status_code
         == 422
     )
@@ -161,7 +174,10 @@ def test_history_routes_return_503_when_store_is_unavailable():
     client = _client(_Store(available=False))
     path = "/config/security/skill-scanner/blocked-history"
 
-    assert client.get(path).status_code == 503
+    assert (
+        client.get(path, headers={"X-Source-Id": "source-a"}).status_code
+        == 503
+    )
     assert (
         client.get(
             f"{path}/latest-warning",
@@ -169,6 +185,7 @@ def test_history_routes_return_503_when_store_is_unavailable():
                 "skill_name": "unsafe-skill",
                 "since": "2026-08-03T08:30:00+00:00",
             },
+            headers={"X-Source-Id": "source-a"},
         ).status_code
         == 503
     )
@@ -211,6 +228,7 @@ def test_history_route_returns_503_when_recorder_flush_times_out(
 
     response = TestClient(app).get(
         "/config/security/skill-scanner/blocked-history",
+        headers={"X-Source-Id": "source-a"},
     )
 
     assert response.status_code == 503

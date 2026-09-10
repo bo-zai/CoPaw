@@ -17,6 +17,7 @@ interface RuntimeEnvConfig {
   systemSect?: string;
   responseFeedbackUserWhitelist?: string[];
   voiceRecorderUserWhitelist?: string[];
+  directAccessUserWhitelist?: string[];
   chatSessionPageSize?: number | string;
 }
 

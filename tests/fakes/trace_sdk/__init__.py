@@ -1,7 +1,14 @@
 # -*- coding: utf-8 -*-
 """Test fake for only the documented AgentTraceSDK surface used by Swe."""
 
-from ._impl import SpanKind, TraceFields, decorator, global_tracer
+from ._impl import (
+    SpanKind,
+    TraceFields,
+    decorator,
+    extract_trace_context,
+    global_tracer,
+    use_trace_context,
+)
 
 
 def chat_traced(**config):

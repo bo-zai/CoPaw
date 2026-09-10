@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Unit tests for tenant-scoped bootstrap helper functions."""
 
+import importlib
 import json
 import sys
 from pathlib import Path
@@ -26,6 +27,15 @@ from swe.config.config import (
 )
 from swe.config.utils import save_config
 from swe.constant import BUILTIN_QA_AGENT_ID
+
+
+def _skip_workspace_skill_seeding(monkeypatch):
+    agents_router_module = importlib.import_module("swe.app.routers.agents")
+    monkeypatch.setattr(
+        agents_router_module,
+        "_initialize_agent_workspace",
+        lambda *_args, **_kwargs: None,
+    )
 
 
 def test_ensure_default_agent_exists_uses_tenant_working_dir(
@@ -59,6 +69,7 @@ def test_ensure_qa_agent_exists_uses_tenant_working_dir(tmp_path, monkeypatch):
     tenant_dir = tmp_path / "tenant-bravo"
     global_dir = tmp_path / "global-default"
     monkeypatch.setattr(migration_module, "WORKING_DIR", global_dir)
+    _skip_workspace_skill_seeding(monkeypatch)
 
     ensure_qa_agent_exists(working_dir=tenant_dir)
 
@@ -86,6 +97,7 @@ def test_ensure_qa_agent_exists_uses_tenant_language_templates(
     tenant_dir = tmp_path / "tenant-echo"
     observed = {}
     original_agent_profile_config = migration_module.AgentProfileConfig
+    _skip_workspace_skill_seeding(monkeypatch)
     save_config(
         Config(
             agents=AgentsConfig(

@@ -61,9 +61,22 @@ const records = Array.from({ length: 10 }, (_, index) => ({
   skill_name: `skill-${index}`,
   blocked_at: "2026-08-03T08:00:00+00:00",
   max_severity: "HIGH",
-  findings: [],
+  findings: [
+    {
+      severity: "HIGH",
+      title: "unsafe",
+      description: "unsafe behavior",
+      file_path: "SKILL.md",
+      line_number: 3,
+      rule_id: "RULE",
+      analyzer: "package",
+    },
+  ],
   content_hash: "",
   action: "blocked" as const,
+  source_id: "source-a",
+  user_id: "user-a",
+  bbk_id: "bbk-a",
 }));
 
 function setHookState(overrides: Record<string, unknown> = {}) {
@@ -191,5 +204,21 @@ describe("SkillScannerSection history", () => {
         name: "security.skillScanner.scanAlerts.remove",
       })[0],
     ).toBeDisabled();
+  });
+
+  it("shows user and branch columns and analyzer details for scan alerts", () => {
+    render(<SkillScannerSection />);
+
+    expect(screen.getAllByText("user-a").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("bbk-a").length).toBeGreaterThan(0);
+    expect(screen.queryByText("source-a")).not.toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getAllByRole("button", {
+        name: "security.skillScanner.scanAlerts.viewFindings",
+      })[0],
+    );
+
+    expect(screen.getByText("package")).toBeInTheDocument();
   });
 });

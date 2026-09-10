@@ -14,6 +14,7 @@ from swe.tracing.agent_trace_sdk import global_tracer
 
 from ..command_dispatch import _is_command, run_command_path
 from ..query_attempt import _query_session_execution
+from ..session_lifecycle import admit_user_turn
 
 
 async def stream_admission(
@@ -33,6 +34,14 @@ async def stream_admission(
             user_id,
             request=request,
         ) as session_execution:
+            if session_execution is not None and not (
+                query and _is_command(query)
+            ):
+                await admit_user_turn(
+                    session_execution,
+                    msgs=msgs,
+                    request=request,
+                )
             preflight_args = {
                 "session_id": session_id,
                 "user_id": user_id,

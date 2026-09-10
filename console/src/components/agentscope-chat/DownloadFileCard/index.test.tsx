@@ -8,6 +8,7 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 import DownloadFileCard from "./index";
 import { AutoPreviewHtmlProvider } from "../AutoPreviewHtmlContext";
+import { FilePreviewPresentationProvider } from "../FilePreviewPresentationContext";
 
 vi.mock("@agentscope-ai/icons", () => ({
   SparkDownloadLine: () => <span data-testid="download-icon" />,
@@ -29,11 +30,63 @@ vi.mock("../FilePreviewModal", () => ({
     ) : null,
 }));
 
+vi.mock("../FilePreviewDrawer", () => ({
+  default: (props: { open: boolean; fileName: string }) =>
+    props.open ? (
+      <div data-testid="file-preview-drawer">{props.fileName}</div>
+    ) : null,
+}));
+
 afterEach(() => {
   cleanup();
 });
 
 describe("DownloadFileCard", () => {
+  it("普通聊天显式选择 drawer 时使用右侧预览组件", () => {
+    render(
+      <FilePreviewPresentationProvider value="drawer">
+        <DownloadFileCard
+          url="https://example.test/static/report.html"
+          fileName="report.html"
+        />
+      </FilePreviewPresentationProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button"));
+
+    expect(screen.getByTestId("file-preview-drawer")).toHaveTextContent(
+      "report.html",
+    );
+    expect(screen.queryByTestId("file-preview-modal")).not.toBeInTheDocument();
+  });
+
+  it("普通聊天选择 workspace 时将文件交给统一文件工作台", () => {
+    const handler = vi.fn();
+    window.addEventListener("copaw:chat-workspace-file", handler);
+    render(
+      <FilePreviewPresentationProvider value="workspace">
+        <DownloadFileCard
+          url="https://example.test/static/report.html"
+          fileName="report.html"
+        />
+      </FilePreviewPresentationProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button"));
+
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({
+        detail: expect.objectContaining({
+          action: "open",
+          fileName: "report.html",
+        }),
+      }),
+    );
+    expect(screen.queryByTestId("file-preview-drawer")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("file-preview-modal")).not.toBeInTheDocument();
+    window.removeEventListener("copaw:chat-workspace-file", handler);
+  });
+
   it("显式启用时自动打开带 auto-preview 标记的 HTML 预览", async () => {
     render(
       <DownloadFileCard

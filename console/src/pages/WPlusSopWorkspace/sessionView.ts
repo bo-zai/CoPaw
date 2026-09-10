@@ -121,6 +121,8 @@ export function getWPlusSopStateLabel(state: WPlusSopState): string {
     ExecutingTrial: "正在执行预跑",
     AwaitingTrialFeedback: "等待预跑反馈",
     AwaitingStageConfirmation: "等待确认环节",
+    GeneratingStageReport: "正在生成环节报告",
+    RefreshingCumulative: "正在刷新累计 SOP",
     FinalizingOutputs: "正在生成结果",
     OutputReview: "等待确认结果",
     MemoryReview: "待处理记忆候选",

@@ -512,6 +512,183 @@
   justify-content: flex-end;
 }
 
+.goalProposalCard {
+  max-height: min(440px, 50vh);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+}
+
+.goalProposalCard .reviewHeader {
+  flex: 0 0 auto;
+  padding-bottom: 4px;
+}
+
+.goalIcon {
+  flex: 0 0 auto;
+  color: var(--clarification-accent);
+  margin-top: 2px;
+}
+.goalDraftBadge {
+  border-radius: 999px;
+  background: var(--clarification-selected-bg);
+  color: var(--clarification-accent);
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 8px;
+}
+.goalSummary {
+  flex: 0 0 auto;
+  border: 1px solid var(--clarification-border);
+  border-left: 3px solid var(--clarification-accent);
+  border-radius: 9px;
+  background: var(--clarification-soft-bg);
+  padding: 10px 12px;
+}
+.goalSummaryTitle {
+  color: var(--clarification-text);
+  font-size: 12px;
+  font-weight: 700;
+}
+.goalSummary p {
+  margin: 4px 0 8px;
+  color: var(--clarification-muted);
+  font-size: 13px;
+  line-height: 19px;
+  overflow-wrap: anywhere;
+}
+.goalSummaryStats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.goalSummaryStats span {
+  border-radius: 999px;
+  background: #fff;
+  color: var(--clarification-muted);
+  font-size: 11px;
+  padding: 3px 7px;
+}
+.goalDetailToggle {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 0;
+  background: transparent;
+  color: var(--clarification-accent);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  padding: 2px 0;
+}
+.goalDetailToggle svg {
+  transition: transform 160ms ease;
+}
+.goalDetailToggle[aria-expanded="true"] svg {
+  transform: rotate(180deg);
+}
+.goalDetails {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 2px 3px 2px 0;
+}
+.goalDraftNotice {
+  margin: 0 0 8px;
+  color: var(--clarification-soft);
+  font-size: 11px;
+}
+.goalField {
+  display: grid;
+  gap: 5px;
+  margin-bottom: 10px;
+}
+.goalField > label,
+.goalFieldLabel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--clarification-text);
+  font-size: 12px;
+  font-weight: 700;
+}
+.goalField > label svg {
+  color: var(--clarification-accent);
+}
+.goalField > label span {
+  color: var(--clarification-soft);
+  font-size: 11px;
+  font-weight: 500;
+}
+.goalField textarea {
+  width: 100%;
+  min-height: 52px;
+  border: 1px solid var(--clarification-border);
+  border-radius: 8px;
+  outline: none;
+  background: #fff;
+  color: var(--clarification-text);
+  font: inherit;
+  font-size: 13px;
+  line-height: 19px;
+  padding: 8px 10px;
+  resize: vertical;
+}
+.goalField textarea:focus {
+  border-color: var(--clarification-accent);
+  box-shadow: 0 0 0 2px rgba(55, 105, 252, 0.16);
+}
+.goalField textarea:disabled {
+  background: var(--clarification-soft-bg);
+  cursor: not-allowed;
+}
+.goalFieldLabel label {
+  color: var(--clarification-text);
+}
+.goalFormatButton {
+  border: 1px solid var(--clarification-border);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--clarification-muted);
+  font: inherit;
+  font-size: 11px;
+  padding: 3px 7px;
+  cursor: pointer;
+}
+.goalConstraintPair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.goalFieldError,
+.goalAggregateError {
+  margin: 0;
+  color: #c24132;
+  font-size: 11px;
+  line-height: 16px;
+}
+.goalAggregateError {
+  flex: 0 0 auto;
+  border-radius: 7px;
+  background: #fff4f1;
+  padding: 7px 9px;
+}
+.goalProposalCard .reviewActions {
+  flex: 0 0 auto;
+  margin-top: 0;
+  padding-top: 10px;
+}
+
+@media (max-width: 768px) {
+  .goalConstraintPair {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+}
+
 @keyframes clarification-enter {
   from {
     opacity: 0;

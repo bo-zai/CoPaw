@@ -99,6 +99,11 @@ class QueryAttemptOwner(Protocol):
         runtime_start: Any,
     ) -> None: ...
 
+    async def _settle_stopped_turn(
+        self,
+        **kwargs: Any,
+    ) -> None: ...
+
     async def _store_qa_content_if_needed(self, **kwargs: Any) -> None: ...
 
     async def _prepare_query_runtime(self, **kwargs: Any) -> Any: ...
@@ -334,6 +339,8 @@ async def stream_single_query_attempt(
         attempt_state.should_return = True
         return
     runtime.session_execution = attempt_input.session_execution
+    from .session_lifecycle import discard_admitted_user_anchor
+
     with runtime_invocation_claims_context(
         chat_id=runtime.chat.id if runtime.chat is not None else None,
     ):
@@ -355,6 +362,12 @@ async def stream_single_query_attempt(
                 retry_state,
                 "agent_state_snapshot",
                 None,
+            ),
+        )
+        discard_admitted_user_anchor(
+            runtime.agent,
+            (getattr(runtime.agent, "_request_context", None) or {}).get(
+                "msgid",
             ),
         )
         retry_state.agent = runtime.agent
@@ -391,6 +404,13 @@ async def stream_single_query_attempt(
                 )
                 attempt_state.session_title_task_started = True
             yield msg, last
+        settle_stopped_turn = getattr(owner, "_settle_stopped_turn", None)
+        if callable(settle_stopped_turn):
+            await settle_stopped_turn(
+                runtime=runtime,
+                request=attempt_input.request,
+                session_execution=attempt_input.session_execution,
+            )
         skill_snapshot_to_persist = (
             await owner._build_skill_snapshot_to_persist(
                 runtime=runtime,
@@ -465,6 +485,13 @@ async def _stream_retry_attempt(
             ):
                 yield item
     except asyncio.CancelledError as exc:
+        settle_stopped_turn = getattr(owner, "_settle_stopped_turn", None)
+        if callable(settle_stopped_turn):
+            await settle_stopped_turn(
+                runtime=attempt_state.runtime,
+                request=request,
+                session_execution=session_execution,
+            )
         await owner._handle_query_cancelled(
             trace_id=trace_id,
             session_id=session_id,

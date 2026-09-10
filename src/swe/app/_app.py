@@ -48,6 +48,7 @@ from .migration import (
 from .channels.registry import register_custom_channel_routes
 from ..tracing import init_trace_manager, close_trace_manager
 from ..tracing.agent_trace_sdk import shutdown_global_tracer
+from .runner.model_call_error_detail import redact_sensitive_fragments
 from ..database import get_database_config
 from .service_heartbeat import start_service_heartbeat, stop_service_heartbeat
 from .crons.notification_worker import CronNotificationWorker
@@ -57,6 +58,14 @@ from .runtime_diagnostic import RuntimeDiagnosticManager
 logger = setup_logger(os.environ.get(LOG_LEVEL_ENV, "info"))
 
 _SKILL_SCAN_HISTORY_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+_DYNAMIC_RUNNER_ERROR_MESSAGE_MAX_LENGTH = 512
+
+
+def _safe_dynamic_runner_error_message(error: Exception) -> str:
+    message = redact_sensitive_fragments(str(error))
+    if len(message) <= _DYNAMIC_RUNNER_ERROR_MESSAGE_MAX_LENGTH:
+        return message
+    return message[:_DYNAMIC_RUNNER_ERROR_MESSAGE_MAX_LENGTH] + "..."
 
 
 # Ensure static assets are served with browser-compatible MIME types across
@@ -111,12 +120,16 @@ class DynamicMultiAgentRunner:
             )
             return workspace.runner
         except ValueError as e:
-            logger.error(f"Agent not found: {e}")
+            logger.error(
+                "Agent not found: %s",
+                _safe_dynamic_runner_error_message(e),
+            )
             raise
         except Exception as e:
+            safe_message = _safe_dynamic_runner_error_message(e)
             logger.error(
-                f"Error getting workspace runner: {e}",
-                exc_info=True,
+                "Error getting workspace runner: %s",
+                safe_message,
             )
             raise
 
@@ -144,15 +157,31 @@ class DynamicMultiAgentRunner:
                     yield item
             logger.debug(f"stream_query completed, yielded {count} items")
         except Exception as e:
-            logger.error(
-                f"Error in stream_query: {e}",
-                exc_info=True,
+            from agentscope_runtime.engine.schemas.agent_schemas import (
+                AgentResponse,
+                Error,
             )
-            # Yield error message to client
-            yield {
-                "error": str(e),
-                "type": "error",
-            }
+
+            safe_message = _safe_dynamic_runner_error_message(e)
+            logger.error(
+                "Error in stream_query: %s",
+                safe_message,
+            )
+            request_id = (
+                request.get("id")
+                if isinstance(request, dict)
+                else getattr(
+                    request,
+                    "id",
+                    None,
+                )
+            )
+            yield AgentResponse(id=request_id).failed(
+                Error(
+                    code="agent_runtime_error",
+                    message=safe_message,
+                ),
+            )
 
     async def query_handler(self, request, *args, **kwargs):
         """Dynamically route to the correct workspace runner."""
@@ -648,6 +677,7 @@ async def _initialize_database_backed_modules(
             init_html_preview_click_module,
         )
         from .scenario_preset.router import init_scenario_preset_module
+        from .chat_sharing.router import initialize_chat_sharing_module
 
         await initialize_goal_service(db_connection)
         init_greeting_module(db_connection)
@@ -656,9 +686,10 @@ async def _initialize_database_backed_modules(
         init_skill_result_module(db_connection)
         init_html_preview_click_module(db_connection)
         await init_scenario_preset_module(db_connection)
+        await initialize_chat_sharing_module(db_connection)
         logger.info(
             "Greeting, FeaturedCase, Feedback, SkillResult, HTML preview click "
-            "and ScenarioPreset modules initialized",
+            "ScenarioPreset and ChatSharing modules initialized",
         )
 
         from .workspace.tenant_init_source_store import (
@@ -693,6 +724,12 @@ async def _start_lifespan_background_services(
     multi_agent_manager: MultiAgentManager,
 ) -> None:
     """启动生命周期内常驻的后台服务。"""
+    from ..security.tool_guard.watcher import ToolGuardConfigWatcher
+
+    tool_guard_watcher = ToolGuardConfigWatcher()
+    await tool_guard_watcher.start()
+    app.state.tool_guard_config_watcher = tool_guard_watcher
+
     await start_service_heartbeat()
     # get_monitor_sync_client().schedule_swe_cron_warmup(
     #     start_delay_seconds=5.0,
@@ -719,6 +756,10 @@ async def _shutdown_lifespan_resources(
     db_connection: Any | None,
 ) -> None:
     """按依赖顺序关闭生命周期资源。"""
+    tool_guard_watcher = getattr(app.state, "tool_guard_config_watcher", None)
+    if tool_guard_watcher is not None:
+        await tool_guard_watcher.stop()
+
     try:
         from ..agents.tools.background_process import (
             managed_background_process_manager,
@@ -949,6 +990,7 @@ if CORS_ORIGINS:
             "Content-Disposition",
             "X-Swe-Msgid",
             "X-Swe-Sessionid",
+            "X-Swe-Chatid",
         ],
     )
 

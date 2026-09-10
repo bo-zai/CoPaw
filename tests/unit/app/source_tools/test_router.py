@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
+import importlib
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -161,11 +163,17 @@ async def test_manual_draft_test_uses_guarded_agent_path(
     async def fake_agent_and_config(_request):
         return workspace, FakeConfig()
 
+    agent_context = importlib.import_module("swe.app.agent_context")
     monkeypatch.setattr(
-        "swe.app.agent_context.get_agent_and_config_for_request",
+        agent_context,
+        "get_agent_and_config_for_request",
         fake_agent_and_config,
     )
-    monkeypatch.setattr("swe.agents.react_agent.SWEAgent", FakeAgent)
+    fake_react_agent = ModuleType("swe.agents.react_agent")
+    fake_react_agent.SWEAgent = FakeAgent
+    monkeypatch.setitem(
+        sys.modules, "swe.agents.react_agent", fake_react_agent
+    )
 
     response = await manual_test_draft(
         "source_echo",
@@ -225,8 +233,10 @@ async def test_inactive_source_only_tool_is_not_listed_as_builtin(
     async def fake_agent_and_config(_request):
         return SimpleNamespace(), agent_config
 
+    agent_context = importlib.import_module("swe.app.agent_context")
     monkeypatch.setattr(
-        "swe.app.agent_context.get_agent_and_config_for_request",
+        agent_context,
+        "get_agent_and_config_for_request",
         fake_agent_and_config,
     )
 

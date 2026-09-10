@@ -129,6 +129,25 @@ describe("loadSessionMessages session detail errors", () => {
     ]);
   });
 
+  it("can refresh generating state without scheduling a reconnect", async () => {
+    const emitSpy = vi.spyOn(
+      await import("./useChatAnywhereEventEmitter"),
+      "emit",
+    );
+    await loadSessionMessages({
+      requestedSessionId: "chat-generating",
+      clearBeforeLoad: false,
+      reconnectIfGenerating: false,
+      options: createOptions(
+        vi.fn().mockResolvedValue({ messages: [], generating: true }),
+      ),
+      setMessages: vi.fn(),
+      getCurrentSessionId: () => "chat-generating",
+    });
+    expect(emitSpy).not.toHaveBeenCalled();
+    emitSpy.mockRestore();
+  });
+
   it("ignores a stale HTTP 404 after the active session changes", async () => {
     let rejectRequest: (error: Error) => void = () => {};
     const request = new Promise((_, reject) => {

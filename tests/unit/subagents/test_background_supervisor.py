@@ -92,6 +92,64 @@ def _spec() -> DelegationSpec:
     )
 
 
+@pytest.mark.asyncio
+async def test_cancel_turn_runs_only_cancels_exact_owner_turn(
+    tmp_path,
+) -> None:
+    popen_factory = _FakePopenFactory()
+    supervisor = BackgroundSubAgentSupervisor(
+        popen_factory=popen_factory,
+        registry=AgentRegistry(
+            [
+                InMemoryDefinitionProvider(
+                    [
+                        _builtin(
+                            name="plan-researcher",
+                            description="test",
+                            instruction="test",
+                        ),
+                    ],
+                ),
+            ],
+        ),
+    )
+    scope = _scope(tmp_path)
+    target = await supervisor.start(
+        scope=scope,
+        spec=DelegationSpec(
+            parent_thread_id="session-1",
+            parent_chat_id="chat-a",
+            parent_msgid="turn-a",
+            name="plan-researcher",
+            objective="Target turn",
+        ),
+        parent_agent_config=_agent_config(tmp_path),
+        workspace_dir=tmp_path,
+    )
+    other = await supervisor.start(
+        scope=scope,
+        spec=DelegationSpec(
+            parent_thread_id="session-1",
+            parent_chat_id="chat-a",
+            parent_msgid="turn-b",
+            name="plan-researcher",
+            objective="Other turn",
+        ),
+        parent_agent_config=_agent_config(tmp_path),
+        workspace_dir=tmp_path,
+    )
+
+    cancelled = await supervisor.cancel_turn_runs(
+        scope,
+        chat_id="chat-a",
+        msgid="turn-a",
+    )
+
+    assert cancelled == [target.run_id]
+    assert (await supervisor.get(scope, target.run_id)).status == "cancelled"
+    assert (await supervisor.get(scope, other.run_id)).status == "running"
+
+
 def _agent_config(tmp_path: Path) -> AgentProfileConfig:
     return AgentProfileConfig(
         id="agent-1",
@@ -253,7 +311,9 @@ async def test_wait_lazy_reaps_worker_without_result(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_wait_for_run_waits_for_one_worker_without_a_poll_timeout(tmp_path):
+async def test_wait_for_run_waits_for_one_worker_without_a_poll_timeout(
+    tmp_path,
+):
     popen_factory = _FakePopenFactory()
     definition = _builtin(
         name="plan-researcher",

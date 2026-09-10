@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import asyncio
 import json
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from swe.app.wplus_sop.runtime import (
     start_wplus_chat_turn,
 )
 from swe.app.wplus_sop.runtime_context import get_current_wplus_runtime
+from swe.app.answer_turn.models import TurnIdentity, TurnLease
 
 
 class FakeTracker:
@@ -30,7 +32,7 @@ class FakeTracker:
 
     async def attach_or_start(
         self,
-        chat_id,
+        identity,
         payload,
         stream_fn,
         *,
@@ -38,16 +40,44 @@ class FakeTracker:
     ):
         if before_start is not None:
             before_start()
+        if not self.is_new:
+            return object(), False
         self.call = (
-            chat_id,
+            identity,
             payload,
             stream_fn,
             get_current_wplus_runtime(),
         )
-        return object(), self.is_new
+        return object(), True
 
-    async def detach_subscriber(self, chat_id, queue):
-        self.detached = (chat_id, queue)
+    async def attach(self, _identity):
+        return None
+
+    async def detach_subscriber(self, identity, queue):
+        self.detached = (identity, queue)
+
+    async def stream(self, _identity, _queue):
+        for item in ():
+            yield item
+
+
+class FakeCoordinator:
+    def __init__(self, tracker):
+        self.tracker = tracker
+
+    async def start_or_attach(self, chat_id, payload, producer, **kwargs):
+        identity = TurnIdentity(
+            chat_id=chat_id,
+            msgid=kwargs.get("msgid") or "msg-1",
+            turn_id="turn-1",
+        )
+        queue, is_new = await self.tracker.attach_or_start(
+            identity,
+            payload,
+            producer,
+            before_start=kwargs.get("before_start"),
+        )
+        return TurnLease(identity, queue, is_new)
 
 
 class FakeChannelManager:
@@ -468,7 +498,7 @@ def test_stage_proposal_command_requires_one_schema_valid_event():
         payload={"original_request": "梳理客户筛选流程"},
     )
 
-    assert "只允许成功持久化一个业务边界事件" in text
+    assert "每个业务边界调用 emit_wplus_sop_event" in text
     assert "工具返回 ok=false" in text
     assert "kind='stage_proposal'" in text
     assert "不得把命令输入中的 payload 原样提交" in text
@@ -476,13 +506,16 @@ def test_stage_proposal_command_requires_one_schema_valid_event():
     assert "memory/common-wplus-knowledge.jsonl" in text
     assert "memory/cases/sop-cases.jsonl" in text
     example_marker = "stage_proposal payload 示例：\n"
-    example = json.loads(text.split(example_marker, maxsplit=1)[1].splitlines()[0])
+    example = json.loads(
+        text.split(example_marker, maxsplit=1)[1].splitlines()[0],
+    )
     validated = StageProposalPayload.model_validate(example)
 
     assert len(validated.stages) == 2
     assert set(example) == {"stages"}
     assert all(
-        set(stage) == {
+        set(stage)
+        == {
             "stage_id",
             "name",
             "description",
@@ -504,7 +537,7 @@ def test_retrying_stage_proposal_keeps_the_exact_event_contract():
         },
     )
 
-    assert "只允许成功持久化一个业务边界事件" in text
+    assert "每个业务边界调用 emit_wplus_sop_event" in text
     assert "工具返回 ok=false" in text
     assert "kind='stage_proposal'" in text
     assert "stage_proposal payload 示例：" in text
@@ -533,8 +566,8 @@ def test_trial_command_requires_same_background_turn_to_emit_terminal_event(
     assert "不得调用其他业务工具" in text
     assert "trial_execution_completed" in text
     assert "trial_execution_failed" in text
-    assert "run_id 必须严格等于命令中的 run_id=\"run-1\"" in text
-    assert "attempt_id 必须严格等于命令中的 attempt_id=\"attempt-1\"" in text
+    assert 'run_id 必须严格等于命令中的 run_id="run-1"' in text
+    assert 'attempt_id 必须严格等于命令中的 attempt_id="attempt-1"' in text
     assert "confirmed_facts" in text
     assert "unknowns" in text
 
@@ -571,7 +604,9 @@ def test_trial_command_requires_decision_ready_detailed_results(target_state):
     assert validated.result_lists[0].total_count == 1
 
 
-def test_stage_proposal_reads_personal_memory_only_with_anonymous_scope() -> None:
+def test_stage_proposal_reads_personal_memory_only_with_anonymous_scope() -> (
+    None
+):
     text = build_wplus_command_text(
         command="propose_stage_queue",
         sop_session_id="sop-1",
@@ -638,11 +673,15 @@ def test_finalizing_outputs_has_an_explicit_terminal_event_sequence(
     else:
         assert "先提交且只提交一个 sop_result" in text
         sop_example = json.loads(
-            text.split("sop_result payload 示例：\n", maxsplit=1)[1].splitlines()[0],
+            text.split("sop_result payload 示例：\n", maxsplit=1)[
+                1
+            ].splitlines()[0],
         )
         SopResultPayload.model_validate(sop_example)
     memory_example = json.loads(
-        text.split("memory_candidates payload 示例：\n", maxsplit=1)[1].splitlines()[0],
+        text.split("memory_candidates payload 示例：\n", maxsplit=1)[
+            1
+        ].splitlines()[0],
     )
     MemoryCandidatesPayload.model_validate(memory_example)
     assert "进入 OutputReview" in text
@@ -650,7 +689,46 @@ def test_finalizing_outputs_has_an_explicit_terminal_event_sequence(
     assert "不得伪造 approved" in text
 
 
-def test_approved_memory_command_runs_bound_store_script_in_agent_turn() -> None:
+@pytest.mark.parametrize(
+    "is_final_stage",
+    [False, True],
+)
+def test_cumulative_refresh_ends_before_the_next_agent_turn(
+    is_final_stage: bool,
+) -> None:
+    text = build_wplus_command_text(
+        command="confirm_stage",
+        sop_session_id="sop-1",
+        run_id="run-2",
+        attempt_id="attempt-2",
+        payload={
+            "current_stage_id": "stage-2",
+            "confirmed_snapshots": [
+                {
+                    "stage_id": "stage-1",
+                    "report_no": 1,
+                    "revision": 1,
+                    "artifact_sha256": "0" * 64,
+                },
+            ],
+            "is_final_stage": is_final_stage,
+        },
+        target_state="RefreshingCumulative",
+    )
+    body = json.loads(text.splitlines()[1])
+
+    assert body["expected_event_sequence"] == ["cumulative_refreshed"]
+    assert "同一个后台 Agent 回合" in text
+    assert "cumulative_refreshed" in text
+    assert "累计事件成功持久化后结束当前回合" in text
+    assert "不得在本回合生成下一环节问题、执行预跑或生成最终结果" in text
+    assert "sop_result" not in body["expected_event_sequence"]
+    assert "memory_candidates" not in body["expected_event_sequence"]
+
+
+def test_approved_memory_command_runs_bound_store_script_in_agent_turn() -> (
+    None
+):
     text = build_wplus_command_text(
         command="resolve_memory",
         sop_session_id="sop-1",
@@ -762,17 +840,17 @@ def test_generating_questions_requires_one_schema_valid_question_batch(
         target_state="GeneratingQuestions",
     )
 
-    assert "kind='question_batch'" in text
+    assert "[question_batch|trial_plan]" in text
     assert "不得提交 kind='stage_queue_confirmed'" in text
     assert "不得把命令输入中的 payload 原样提交" in text
-    assert "只允许成功持久化一个业务边界事件" in text
+    assert "每个业务边界调用 emit_wplus_sop_event" in text
     assert "工具返回 ok=false" in text
     assert (
         "question_batch.stage_id 必须严格等于命令 payload.current_stage_id="
         in text
     )
     assert json.dumps(payload["current_stage_id"], ensure_ascii=False) in text
-    example_marker = "question_batch payload 示例：\n"
+    example_marker = "question_batch 最终 payload 示例：\n"
     example = json.loads(
         text.split(example_marker, maxsplit=1)[1].splitlines()[0],
     )
@@ -790,6 +868,7 @@ async def test_start_turn_forwards_target_state_into_agent_instruction():
     workspace = SimpleNamespace(
         channel_manager=FakeChannelManager(channel),
         task_tracker=tracker,
+        answer_turn_coordinator=FakeCoordinator(tracker),
     )
 
     await start_wplus_chat_turn(
@@ -808,7 +887,10 @@ async def test_start_turn_forwards_target_state_into_agent_instruction():
     native_payload = tracker.call[1]
     instruction = native_payload["content_parts"][0].text
     assert '"target_state": "GeneratingQuestions"' in instruction
-    assert '"expected_event_kind": "question_batch"' in instruction
+    assert (
+        '"expected_event_sequence": ["[question_batch|trial_plan]"'
+        in instruction
+    )
     assert native_payload["meta"]["wplus_sop_target_state"] == (
         "GeneratingQuestions"
     )
@@ -827,8 +909,8 @@ def test_retry_target_state_falls_back_to_payload_question_contract():
         },
     )
 
-    assert "kind='question_batch'" in text
-    assert "payload.current_stage_id=\"stage-2\"" in text
+    assert "[question_batch|trial_plan]" in text
+    assert 'payload.current_stage_id="stage-2"' in text
     assert "工具返回 ok=false" in text
 
 
@@ -839,6 +921,7 @@ async def test_starts_one_turn_on_owning_chat_and_detaches_internal_queue():
     workspace = SimpleNamespace(
         channel_manager=FakeChannelManager(channel),
         task_tracker=tracker,
+        answer_turn_coordinator=FakeCoordinator(tracker),
     )
     chat = SimpleNamespace(id="chat-1", session_id="logical-1")
     before_start_calls = 0
@@ -860,16 +943,16 @@ async def test_starts_one_turn_on_owning_chat_and_detaches_internal_queue():
         before_start=before_start,
     )
 
-    chat_id, native_payload, stream_fn, trusted_runtime = tracker.call
-    assert chat_id == "chat-1"
-    assert stream_fn is channel.stream_one
+    identity, native_payload, stream_fn, trusted_runtime = tracker.call
+    assert identity.chat_id == "chat-1"
+    assert stream_fn is not channel.stream_one
     assert native_payload["meta"]["session_id"] == "logical-1"
     assert native_payload["meta"]["selected_skill_names"] == [
         "wplus-sop-miner",
     ]
     assert native_payload["meta"]["wplus_sop_session_id"] == "sop-1"
     assert trusted_runtime.run_id == "run-1"
-    assert tracker.detached[0] == "chat-1"
+    assert tracker.detached[0].chat_id == "chat-1"
     assert before_start_calls == 1
     assert result.run_id == "run-1"
 
@@ -881,7 +964,7 @@ async def test_running_turn_freezes_process_local_safe_trace_on_completion():
     completed = asyncio.Event()
 
     class StreamingTracker(FakeTracker):
-        async def stream_from_queue(self, _queue, _chat_id):
+        async def stream(self, _identity, _queue):
             yield _sse(
                 {
                     "object": "message",
@@ -908,9 +991,11 @@ async def test_running_turn_freezes_process_local_safe_trace_on_completion():
         completed.set()
 
     channel = SimpleNamespace(stream_one=object())
+    tracker = StreamingTracker()
     workspace = SimpleNamespace(
         channel_manager=FakeChannelManager(channel),
-        task_tracker=StreamingTracker(),
+        task_tracker=tracker,
+        answer_turn_coordinator=FakeCoordinator(tracker),
     )
 
     await start_wplus_chat_turn(
@@ -937,7 +1022,9 @@ async def test_running_turn_freezes_process_local_safe_trace_on_completion():
     release_stream.set()
     await asyncio.wait_for(completed.wait(), timeout=1)
     await asyncio.sleep(0)
-    completed_snapshot = get_wplus_safe_stream_trace_registry(workspace).snapshot(
+    completed_snapshot = get_wplus_safe_stream_trace_registry(
+        workspace,
+    ).snapshot(
         "sop-1",
         "run-1",
     )
@@ -957,7 +1044,9 @@ async def test_running_turn_freezes_process_local_safe_trace_on_completion():
             },
         ),
     )
-    assert registry.snapshot("sop-1", "run-1").summary_text == "ACCOUNT_SENTINEL"
+    assert (
+        registry.snapshot("sop-1", "run-1").summary_text == "ACCOUNT_SENTINEL"
+    )
 
 
 @pytest.mark.asyncio
@@ -965,7 +1054,7 @@ async def test_failed_stream_calls_on_complete_then_cleans_up():
     completed = asyncio.Event()
 
     class FailingTracker(FakeTracker):
-        async def stream_from_queue(self, _queue, _chat_id):
+        async def stream(self, _identity, _queue):
             yield _sse(
                 {
                     "object": "tool_output_frame",
@@ -983,11 +1072,13 @@ async def test_failed_stream_calls_on_complete_then_cleans_up():
         assert "TOOL_SECRET" not in snapshot.summary_text
         completed.set()
 
+    tracker = FailingTracker()
     workspace = SimpleNamespace(
         channel_manager=FakeChannelManager(
             SimpleNamespace(stream_one=object()),
         ),
-        task_tracker=FailingTracker(),
+        task_tracker=tracker,
+        answer_turn_coordinator=FakeCoordinator(tracker),
     )
 
     await start_wplus_chat_turn(
@@ -1023,7 +1114,7 @@ async def test_cancelled_stream_calls_on_complete_then_cleans_up(monkeypatch):
     original_create_task = asyncio.create_task
 
     class BlockingTracker(FakeTracker):
-        async def stream_from_queue(self, _queue, _chat_id):
+        async def stream(self, _identity, _queue):
             yield _sse(
                 {
                     "object": "content",
@@ -1044,11 +1135,13 @@ async def test_cancelled_stream_calls_on_complete_then_cleans_up(monkeypatch):
         completed.set()
 
     monkeypatch.setattr(asyncio, "create_task", capture_task)
+    tracker = BlockingTracker()
     workspace = SimpleNamespace(
         channel_manager=FakeChannelManager(
             SimpleNamespace(stream_one=object()),
         ),
-        task_tracker=BlockingTracker(),
+        task_tracker=tracker,
+        answer_turn_coordinator=FakeCoordinator(tracker),
     )
 
     await start_wplus_chat_turn(
@@ -1087,6 +1180,7 @@ async def test_refuses_to_attach_to_an_unrelated_existing_chat_run():
     workspace = SimpleNamespace(
         channel_manager=FakeChannelManager(channel),
         task_tracker=tracker,
+        answer_turn_coordinator=FakeCoordinator(tracker),
     )
 
     with pytest.raises(WPlusChatRunBusyError):
@@ -1102,4 +1196,4 @@ async def test_refuses_to_attach_to_an_unrelated_existing_chat_run():
             attempt_id="attempt-1",
         )
 
-    assert tracker.detached[0] == "chat-1"
+    assert tracker.detached[0].chat_id == "chat-1"

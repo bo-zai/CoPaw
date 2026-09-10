@@ -7,6 +7,8 @@ import pytest
 from pydantic import ValidationError
 
 from swe.app.wplus_sop.models import (
+    CumulativePreview,
+    ConfirmedStageSnapshot,
     EventKind,
     FinalSopResult,
     MemoryCandidate,
@@ -24,6 +26,10 @@ from swe.app.wplus_sop.models import (
     StageProposalPayload,
     StageQueue,
     StageQueueConfirmedPayload,
+    StageReport,
+    StageReportArtifact,
+    StageReportGeneratedPayload,
+    StageReportValidationEvidence,
     StructuredInteractionEnvelope,
     TrialExecutionCompletedPayload,
     assert_legal_transition,
@@ -642,3 +648,264 @@ def test_pending_exit_may_complete_at_the_natural_run_boundary() -> None:
         SessionState.PENDING_EXIT,
         SessionState.COMPLETED,
     )
+
+
+def _stage_report_artifacts() -> list[StageReportArtifact]:
+    return [
+        StageReportArtifact(
+            artifact_id="stage_sop_json",
+            name="stage_sop.json",
+            static_file_name="json.file",
+            static_url="https://static.example/stage_sop.json",
+            sha256="a" * 64,
+            copied_by="copy_file_to_static",
+        ),
+        StageReportArtifact(
+            artifact_id="stage_sop_md",
+            name="stage_sop.md",
+            static_file_name="md.file",
+            static_url="https://static.example/stage_sop.md",
+            sha256="b" * 64,
+            copied_by="copy_file_to_static",
+        ),
+        StageReportArtifact(
+            artifact_id="stage_sop_html",
+            name="stage_sop.html",
+            static_file_name="html.file",
+            static_url="https://static.example/stage_sop.html",
+            sha256="c" * 64,
+            copied_by="copy_file_to_static",
+        ),
+    ]
+
+
+def _validation_evidence() -> StageReportValidationEvidence:
+    return StageReportValidationEvidence(
+        schema_validator="scripts/validate_stage_sop.py",
+        schema_exit_code=0,
+        renderers=("scripts/render_stage_md.py", "scripts/render_stage_sop.py"),
+    )
+
+
+def _stage_report(
+    stage_id: str,
+    report_no: int,
+    *,
+    revision: int = 0,
+) -> StageReport:
+    return StageReport(
+        stage_id=stage_id,
+        report_no=report_no,
+        revision=revision,
+        artifacts=_stage_report_artifacts(),
+        validation=_validation_evidence(),
+    )
+
+
+def _snapshot(
+    stage_id: str,
+    report_no: int,
+    *,
+    revision: int = 0,
+) -> ConfirmedStageSnapshot:
+    return ConfirmedStageSnapshot(
+        stage_id=stage_id,
+        report_no=report_no,
+        revision=revision,
+        artifact_sha256="d" * 64,
+    )
+
+
+def _incremental_projection(
+    stages: list[Stage],
+    *,
+    reports: list[StageReport] | None = None,
+    snapshots: list[ConfirmedStageSnapshot] | None = None,
+    preview: CumulativePreview | None = None,
+) -> SessionProjection:
+    return SessionProjection(
+        sop_session_id="sop_1",
+        ownership=OwnershipTuple(
+            tenant_id="tenant_1",
+            source_id="console",
+            user_id="user_1",
+            agent_id="agent_1",
+            chat_id="chat_1",
+            logical_chat_session_id="logical_1",
+        ),
+        skill_snapshot_id="sha256:miner-v1",
+        state=SessionState.AWAITING_STAGE_CONFIRMATION,
+        state_version=1,
+        title="t",
+        stages=stages,
+        stage_reports=reports or [],
+        confirmed_snapshots=snapshots or [],
+        cumulative_preview=preview,
+    )
+
+
+def test_stage_report_requires_three_artifacts() -> None:
+    with pytest.raises(ValidationError):
+        StageReport(
+            stage_id="stage_1",
+            report_no=1,
+            artifacts=_stage_report_artifacts()[:2],
+            validation=_validation_evidence(),
+        )
+
+
+def test_stage_report_rejects_non_newer_superseded_by() -> None:
+    with pytest.raises(ValidationError):
+        StageReport(
+            stage_id="stage_1",
+            report_no=2,
+            superseded_by=2,
+            artifacts=_stage_report_artifacts(),
+            validation=_validation_evidence(),
+        )
+
+
+def test_confirmed_snapshots_must_follow_stage_queue_prefix() -> None:
+    stages = [
+        Stage(stage_id="stage_1", name="一"),
+        Stage(stage_id="stage_2", name="二"),
+    ]
+    with pytest.raises(ValidationError):
+        _incremental_projection(
+            stages,
+            reports=[_stage_report("stage_2", 1)],
+            snapshots=[_snapshot("stage_2", 1)],
+        )
+
+
+def test_confirmed_snapshot_must_reference_an_existing_report() -> None:
+    stages = [
+        Stage(stage_id="stage_1", name="一"),
+        Stage(stage_id="stage_2", name="二"),
+    ]
+    with pytest.raises(ValidationError):
+        _incremental_projection(
+            stages,
+            reports=[_stage_report("stage_1", 1)],
+            snapshots=[_snapshot("stage_1", 2)],
+        )
+
+
+def test_cumulative_preview_requires_matching_confirmed_snapshots() -> None:
+    stages = [
+        Stage(stage_id="stage_1", name="一"),
+        Stage(stage_id="stage_2", name="二"),
+    ]
+    preview = CumulativePreview(
+        preview_version=1,
+        stage_order=["stage_1"],
+        snapshots=[_snapshot("stage_1", 1)],
+        artifacts=_stage_report_artifacts(),
+    )
+    with pytest.raises(ValidationError):
+        _incremental_projection(
+            stages,
+            reports=[_stage_report("stage_1", 1)],
+            snapshots=[],
+            preview=preview,
+        )
+
+
+def test_consistent_incremental_projection_roundtrips() -> None:
+    stages = [
+        Stage(stage_id="stage_1", name="一"),
+        Stage(stage_id="stage_2", name="二"),
+    ]
+    snapshots = [_snapshot("stage_1", 1)]
+    preview = CumulativePreview(
+        preview_version=1,
+        stage_order=["stage_1"],
+        snapshots=snapshots,
+        artifacts=_stage_report_artifacts(),
+        rendered_sha256={"stage_sop_json": "a" * 64},
+    )
+    projection = _incremental_projection(
+        stages,
+        reports=[_stage_report("stage_1", 1)],
+        snapshots=snapshots,
+        preview=preview,
+    )
+    restored = SessionProjection.model_validate(
+        projection.model_dump(mode="json"),
+    )
+    assert restored.stage_reports == projection.stage_reports
+    assert restored.confirmed_snapshots == snapshots
+    assert restored.cumulative_preview == preview
+
+
+def test_legacy_projection_defaults_incremental_fields() -> None:
+    raw = {
+        "sop_session_id": "sop_1",
+        "ownership": {
+            "tenant_id": "tenant_1",
+            "source_id": "console",
+            "user_id": "user_1",
+            "agent_id": "agent_1",
+            "chat_id": "chat_1",
+            "logical_chat_session_id": "logical_1",
+        },
+        "skill_snapshot_id": "sha256:miner-v1",
+        "state": "AwaitingStageConfirmation",
+        "state_version": 1,
+        "title": "t",
+        "stages": [
+            {"stage_id": "stage_1", "name": "一"},
+            {"stage_id": "stage_2", "name": "二"},
+        ],
+    }
+    projection = SessionProjection.model_validate(raw)
+    assert projection.stage_reports == []
+    assert projection.confirmed_snapshots == []
+    assert projection.cumulative_preview is None
+
+
+def test_stage_report_generated_envelope_parses_typed_payload() -> None:
+    envelope = StructuredInteractionEnvelope(
+        event_id="evt_report_1",
+        sop_session_id="sop_1",
+        chat_id="chat_1",
+        revision=1,
+        round=1,
+        state_version=3,
+        kind=EventKind.STAGE_REPORT_GENERATED,
+        payload=StageReportGeneratedPayload(report=_stage_report("stage_1", 1)),
+    )
+    parsed = StructuredInteractionEnvelope.model_validate(
+        envelope.model_dump(mode="json", by_alias=True),
+    )
+    assert parsed.kind is EventKind.STAGE_REPORT_GENERATED
+    assert parsed.payload.report.report_no == 1
+    assert len(parsed.payload.report.artifacts) == 3
+
+
+def test_stage_report_transitions_are_legal() -> None:
+    assert_legal_transition(
+        SessionState.EXECUTING_TRIAL,
+        SessionState.GENERATING_STAGE_REPORT,
+    )
+    assert_legal_transition(
+        SessionState.GENERATING_STAGE_REPORT,
+        SessionState.AWAITING_STAGE_CONFIRMATION,
+    )
+    assert_legal_transition(
+        SessionState.AWAITING_STAGE_CONFIRMATION,
+        SessionState.REFRESHING_CUMULATIVE,
+    )
+    assert_legal_transition(
+        SessionState.REFRESHING_CUMULATIVE,
+        SessionState.GENERATING_QUESTIONS,
+    )
+    assert_legal_transition(
+        SessionState.REFRESHING_CUMULATIVE,
+        SessionState.FINALIZING_OUTPUTS,
+    )
+    with pytest.raises(ValueError):
+        assert_legal_transition(
+            SessionState.REFRESHING_CUMULATIVE,
+            SessionState.AWAITING_ANSWER,
+        )

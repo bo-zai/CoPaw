@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 """Tests for data sanitization utilities."""
 
+import pytest
+
 from swe.tracing.sanitizer import (
     SENSITIVE_KEYS,
     register_sensitive_values,
     sanitize_dict,
     sanitize_string,
+    sanitize_trace_value,
     sanitize_user_message,
 )
 
@@ -197,6 +200,68 @@ class TestSanitizeString:
         result = sanitize_string("token=tenant-secret", max_length=500)
 
         assert result == "token=[REDACTED]"
+
+
+class TestSanitizeTraceValue:
+    """Tests for bounded JSON-compatible trace output values."""
+
+    def test_redacts_nested_and_registered_secret_values(self):
+        register_sensitive_values(["tenant-secret"])
+
+        result = sanitize_trace_value(
+            {
+                "authorization": "Bearer direct-secret",
+                "message": "cookie: sid=abc; token=tenant-secret",
+                "nested": {"private_key": "secret-key-material"},
+            },
+        )
+
+        assert result.value["authorization"] == "[REDACTED]"
+        assert "tenant-secret" not in result.value["message"]
+        assert "sid=abc" not in result.value["message"]
+        assert result.value["nested"]["private_key"] == "[REDACTED]"
+
+    @pytest.mark.parametrize(
+        "value, secret_fragment",
+        [
+            ("Authorization: Bearer abcdefghijklmnop", "abcdefghijklmnop"),
+            ("Cookie: sid=abcdef", "sid=abcdef"),
+            (
+                "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+                "eyJhbGciOiJIUzI1NiJ9",
+            ),
+            ("postgres://alice:password@db.example/app", "alice:password"),
+            (
+                "-----BEGIN "
+                + "PRIVATE KEY-----\\nsecret\\n-----END "
+                + "PRIVATE KEY-----",
+                "secret",
+            ),
+        ],
+    )
+    def test_redacts_sensitive_fragments_in_text(self, value, secret_fragment):
+        result = sanitize_trace_value(value)
+
+        assert secret_fragment not in result.value
+
+    def test_bounds_utf8_depth_and_collection_size(self):
+        text_result = sanitize_trace_value("你" * 20, max_bytes=16)
+        nested_result = sanitize_trace_value(
+            {
+                "items": ["你" * 20, "discarded", "also-discarded"],
+                "nested": {"a": {"b": 1}},
+            },
+            max_depth=2,
+            max_items=2,
+        )
+
+        assert text_result.truncated is True
+        assert text_result.value.endswith("...")
+        assert len(text_result.value.encode("utf-8")) <= 19
+        assert nested_result.value["items"] == ["你" * 20, "discarded"]
+        assert nested_result.value["nested"]["a"]["b"] == (
+            "<max-depth-exceeded>"
+        )
 
 
 class TestSanitizeUserMessage:

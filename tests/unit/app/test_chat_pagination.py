@@ -14,6 +14,7 @@ from swe.app.runner.manager import ChatManager
 from swe.app.runner.models import ChatSpec, ChatsFile
 from swe.app.runner.repo import BaseChatRepository
 from swe.app.routers.agent_scoped import create_agent_scoped_router
+from swe.app.answer_turn.models import TurnStatus
 
 
 def _chat(
@@ -265,9 +266,18 @@ class _FakeTaskTracker:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    async def get_status(self, chat_id: str) -> str:
+    async def read_status(self, chat_id: str) -> str:
         self.calls.append(chat_id)
         return "running" if chat_id == "chat-z" else "idle"
+
+
+class _FakeCoordinator:
+    def __init__(self, tracker: _FakeTaskTracker) -> None:
+        self.tracker = tracker
+
+    async def status(self, chat_id: str) -> TurnStatus | None:
+        status = await self.tracker.read_status(chat_id)
+        return TurnStatus.RUNNING if status == "running" else None
 
 
 def _api_client(
@@ -279,7 +289,11 @@ def _api_client(
         ),
     )
     tracker = _FakeTaskTracker()
-    workspace = SimpleNamespace(chat_manager=manager, task_tracker=tracker)
+    workspace = SimpleNamespace(
+        chat_manager=manager,
+        task_tracker=tracker,
+        answer_turn_coordinator=_FakeCoordinator(tracker),
+    )
     app = FastAPI()
     app.include_router(router)
 
@@ -297,7 +311,11 @@ def _api_client(
 def _agent_scoped_api_client() -> tuple[TestClient, _FakeTaskTracker]:
     manager = ChatManager(repo=_InMemoryChatRepository(_stored_chats()))
     tracker = _FakeTaskTracker()
-    workspace = SimpleNamespace(chat_manager=manager, task_tracker=tracker)
+    workspace = SimpleNamespace(
+        chat_manager=manager,
+        task_tracker=tracker,
+        answer_turn_coordinator=_FakeCoordinator(tracker),
+    )
     app = FastAPI()
     app.include_router(create_agent_scoped_router(), prefix="/api")
 

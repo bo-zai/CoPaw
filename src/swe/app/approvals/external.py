@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """External approval submission helpers.
 
 These helpers let another channel approve or deny an existing console
@@ -22,6 +23,7 @@ from agentscope_runtime.engine.schemas.agent_schemas import (
 )
 
 from .service import PendingApproval, get_approval_service
+from ..answer_turn.models import TurnIdentity
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,7 @@ class ExternalApprovalSubmission:
     submitted: bool = False
     reconnect: bool = False
     is_new_run: bool = False
+
 
 def _command_for_decision(
     decision: ExternalApprovalDecision,
@@ -316,14 +319,14 @@ async def _should_notify_zhaohu_for_approval(
 
 
 async def _wait_until_run_idle(task_tracker: Any, run_key: str) -> None:
-    get_status = getattr(task_tracker, "get_status", None)
-    if get_status is None:
+    status_fn = getattr(task_tracker, "status", None)
+    if status_fn is None:
         return
 
     deadline = asyncio.get_running_loop().time() + _RUN_IDLE_WAIT_SECONDS
     while True:
-        status = await _maybe_await(get_status(run_key))
-        if status in (None, "idle"):
+        status = await _maybe_await(status_fn(run_key))
+        if status is None or getattr(status, "value", status) == "idle":
             return
         if asyncio.get_running_loop().time() >= deadline:
             raise TimeoutError("approval chat is still streaming")
@@ -525,6 +528,17 @@ async def submit_external_approval_decision(
 
     await _wait_until_run_idle(workspace.task_tracker, chat.id)
 
+    current = await get_approval_service().get_request(pending.request_id)
+    if current is None or current.status != "pending":
+        return ExternalApprovalSubmission(
+            request_id=pending.request_id,
+            decision=decision,
+            status=current.status if current is not None else "superseded",
+            session_id=pending.session_id,
+            submitted=False,
+        )
+    pending = current
+
     payload = build_external_approval_payload(
         pending=pending,
         decision=decision,
@@ -543,11 +557,29 @@ async def submit_external_approval_decision(
         source_user_id=source_user_id,
         source_message_id=source_message_id,
     )
-    _queue, is_new_run = await workspace.task_tracker.attach_or_start(
+    coordinator = workspace.answer_turn_coordinator
+    if coordinator is None:
+        raise RuntimeError("answer-turn coordinator is not configured")
+
+    async def producer(identity: TurnIdentity, bound_payload: Any):
+        next_payload = {
+            **bound_payload,
+            "meta": {
+                **(bound_payload.get("meta") or {}),
+                "answer_turn_identity": identity,
+                "msgid": identity.msgid,
+            },
+        }
+        async for event in console_channel.stream_one(next_payload):
+            yield event
+
+    lease = await coordinator.start_or_attach(
         chat.id,
         payload,
-        console_channel.stream_one,
+        producer,
+        msgid=f"approval-{pending.request_id}",
     )
+    is_new_run = lease.is_new_run
 
     await get_approval_service().record_external_submission(
         pending,

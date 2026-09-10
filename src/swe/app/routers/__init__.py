@@ -20,6 +20,8 @@ _ROUTER_MODULES = (
     (".providers", "router"),
     (".providers", "tenant_providers_router"),
     ("..runner.api", "router"),
+    ("..chat_sharing.router", "router"),
+    ("..goals.router", "router"),
     (".runtime", "router"),
     (".skills", "router"),
     (".skills_stream", "router"),

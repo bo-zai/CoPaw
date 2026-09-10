@@ -45,6 +45,7 @@ export interface IAgentScopeRuntimeWebUIAPIOptions {
     session_id: string;
     logical_session_id?: string;
     chat_id?: string | null;
+    msgid?: string | null;
   }) => void;
 
   /**
@@ -486,6 +487,8 @@ export interface IAgentScopeRuntimeWebUIInputContext {
    * @descriptionEn Loading state
    */
   loading: boolean | string;
+  stopping: boolean;
+  setStopping: (stopping: boolean, sessionId?: string) => void;
   /**
    * @description 设置加载状态
    * @descriptionEn Set loading state

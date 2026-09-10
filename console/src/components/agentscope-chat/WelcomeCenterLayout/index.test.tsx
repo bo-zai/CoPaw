@@ -346,7 +346,11 @@ describe("WelcomeCenterLayout", () => {
     const sceneStyle = getComputedStyle(sceneStrip);
 
     expect(capabilityStyle.borderTopStyle).toBe("none");
-    expect(sceneStyle.minHeight).toBe("48px");
+    expect(sceneStyle.minHeight).toBe("44px");
+    expect(sceneStyle.marginBottom).toBe("0px");
+    expect(sceneStyle.borderBottomStyle).toBe("solid");
+    expect(sceneStyle.borderLeftStyle).toBe("none");
+    expect(sceneStyle.borderRightStyle).toBe("none");
     expect(sceneStyle.borderTopLeftRadius).toBe("12px");
     expect(sceneStyle.borderTopRightRadius).toBe("12px");
   });
@@ -425,7 +429,7 @@ describe("WelcomeCenterLayout", () => {
     expect(screen.queryByLabelText("推荐场景")).not.toBeInTheDocument();
   });
 
-  it("uses the capsule palette for the selected domain and secondary controls", async () => {
+  it("uses the conversation palette for the selected domain and secondary controls", async () => {
     getEffectiveCatalog.mockResolvedValueOnce({
       domains: [
         {
@@ -458,20 +462,30 @@ describe("WelcomeCenterLayout", () => {
     const selectorStyle = getComputedStyle(selector as Element);
 
     expect(domain).toHaveClass("is-active");
+    expect(
+      domain.closest(".scenario-preset-domain-selector"),
+    ).toHaveClass("is-single");
     expect(capability).toHaveClass("is-active");
     expect(scene).not.toHaveClass("is-active");
-    expect(selectorStyle.getPropertyValue("--capsule-bg").trim()).toBe(
-      "#F1F2F6",
+    expect(selectorStyle.getPropertyValue("--segment-track-bg").trim()).toBe(
+      "#EDF1F7",
     );
-    expect(selectorStyle.getPropertyValue("--capsule-text").trim()).toBe(
-      "#6D7C96",
-    );
-    expect(selectorStyle.getPropertyValue("--capsule-active-bg").trim()).toBe(
-      "#697892",
-    );
-    expect(selectorStyle.getPropertyValue("--capsule-active-text").trim()).toBe(
+    expect(selectorStyle.getPropertyValue("--segment-active-bg").trim()).toBe(
       "#FFFFFF",
     );
+    expect(selectorStyle.getPropertyValue("--segment-active-text").trim()).toBe(
+      "#2957DC",
+    );
+    expect(selectorStyle.getPropertyValue("--chip-active-bg").trim()).toBe(
+      "#EEF4FF",
+    );
+    expect(selectorStyle.getPropertyValue("--chip-active-text").trim()).toBe(
+      "#2957DC",
+    );
+    expect(selectorStyle.getPropertyValue("--chip-active-border").trim()).toBe(
+      "#C7D6FF",
+    );
+    expect(getComputedStyle(scene).backgroundColor).toBe("rgb(233, 237, 244)");
   });
 
   it("renders secondary capsules with a slim height", async () => {
@@ -503,9 +517,9 @@ describe("WelcomeCenterLayout", () => {
     const domain = screen.getByRole("tab", { name: "文档处理" });
     const scene = screen.getByRole("button", { name: "提取字段" });
 
-    expect(getComputedStyle(domain).height).toBe("36px");
-    expect(getComputedStyle(capability).height).toBe("32px");
-    expect(getComputedStyle(scene).height).toBe("32px");
+    expect(getComputedStyle(domain).height).toBe("32px");
+    expect(getComputedStyle(capability).height).toBe("30px");
+    expect(getComputedStyle(scene).height).toBe("26px");
   });
 
   it("opens the shared labelled skill menu and selects a matching skill by click", () => {

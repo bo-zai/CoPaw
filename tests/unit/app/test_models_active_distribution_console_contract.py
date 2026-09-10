@@ -29,10 +29,8 @@ MODELS_SECTION = (
 PROVIDER_API = CONSOLE_SRC / "api" / "modules" / "provider.ts"
 PROVIDER_TYPES = CONSOLE_SRC / "api" / "types" / "provider.ts"
 LOCALE_FILES = {
-    "en": CONSOLE_SRC / "locales" / "en.json",
-    "zh": CONSOLE_SRC / "locales" / "zh.json",
-    "ja": CONSOLE_SRC / "locales" / "ja.json",
-    "ru": CONSOLE_SRC / "locales" / "ru.json",
+    file_path.stem: file_path
+    for file_path in (CONSOLE_SRC / "locales").glob("*.json")
 }
 
 
@@ -91,14 +89,16 @@ def test_models_section_wires_distribution_modal_warning_and_result_feedback() -
 ):
     content = MODELS_SECTION.read_text(encoding="utf-8")
 
-    assert "api.listActiveModelDistributionTenants()" in content
     assert "api.distributeActiveLlm({" in content
+    assert "target_tenant_ids: selectedDistributionTenantIds," in content
+    assert "overwrite: true," in content
+    assert "<TenantSelector" in content
+    assert "excludeTenantId={currentTenantId}" in content
     assert 't("models.distribute")' in content
     assert 't("models.distributeOverwriteWarning")' in content
-    assert 'title: t("models.distributeResultTitle")' in content
-    assert 'title: t("models.distributePartialFailureTitle")' in content
-    assert 't("models.distributeSuccessList")' in content
-    assert 't("models.distributeFailureInlineHint")' in content
+    assert (
+        "message.success(`模型分发任务已提交：${result.task_id}`)" in content
+    )
 
 
 def test_models_locales_cover_distribution_copy() -> None:

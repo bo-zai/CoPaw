@@ -231,6 +231,30 @@ describe("useChatController", () => {
     );
   });
 
+  it("clears loading when completion arrives after the response was removed", async () => {
+    render(<Harness />);
+    latestCurrentQARef!.current.activeRequestOwner = {
+      requestId: "request-a",
+      kind: "submit",
+      sessionId: "chat-b",
+      logicalSessionId: "logical:chat-b",
+      chatId: "chat:chat-b",
+    };
+
+    await act(async () => {
+      latestRequestOptions!.onFinish({
+        requestId: "request-a",
+        kind: "submit",
+        sessionId: "chat-b",
+        logicalSessionId: "logical:chat-b",
+        chatId: "chat:chat-b",
+      });
+    });
+
+    expect(mocks.setLoading).toHaveBeenCalledWith(false);
+    expect(latestCurrentQARef!.current.activeRequestOwner).toBeUndefined();
+  });
+
   it("marks the owning session as generating before waiting for the first frame", async () => {
     let releaseSleep: (() => void) | undefined;
     mocks.sleep.mockImplementationOnce(
@@ -325,5 +349,30 @@ describe("useChatController", () => {
       false,
       { refreshList: false },
     );
+  });
+
+  it("keeps the composer locked until the Stop request settles", async () => {
+    render(<Harness />);
+    mocks.setLoading.mockClear();
+    let finishStop: (() => void) | undefined;
+    mocks.cancelActiveRequest.mockImplementation(
+      () => new Promise<void>((resolve) => (finishStop = resolve)),
+    );
+    latestCurrentQARef!.current.response = {
+      id: "response-a",
+      msgStatus: "generating",
+      cards: [],
+    };
+
+    const stopPromise = latestController!.handleCancel();
+    await waitFor(() => expect(mocks.setLoading).toHaveBeenCalledWith(true));
+    expect(mocks.setLoading).not.toHaveBeenCalledWith(false);
+
+    finishStop?.();
+    await act(async () => {
+      await stopPromise;
+    });
+
+    expect(mocks.setLoading).toHaveBeenCalledWith(false);
   });
 });

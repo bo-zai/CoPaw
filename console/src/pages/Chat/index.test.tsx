@@ -44,13 +44,21 @@ const mocks = vi.hoisted(() => {
     expertSelectorProps: null as Record<string, unknown> | null,
     listCronJobs: vi.fn(async () => []),
     listExperts: vi.fn(async () => []),
+    loadActiveModelData: vi.fn(async () => ({
+      active_llm: {
+        provider_id: "provider-1",
+        model: "model-1",
+      },
+    })),
     currentSessionId: "chat-1",
     inputDisabled: true,
+    inputLoading: false,
     pathname: "/chat/chat-1",
     search: "",
     getChatIdForSession: vi.fn((sessionId: string) => sessionId),
     getLogicalSessionId: vi.fn((sessionId: string) => sessionId),
     getRealIdForSession: vi.fn((sessionId: string) => sessionId),
+    getContextUsage: vi.fn(async () => ({ available: false })),
     navigationSessionId: null as string | null,
     navigationTaskId: null as string | null,
     navigate: vi.fn(),
@@ -164,7 +172,7 @@ vi.mock("@/components/agentscope-chat", () => {
     ) =>
       selector({
         disabled: mocks.inputDisabled,
-        loading: false,
+        loading: mocks.inputLoading,
         setLoading: mocks.setLoading,
         getLoading: mocks.getLoading,
       }),
@@ -288,6 +296,14 @@ vi.mock("../../stores/sourceSystemConfigStore", () => ({
   ) => selector({ config: {} }),
 }));
 
+vi.mock("../../stores/providerModelStore", () => ({
+  useProviderModelStore: (
+    selector: (value: {
+      loadActiveModelData: typeof mocks.loadActiveModelData;
+    }) => unknown,
+  ) => selector({ loadActiveModelData: mocks.loadActiveModelData }),
+}));
+
 vi.mock("../../stores/iframeStore", () => {
   const useIframeStore = (
     selector?: (value: { userId: string; isOriginY: boolean }) => unknown,
@@ -318,6 +334,8 @@ vi.mock("../../api/modules/chat", () => ({
     })),
     cancelSubAgentRun: vi.fn(async () => undefined),
     filePreviewUrl: vi.fn((filename: string) => `/preview/${filename}`),
+    getRecentGoal: vi.fn(async () => null),
+    getContextUsage: mocks.getContextUsage,
     stopChat: vi.fn(async () => undefined),
     updateChat: mocks.updateChat,
     uploadFile: vi.fn(),
@@ -614,6 +632,12 @@ vi.mock("@/api/modules/featuredCases", () => ({
   },
 }));
 
+vi.mock("@/api/modules/scenarioPreset", () => ({
+  scenarioPresetApi: {
+    getEffectiveCatalog: vi.fn(async () => ({ domains: [] })),
+  },
+}));
+
 describe("ChatPage plan mode wiring", () => {
   beforeEach(() => {
     mocks.capturedOptions = null;
@@ -621,6 +645,7 @@ describe("ChatPage plan mode wiring", () => {
     mocks.showContentOnly = false;
     mocks.isOriginY = false;
     mocks.inputDisabled = true;
+    mocks.inputLoading = false;
     mocks.pathname = "/chat/chat-1";
     mocks.search = "";
     mocks.currentSessionId = "chat-1";
@@ -633,6 +658,8 @@ describe("ChatPage plan mode wiring", () => {
     mocks.getRealIdForSession.mockImplementation(
       (sessionId: string) => sessionId,
     );
+    mocks.getContextUsage.mockReset();
+    mocks.getContextUsage.mockResolvedValue({ available: false });
     mocks.sessions = [
       {
         id: "chat-1",
@@ -651,6 +678,7 @@ describe("ChatPage plan mode wiring", () => {
     mocks.listCronJobs.mockResolvedValue([]);
     mocks.listExperts.mockReset();
     mocks.listExperts.mockResolvedValue([]);
+    mocks.loadActiveModelData.mockClear();
     mocks.expertSelectorProps = null;
     mocks.setLoading.mockReset();
     mocks.getLoading.mockReset();
@@ -681,6 +709,55 @@ describe("ChatPage plan mode wiring", () => {
     expect(screen.getByTestId("chat-sender-before-ui")).not.toContainElement(
       monitor,
     );
+  });
+
+  it("resolves the backend chat id and renders context usage in both composer prefixes", async () => {
+    mocks.pathname = "/chat/temp-1";
+    mocks.currentSessionId = "temp-1";
+    mocks.getChatIdForSession.mockImplementation((sessionId: string) =>
+      sessionId === "temp-1" ? "backend-chat-1" : sessionId,
+    );
+
+    render(<ChatPage />);
+
+    expect(screen.getByTestId("chat-sender-prefix")).toContainElement(
+      screen.getAllByRole("button", { name: /上下文占用/ })[1],
+    );
+    expect(screen.getByTestId("chat-welcome")).toContainElement(
+      screen.getAllByRole("button", { name: /上下文占用/ })[0],
+    );
+    await waitFor(() => {
+      expect(mocks.getContextUsage).toHaveBeenCalledWith("backend-chat-1");
+      expect(mocks.getContextUsage).toHaveBeenCalledTimes(1);
+    });
+
+    document.dispatchEvent(
+      new CustomEvent("conversation_compacted", {
+        detail: { chat_id: "backend-chat-1" },
+      }),
+    );
+    await waitFor(() => {
+      expect(mocks.getContextUsage).toHaveBeenCalledTimes(2);
+    });
+
+    window.dispatchEvent(new CustomEvent("model-switched"));
+    await waitFor(() => {
+      expect(mocks.getContextUsage).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  it("does not show the previous active chat usage while a route chat is unresolved", async () => {
+    mocks.pathname = "/chat/1780458341751000";
+    mocks.currentSessionId = "chat-1";
+    mocks.getChatIdForSession.mockImplementation((sessionId: string) =>
+      sessionId === "chat-1" ? "backend-chat-1" : null,
+    );
+
+    render(<ChatPage />);
+
+    screen.getAllByRole("button", { name: /上下文占用.*暂无数据/ });
+    await act(async () => Promise.resolve());
+    expect(mocks.getContextUsage).not.toHaveBeenCalled();
   });
 
   it("keeps the subagent monitor mounted in content-only mode", () => {
@@ -755,6 +832,65 @@ describe("ChatPage plan mode wiring", () => {
     expect(expertSelector.props.inline).toBe(true);
     expect(goalModeItem).toBeDefined();
     expect(goalModeItem?.props.icon).toBeUndefined();
+  });
+
+  it("keeps Goal Mode selected after submitting a goal request", async () => {
+    mocks.inputDisabled = false;
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        new Response("", { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<ChatPage />);
+
+    const quickMenuItems = React.Children.toArray(
+      mocks.capturedOptions?.sender?.quickMenuItems,
+    ) as Array<React.ReactElement<{ children?: React.ReactNode }>>;
+    const modeItems = React.Children.toArray(
+      quickMenuItems[0].props.children,
+    ) as Array<
+      React.ReactElement<{
+        label?: string;
+        extra?: React.ReactElement<{ onChange: (enabled: boolean) => void }>;
+      }>
+    >;
+    const goalModeItem = modeItems.find((item) => item.props.label === "目标");
+
+    act(() => {
+      goalModeItem?.props.extra?.props.onChange(true);
+    });
+    await waitFor(() => {
+      const buttons = screen.getAllByRole("button", { name: "目标" });
+      expect(buttons).toHaveLength(2);
+      buttons.forEach((button) => expect(button).toBeEnabled());
+    });
+
+    await act(async () => {
+      await mocks.capturedOptions?.api.fetch({
+        input: [
+          {
+            role: "user",
+            content: "起草一个可确认的目标",
+            session: {},
+          },
+        ],
+        session_id: "chat-1",
+      });
+    });
+
+    const chatRequest = fetchMock.mock.calls.find(
+      ([url]) => url === "/console/chat",
+    );
+    expect(chatRequest).toBeDefined();
+    const requestBody = chatRequest?.[1]?.body;
+    expect(typeof requestBody).toBe("string");
+    expect(JSON.parse(requestBody as string)).toMatchObject({
+      goal_mode_enabled: true,
+    });
+    screen
+      .getAllByRole("button", { name: "目标" })
+      .forEach((button) => expect(button).toBeEnabled());
   });
 
   it("hides Expert from Composer quick actions when no selectable experts are configured", async () => {

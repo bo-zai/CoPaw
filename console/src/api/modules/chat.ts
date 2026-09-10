@@ -12,11 +12,15 @@ import type {
   ChatHistory,
   ChatArchivePage,
   ChatDeleteResponse,
+  ChatShareCreateResponse,
+  ChatShareSnapshot,
+  ChatShareOptions,
   Session,
   SubAgentRunCancelResponse,
   SubAgentRunSnapshot,
   GoalSnapshot,
 } from "../types";
+import type { ContextUsageSnapshot } from "../types/contextUsage";
 
 /** Response from POST /console/upload. url = filename only; agent_id from header. */
 export interface ChatUploadResponse {
@@ -266,6 +270,25 @@ export const chatApi = {
   getChat: (chatId: string) =>
     request<ChatHistory>(`/chats/${encodeURIComponent(chatId)}`),
 
+  createChatShare: (chatId: string, turnIds: string[]) =>
+    request<ChatShareCreateResponse>(
+      `/chats/${encodeURIComponent(chatId)}/share`,
+      { method: "POST", body: JSON.stringify({ turn_ids: turnIds }) },
+    ),
+
+  getChatShareOptions: (chatId: string) =>
+    request<ChatShareOptions>(
+      `/chats/${encodeURIComponent(chatId)}/share-options`,
+    ),
+
+  getChatShare: (token: string) =>
+    request<ChatShareSnapshot>(`/chat-shares/${encodeURIComponent(token)}`),
+
+  getContextUsage: (chatId: string) =>
+    request<ContextUsageSnapshot>(
+      `/chats/${encodeURIComponent(chatId)}/context-usage`,
+    ),
+
   getChatHistory: (chatId: string, before?: string | null, limit = 50) => {
     const params = new URLSearchParams({ limit: String(limit) });
     if (before) params.set("before", before);
@@ -364,10 +387,18 @@ export const chatApi = {
       ),
   },
 
-  stopChat: (chatId: string) =>
-    request<void>(`/console/chat/stop?chat_id=${encodeURIComponent(chatId)}`, {
+  stopChat: (
+    chatId: string,
+    msgid?: string | null,
+    sessionId?: string | null,
+  ) => {
+    const params = new URLSearchParams({ chat_id: chatId });
+    if (msgid) params.set("msgid", msgid);
+    if (sessionId) params.set("session_id", sessionId);
+    return request<void>(`/console/chat/stop?${params.toString()}`, {
       method: "POST",
-    }),
+    });
+  },
 
   getSubAgentRuns: (chatId: string) =>
     request<SubAgentRunSnapshot>(
@@ -395,31 +426,60 @@ export const chatApi = {
     }),
 
   pauseGoal: (goalId: string, chatId: string) =>
-    request<GoalSnapshot>(`/goals/${encodeURIComponent(goalId)}/pause?chat_id=${encodeURIComponent(chatId)}`, {
-      method: "POST",
-    }),
+    request<GoalSnapshot>(
+      `/goals/${encodeURIComponent(goalId)}/pause?chat_id=${encodeURIComponent(
+        chatId,
+      )}`,
+      {
+        method: "POST",
+      },
+    ),
 
   resumeGoal: (goalId: string, chatId: string) =>
-    request<GoalSnapshot>(`/goals/${encodeURIComponent(goalId)}/resume?chat_id=${encodeURIComponent(chatId)}`, {
-      method: "POST",
-    }),
+    request<GoalSnapshot>(
+      `/goals/${encodeURIComponent(goalId)}/resume?chat_id=${encodeURIComponent(
+        chatId,
+      )}`,
+      {
+        method: "POST",
+      },
+    ),
 
   cancelGoal: (goalId: string, chatId: string) =>
-    request<GoalSnapshot>(`/goals/${encodeURIComponent(goalId)}/cancel?chat_id=${encodeURIComponent(chatId)}`, {
-      method: "POST",
-    }),
+    request<GoalSnapshot>(
+      `/goals/${encodeURIComponent(goalId)}/cancel?chat_id=${encodeURIComponent(
+        chatId,
+      )}`,
+      {
+        method: "POST",
+      },
+    ),
 
-  editGoal: (goalId: string, chatId: string, contract: GoalSnapshot["contract"]) =>
-    request<GoalSnapshot>(`/goals/${encodeURIComponent(goalId)}/edit?chat_id=${encodeURIComponent(chatId)}`, {
-      method: "POST",
-      body: JSON.stringify({ contract }),
-    }),
+  editGoal: (
+    goalId: string,
+    chatId: string,
+    contract: GoalSnapshot["contract"],
+  ) =>
+    request<GoalSnapshot>(
+      `/goals/${encodeURIComponent(goalId)}/edit?chat_id=${encodeURIComponent(
+        chatId,
+      )}`,
+      {
+        method: "POST",
+        body: JSON.stringify({ contract }),
+      },
+    ),
 
   enqueueGoalSteering: (goalId: string, chatId: string, content: string) =>
-    request<GoalSnapshot>(`/goals/${encodeURIComponent(goalId)}/steering?chat_id=${encodeURIComponent(chatId)}`, {
-      method: "POST",
-      body: JSON.stringify({ content }),
-    }),
+    request<GoalSnapshot>(
+      `/goals/${encodeURIComponent(
+        goalId,
+      )}/steering?chat_id=${encodeURIComponent(chatId)}`,
+      {
+        method: "POST",
+        body: JSON.stringify({ content }),
+      },
+    ),
 };
 
 export const sessionApi = {
