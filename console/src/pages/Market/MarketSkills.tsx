@@ -106,11 +106,15 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
   const [allBbkIds, setAllBbkIds] = useState<BranchCount[]>([]);
 
   // 获取所有有数据的分行 ID 列表及技能数量（管理员用）
-  useEffect(() => {
+  const refreshBbkIds = useCallback(() => {
     if (isManager) {
       marketApi.listBbkIds(sourceId).then((res) => setAllBbkIds(res.branches)).catch(console.error);
     }
   }, [sourceId, isManager]);
+
+  useEffect(() => {
+    refreshBbkIds();
+  }, [refreshBbkIds]);
 
   useEffect(() => {
     refreshCategories();
@@ -127,6 +131,7 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
         setDetailDrawerOpen(false);
       }
       refreshSkills();
+      refreshBbkIds();
     } catch {
       message.error("下架失败");
     }
@@ -275,6 +280,7 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
     setMcpEditModalOpen(false);
     setEditingMCP(null);
     await refreshMCP();
+    refreshBbkIds();
     if (selectedMCP?.item_id === detail.item_id) {
       try {
         const latest = await marketMcpApi.getMarketMCPDetail(detail.item_id);
@@ -285,7 +291,7 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
         console.error("刷新编辑后的 MCP 详情失败:", err);
       }
     }
-  }, [refreshMCP, selectedMCP]);
+  }, [refreshMCP, refreshBbkIds, selectedMCP]);
 
   // 过滤技能列表
   const filteredSkills = skills.filter((skill) => {
@@ -889,7 +895,10 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
         open={uploadModalOpen}
         sourceId={sourceId}
         onClose={() => setUploadModalOpen(false)}
-        onSuccess={refreshSkillsAndDetail}
+        onSuccess={() => {
+          refreshSkillsAndDetail();
+          refreshBbkIds();
+        }}
       />
 
       {isManager && (
@@ -916,6 +925,7 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
           }}
           onSuccess={async () => {
             await refreshSkillsAndDetail();
+            refreshBbkIds();
             setEditingSkill(null);
           }}
         />
@@ -937,8 +947,10 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
             setDistributeTarget(null);
             if (distributeType === "skill") {
               refreshSkills();
+              refreshBbkIds();
             } else {
               refreshMCP();
+              refreshBbkIds();
             }
           }}
         />
@@ -948,7 +960,10 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
       <MCPUploadModal
         open={mcpUploadModalOpen}
         onClose={() => setMcpUploadModalOpen(false)}
-        onSuccess={refreshMCP}
+        onSuccess={() => {
+          refreshMCP();
+          refreshBbkIds();
+        }}
       />
 
       <MCPEditModal
@@ -985,8 +1000,10 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
             setRecallSkillName("");
             if (recallType === "skill") {
               refreshSkills();
+              refreshBbkIds();
             } else {
               refreshMCP();
+              refreshBbkIds();
             }
           }}
         />

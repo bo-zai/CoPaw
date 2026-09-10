@@ -2920,6 +2920,7 @@ class MarketplaceService:
         unique_skill_ids: set[str] = set()
         unique_mcp_ids: set[str] = set()
 
+        # 第一遍：统计分行数量（受 visible_category_ids 过滤），与 list_skills 口径一致
         for item in items:
             if (
                 item.status != "active"
@@ -5766,106 +5767,100 @@ class MarketplaceService:
         item_type: str,
         skill_name: str | None = None,
     ) -> list[DistributionRecord]:
-        """查询分发记录.
-
-        Args:
-            source_id: 来源 ID.
-            item_id: 条目 ID.
-            item_type: 条目类型（skill 或 mcp）.
-            skill_name: 技能名称（可选，用于查询当前实际持有的用户）.
-
-        Returns:
-            分发记录列表.
-        """
+        """查询分发记录."""
         if not self.db.is_connected:
             return []
         try:
-            # 如果提供了 skill_name，查询 swe_skills 表获取当前实际持有技能的用户
             if skill_name and item_type == "skill":
-                # 规范化 skill_name，与 swe_skills 表存储格式一致
-                normalized_skill_name = normalize_skill_name(skill_name)
-                rows = await self.db.fetch_all(
-                    _QUERY_DISTRIBUTED_USERS_SQL,
-                    (normalized_skill_name, source_id),
-                )
-                return [
-                    DistributionRecord(
-                        target_user_id=r["tenant_id"],
-                        target_user_name=r.get("tenant_name") or "",
-                        target_bbk_id=r.get("bbk_id") or "",
-                        distributed_at=None,
-                    )
-                    for r in rows
-                ]
-            # MCP 类型优先查询 swe_mcp_clients 表获取当前实际持有的用户
+                return await self._get_skill_distributions(source_id, skill_name)
             if item_type == "mcp":
-                items = load_index(self.marketplace_root, source_id)
-                mcp_item = next(
-                    (
-                        i
-                        for i in items
-                        if i.item_id == item_id and i.item_type == "mcp"
-                    ),
-                    None,
-                )
-                if mcp_item:
-                    # index 中存在该 item，按 mcp_name 查询
-                    rows = await self.db.fetch_all(
-                        _QUERY_DISTRIBUTED_MCP_CLIENTS_SQL,
-                        (source_id, mcp_item.name),
-                    )
-                    if rows:
-                        return [
-                            DistributionRecord(
-                                target_user_id=r["tenant_id"],
-                                target_user_name=r.get("tenant_name") or "",
-                                target_bbk_id=r.get("bbk_id") or "",
-                                distributed_at=None,
-                            )
-                            for r in rows
-                        ]
-                else:
-                    # index 中不存在该 item（可能已下架），按 source 字段查询
-                    source_prefix = f"marketplace:{item_id}"
-                    rows = await self.db.fetch_all(
-                        _QUERY_DISTRIBUTED_MCP_CLIENTS_BY_SOURCE_SQL,
-                        (source_prefix,),
-                    )
-                    if rows:
-                        return [
-                            DistributionRecord(
-                                target_user_id=r["tenant_id"],
-                                target_user_name=r.get("tenant_name") or "",
-                                target_bbk_id=r.get("bbk_id") or "",
-                                distributed_at=None,
-                            )
-                            for r in rows
-                        ]
-            # 兜底查询操作日志表
-            rows = await self.db.fetch_all(
-                _QUERY_DISTRIBUTIONS_SQL,
-                (source_id, item_id, item_type),
-            )
-            return [
-                DistributionRecord(
-                    target_user_id=r["target_user_id"],
-                    target_user_name=r.get("target_user_name") or "",
-                    target_bbk_id=r.get("target_bbk_id") or "",
-                    distributed_at=(
-                        r.get("created_at").isoformat()
-                        if r.get("created_at")
-                        else None
-                    ),
-                )
-                for r in rows
-            ]
+                mcp_result = await self._get_mcp_distributions(source_id, item_id)
+                if mcp_result is not None:
+                    return mcp_result
+            return await self._get_log_distributions(source_id, item_id, item_type)
         except Exception as e:
-            logger.warning(
-                "Failed to get distributions for %s: %s",
-                item_id,
-                e,
-            )
+            logger.warning("Failed to get distributions for %s: %s", item_id, e)
         return []
+
+    async def _get_skill_distributions(
+        self,
+        source_id: str,
+        skill_name: str,
+    ) -> list[DistributionRecord]:
+        """从 swe_skills 表查询技能分发记录."""
+        normalized = normalize_skill_name(skill_name)
+        rows = await self.db.fetch_all(
+            _QUERY_DISTRIBUTED_USERS_SQL,
+            (normalized, source_id),
+        )
+        return [
+            DistributionRecord(
+                target_user_id=r["tenant_id"],
+                target_user_name=r.get("tenant_name") or "",
+                target_bbk_id=r.get("bbk_id") or "",
+                distributed_at=None,
+            )
+            for r in rows
+        ]
+
+    async def _get_mcp_distributions(
+        self,
+        source_id: str,
+        item_id: str,
+    ) -> list[DistributionRecord] | None:
+        """从 swe_mcp_clients 表查询 MCP 分发记录，找不到返回 None."""
+        items = load_index(self.marketplace_root, source_id)
+        mcp_item = next(
+            (i for i in items if i.item_id == item_id and i.item_type == "mcp"),
+            None,
+        )
+        if mcp_item:
+            rows = await self.db.fetch_all(
+                _QUERY_DISTRIBUTED_MCP_CLIENTS_SQL,
+                (source_id, mcp_item.name),
+            )
+        else:
+            source_prefix = f"marketplace:{item_id}"
+            rows = await self.db.fetch_all(
+                _QUERY_DISTRIBUTED_MCP_CLIENTS_BY_SOURCE_SQL,
+                (source_prefix,),
+            )
+        if not rows:
+            return None
+        return [
+            DistributionRecord(
+                target_user_id=r["tenant_id"],
+                target_user_name=r.get("tenant_name") or "",
+                target_bbk_id=r.get("bbk_id") or "",
+                distributed_at=None,
+            )
+            for r in rows
+        ]
+
+    async def _get_log_distributions(
+        self,
+        source_id: str,
+        item_id: str,
+        item_type: str,
+    ) -> list[DistributionRecord]:
+        """从操作日志表查询分发记录（兜底）."""
+        rows = await self.db.fetch_all(
+            _QUERY_DISTRIBUTIONS_SQL,
+            (source_id, item_id, item_type),
+        )
+        return [
+            DistributionRecord(
+                target_user_id=r["target_user_id"],
+                target_user_name=r.get("target_user_name") or "",
+                target_bbk_id=r.get("target_bbk_id") or "",
+                distributed_at=(
+                    r.get("created_at").isoformat()
+                    if r.get("created_at")
+                    else None
+                ),
+            )
+            for r in rows
+        ]
 
     def _build_recall_response(
         self,
