@@ -3766,6 +3766,13 @@ class AgentRunner(Runner):
             "_hook_overlay_model": hook_overlay,
         }
         channel_meta = getattr(request, "channel_meta", None) or {}
+        annotation_context = channel_meta.get(
+            "_document_annotation_context",
+        )
+        if isinstance(annotation_context, dict):
+            request_context["_document_annotation_context"] = (
+                annotation_context
+            )
         goal_id = channel_meta.get("goal_id")
         goal_mode_enabled = bool(channel_meta.get("goal_mode_enabled", False))
         goal_request = bool(goal_id) or goal_mode_enabled

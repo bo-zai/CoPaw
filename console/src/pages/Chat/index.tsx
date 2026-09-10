@@ -71,6 +71,17 @@ import DragUploadOverlay from "@/components/agentscope-chat/DragUploadOverlay";
 // ==================== userId 统一整改 (Kun He) ====================
 // 使用统一的 getUserId/getChannel helper
 import { getUserId, getChannel } from "../../utils/identity";
+import {
+  HtmlAnnotationProvider,
+  useHtmlAnnotations,
+} from "@/components/agentscope-chat/HtmlAnnotations/context";
+import HtmlAnnotationComposerSummary from "@/components/agentscope-chat/HtmlAnnotations/ComposerSummary";
+import { isAnnotationForNewChat } from "@/components/agentscope-chat/HtmlAnnotations/sessionMigration";
+import {
+  discardStaleHtmlAnnotationSubmission,
+  prepareHtmlAnnotationExecutionMode,
+  prepareHtmlAnnotationSubmit,
+} from "@/components/agentscope-chat/HtmlAnnotations/submission";
 // ==================== userId 统一整改结束 ====================
 // ==================== 品牌主题 (Kun He) ====================
 import { useBrandTheme } from "../../contexts/BrandThemeContext";
@@ -655,7 +666,7 @@ const addPlanModeScopeAlias = (
   };
 };
 
-export default function ChatPage() {
+function ChatPageContent() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
@@ -710,6 +721,18 @@ export default function ChatPage() {
   }));
   const composerDisabled = Boolean(composerInputState.disabled);
   const composerLoading = Boolean(composerInputState.loading);
+  const {
+    pendingBundle: pendingHtmlAnnotationBundle,
+    consumeBundle: consumeHtmlAnnotationBundle,
+    migrateBundle: migrateHtmlAnnotationBundle,
+  } = useHtmlAnnotations();
+  const pendingHtmlAnnotationBundleRef = useRef(
+    pendingHtmlAnnotationBundle,
+  );
+  pendingHtmlAnnotationBundleRef.current = pendingHtmlAnnotationBundle;
+  const annotationSessionMigrationRef = useRef(
+    new Map<string, { fromChatKey: string; token: string }>(),
+  );
   const [taskEditForm] = Form.useForm<CronJobSpecOutput>();
   const [editingTask, setEditingTask] = useState<CronJobSpecOutput | null>(
     null,
@@ -907,8 +930,20 @@ export default function ChatPage() {
   // Register session API event callbacks for URL synchronization
 
   useEffect(() => {
+    const annotationSessionMigrations =
+      annotationSessionMigrationRef.current;
     sessionApi.onSessionIdResolved = (tempId, realId) => {
       if (!isChatActiveRef.current) return;
+      migrateHtmlAnnotationBundle(tempId, realId);
+      const annotationMigration = annotationSessionMigrations.get(tempId);
+      if (annotationMigration) {
+        migrateHtmlAnnotationBundle(
+          annotationMigration.fromChatKey,
+          realId,
+          annotationMigration.token,
+        );
+        annotationSessionMigrations.delete(tempId);
+      }
       if (pendingPlanModePersistScopesRef.current.delete(tempId)) {
         pendingPlanModePersistScopesRef.current.add(realId);
         resolvedPlanModePersistScopesRef.current.set(tempId, realId);
@@ -1000,6 +1035,13 @@ export default function ChatPage() {
 
     sessionApi.onSessionCreated = (sessionId) => {
       if (!isChatActiveRef.current) return;
+      const pendingAnnotation = pendingHtmlAnnotationBundleRef.current;
+      if (isAnnotationForNewChat(pendingAnnotation)) {
+        annotationSessionMigrations.set(sessionId, {
+          fromChatKey: pendingAnnotation.chatKey,
+          token: pendingAnnotation.token,
+        });
+      }
       setPlanModeLocalState((current) =>
         current.enabled ||
         pendingPlanModePersistScopesRef.current.has(current.scopeKey)
@@ -1016,8 +1058,9 @@ export default function ChatPage() {
       sessionApi.onSessionRemoved = null;
       sessionApi.onSessionSelected = null;
       sessionApi.onSessionCreated = null;
+      annotationSessionMigrations.clear();
     };
-  }, []);
+  }, [migrateHtmlAnnotationBundle]);
 
   useEffect(() => {
     setTaskProgress(null);
@@ -1920,6 +1963,7 @@ export default function ChatPage() {
         .map(extractUserMessageText)
         .join("\n")
         .trim();
+      const submittedDocumentAnnotations = biz_params?.document_annotations;
 
       const resolvedLogicalSessionId = resolveLogicalRequestSessionId(
         {
@@ -1962,7 +2006,7 @@ export default function ChatPage() {
         requestBody.session_id,
       );
       let routedAsSteering = false;
-      if (backendChatId && userText) {
+      if (backendChatId && userText && !submittedDocumentAnnotations) {
         try {
           const activeGoal = await chatApi.getRecentGoal(backendChatId);
           if (
@@ -2017,6 +2061,13 @@ export default function ChatPage() {
           signal: timeoutSignal.signal,
         });
 
+        if (
+          response.ok &&
+          submittedDocumentAnnotations &&
+          pendingHtmlAnnotationBundle
+        ) {
+          consumeHtmlAnnotationBundle(pendingHtmlAnnotationBundle.token);
+        }
         if (shouldClearPendingScenarioPreset(response.status)) {
           pendingScenarioPresetIdRef.current = null;
         }
@@ -2034,6 +2085,8 @@ export default function ChatPage() {
       resolveRequestChatId,
       selectedAgent,
       selectedExpertId,
+      pendingHtmlAnnotationBundle,
+      consumeHtmlAnnotationBundle,
     ],
   );
 
@@ -2220,8 +2273,45 @@ export default function ChatPage() {
       IAgentScopeRuntimeWebUISenderOptions["beforeSubmit"]
     > = async (data) => {
       if (isComposingRef.current) return false;
-      const skillPrepared = await handleSkillMentionsBeforeSubmit(data);
+      let annotationPrepared = discardStaleHtmlAnnotationSubmission(data);
+      if (pendingHtmlAnnotationBundle) {
+        try {
+          annotationPrepared = await prepareHtmlAnnotationExecutionMode(
+            annotationPrepared,
+            {
+              planModeEnabled,
+              persistPlanMode,
+              goalModeEnabled,
+              setGoalModeEnabled,
+            },
+          );
+        } catch {
+          return false;
+        }
+        setPendingPlanRevision(null);
+        try {
+          annotationPrepared = await prepareHtmlAnnotationSubmit(
+            annotationPrepared,
+            pendingHtmlAnnotationBundle,
+            {
+              uploadFile: chatApi.uploadFile,
+              filePreviewUrl: chatApi.filePreviewUrl,
+            },
+          );
+        } catch (error) {
+          messageRef.current.error(
+            error instanceof Error ? error.message : "页面批注源文件上传失败",
+          );
+          return false;
+        }
+      }
+      const skillPrepared = await handleSkillMentionsBeforeSubmit(
+        annotationPrepared,
+      );
       if (skillPrepared === false) return false;
+      if (pendingHtmlAnnotationBundle) {
+        return skillPrepared;
+      }
       const prepared = await preparePlanModeSubmit(skillPrepared, {
         planModeEnabled,
         persistPlanMode,
@@ -2348,7 +2438,11 @@ export default function ChatPage() {
             <RuntimeLoadingBridge bridgeRef={runtimeLoadingBridgeRef} />
             <ChatHeaderTitle />
             <span style={{ flex: 1 }} />
-            {!isContentOnly && <FileManager />}
+            {!isContentOnly && (
+              <FileManager
+                enableSessionAnnotations={!feedbackTask?.cronTaskId}
+              />
+            )}
             {!isContentOnly && <ChatActionGroup chatId={chatId} />}
             {!isContentOnly && <ModelSelector />}
           </>
@@ -2366,26 +2460,31 @@ export default function ChatPage() {
         // ==================== 首页改版 (Kun He) ====================
         // 使用自定义欢迎页渲染，替代默认 WelcomePrompts
         render: ({ greeting, onSubmit }) => (
-          <WelcomeCenterLayout
-            greeting={
-              typeof greeting === "string" ? greeting : "你好，有什么可以帮您？"
-            }
-            placeholder={t("chat.inputPlaceholder")}
-            beforeSubmit={handleBeforeSubmit}
-            quickMenuItems={planModeQuickMenuItems}
-            prefixItems={
-              <>
-                {activePlanModeControl}
-                {activeGoalModeControl}
-                {contextUsageIndicator}
-              </>
-            }
-            onSubmit={(data) => onSubmit(data)}
-            onScenarioPresetSubmit={(scenarioPresetId) => {
-              pendingScenarioPresetIdRef.current = scenarioPresetId;
-            }}
-            skillMentions={skillMentions}
-          />
+          <>
+            <HtmlAnnotationComposerSummary />
+            <WelcomeCenterLayout
+              greeting={
+                typeof greeting === "string"
+                  ? greeting
+                  : "你好，有什么可以帮您？"
+              }
+              placeholder={t("chat.inputPlaceholder")}
+              beforeSubmit={handleBeforeSubmit}
+              quickMenuItems={planModeQuickMenuItems}
+              prefixItems={
+                <>
+                  {activePlanModeControl}
+                  {activeGoalModeControl}
+                  {contextUsageIndicator}
+                </>
+              }
+              onSubmit={(data) => onSubmit(data)}
+              onScenarioPresetSubmit={(scenarioPresetId) => {
+                pendingScenarioPresetIdRef.current = scenarioPresetId;
+              }}
+              skillMentions={skillMentions}
+            />
+          </>
         ),
         // ==================== 首页改版结束 ====================
       },
@@ -2394,6 +2493,7 @@ export default function ChatPage() {
         beforeSubmit: handleBeforeSubmit,
         beforeUI: (
           <>
+            <HtmlAnnotationComposerSummary />
             {taskProgressEnabled ? (
               <TaskProgressFloatingCard progress={taskProgress} />
             ) : null}
@@ -2529,6 +2629,8 @@ export default function ChatPage() {
     chatId,
     activeSessionId,
     feedbackChatId,
+    feedbackTask?.cronTaskId,
+    goalModeEnabled,
     handleFileUpload,
     handleContinueModifyingPlan,
     handlePlanModeDecision,
@@ -2543,6 +2645,7 @@ export default function ChatPage() {
     contextUsageChatId,
     contextUsage,
     pendingPlanRevision,
+    pendingHtmlAnnotationBundle,
     persistPlanMode,
     planModeEnabled,
     resolveLogicalRequestSessionId,
@@ -2764,5 +2867,25 @@ export default function ChatPage() {
         </Modal>
       </AgentScopeRuntimeWebUIComposedProvider>
     </ChatShareSelectionProvider>
+  );
+}
+
+export default function ChatPage() {
+  const location = useLocation();
+  const showContentOnly = useChatPresentationStore(
+    (state) => state.showContentOnly,
+  );
+  const activeChatKey = useMemo(() => {
+    const match = location.pathname.match(/^\/chat\/(.+)$/);
+    return match?.[1] || "new-chat";
+  }, [location.pathname]);
+
+  return (
+    <HtmlAnnotationProvider
+      activeChatKey={activeChatKey}
+      composerAvailable={!showContentOnly}
+    >
+      <ChatPageContent />
+    </HtmlAnnotationProvider>
   );
 }

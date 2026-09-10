@@ -27,7 +27,7 @@ import {
 } from "antd";
 import { WarningOutlined } from "@ant-design/icons";
 import dayjs, { type Dayjs } from "dayjs";
-import { useEffect, useMemo, useState, type CSSProperties } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   monitorApi,
@@ -1449,7 +1449,11 @@ export default function CronJobOverviewPage() {
   };
 
   const handleBranchExport = async () => {
-    if (loading || branchExporting || !overviewData.branchRankingRows.length)
+    if (
+      branchDimensionLoading ||
+      branchExporting ||
+      !overviewData.branchRankingRows.length
+    )
       return;
     setBranchExporting(true);
     try {
@@ -2141,7 +2145,9 @@ export default function CronJobOverviewPage() {
           className={styles.exportButton}
           onClick={handleBranchExport}
           disabled={
-            loading || branchExporting || !overviewData.branchRankingRows.length
+            branchDimensionLoading ||
+            branchExporting ||
+            !overviewData.branchRankingRows.length
           }
           aria-label="分行维度导出 Excel"
           aria-busy={branchExporting}
@@ -2151,11 +2157,12 @@ export default function CronJobOverviewPage() {
         </button>
       </h2>
       <RankingTable
-        tableRef={branchTableRef}
         data={overviewData.branchRankingRows}
         loading={branchDimensionLoading}
         onRowClick={handleSelectBranch}
         selectedBranchId={selectedBranch?.bbk_id ?? null}
+        sortConfig={branchSort}
+        onSortChange={setBranchSort}
       />
 
       {/* 分行维度下钻 */}
