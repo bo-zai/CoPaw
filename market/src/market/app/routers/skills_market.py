@@ -2247,6 +2247,145 @@ async def init_market_skills(
     return results
 
 
+class _InitMissingSkillFieldsRequest(BaseModel):
+    """初始化缺失分类和分行请求参数."""
+
+    source_id: str = Field(..., description="来源ID")
+    category_id: int = Field(..., description="要设置的分类ID")
+    bbk_ids: list[str] = Field(
+        default_factory=list,
+        description="要设置的分行ID列表，默认为 ['100']",
+    )
+    dry_run: bool = Field(
+        default=True,
+        description="试运行模式，仅预览不实际写入",
+    )
+
+
+class _SkillMissingFieldsItem(BaseModel):
+    """缺失字段的技能条目."""
+
+    item_id: str
+    name: str
+    chinese_name: str
+    category_id: int | None
+    bbk_ids: list[str]
+    missing_category: bool
+    missing_bbk: bool
+
+
+class _InitMissingSkillFieldsResult(BaseModel):
+    """初始化缺失分类和分行返回结果."""
+
+    dry_run: bool
+    source_id: str
+    category_id: int
+    bbk_ids: list[str]
+    total_skills: int
+    missing_category_count: int
+    missing_bbk_count: int
+    skills: list[_SkillMissingFieldsItem]
+
+
+@router.post(
+    "/market/skills/init-missing-fields",
+    response_model=_InitMissingSkillFieldsResult,
+)
+async def init_missing_skill_fields(
+    request: Request,
+    payload: _InitMissingSkillFieldsRequest,
+):
+    """初始化缺失分类和分行的技能.
+
+    扫描 index.json 中 category_id 为空或 bbk_ids 为空的技能，
+    预览或更新这些技能的 category_id 和 bbk_ids。
+
+    Args:
+        payload.source_id: 来源ID
+        payload.category_id: 要设置的分类ID
+        payload.bbk_ids: 要设置的分行ID列表，默认为 ["100"]
+        payload.dry_run: 试运行模式，仅预览不实际写入
+    """
+    log_params(
+        logger,
+        request.method,
+        request.url.path,
+        source_id=payload.source_id,
+        category_id=payload.category_id,
+        bbk_ids=payload.bbk_ids,
+        dry_run=payload.dry_run,
+    )
+
+    svc = request.app.state.marketplace
+    items = load_index(svc.marketplace_root, payload.source_id)
+
+    # 默认分行为 ["100"]（总行）
+    bbk_ids_to_set = payload.bbk_ids if payload.bbk_ids else ["100"]
+
+    skills: list[_SkillMissingFieldsItem] = []
+    missing_category_count = 0
+    missing_bbk_count = 0
+
+    for item in items:
+        if item.item_type != "skill":
+            continue
+
+        missing_category = item.category_id is None
+        missing_bbk = not item.bbk_ids
+
+        if missing_category or missing_bbk:
+            skills.append(
+                _SkillMissingFieldsItem(
+                    item_id=item.item_id,
+                    name=item.name,
+                    chinese_name=item.chinese_name,
+                    category_id=item.category_id,
+                    bbk_ids=item.bbk_ids,
+                    missing_category=missing_category,
+                    missing_bbk=missing_bbk,
+                ),
+            )
+            if missing_category:
+                missing_category_count += 1
+            if missing_bbk:
+                missing_bbk_count += 1
+
+    # 非 dry_run 模式：实际更新
+    if not payload.dry_run:
+        for item in items:
+            if item.item_type != "skill":
+                continue
+            if item.category_id is None:
+                item.category_id = payload.category_id
+            if not item.bbk_ids:
+                item.bbk_ids = bbk_ids_to_set.copy()
+            item.updated_at = datetime.now(timezone.utc).isoformat()
+        save_index(svc.marketplace_root, payload.source_id, items)
+
+    logger.info(
+        "初始化缺失字段完成: dry_run=%s, source_id=%s, category_id=%s, "
+        "bbk_ids=%s, total_skills=%d, missing_category=%d, missing_bbk=%d",
+        payload.dry_run,
+        payload.source_id,
+        payload.category_id,
+        bbk_ids_to_set,
+        len(skills),
+        missing_category_count,
+        missing_bbk_count,
+    )
+
+    return _InitMissingSkillFieldsResult(
+        dry_run=payload.dry_run,
+        source_id=payload.source_id,
+        category_id=payload.category_id,
+        bbk_ids=bbk_ids_to_set,
+        total_skills=len(skills),
+        missing_category_count=missing_category_count,
+        missing_bbk_count=missing_bbk_count,
+        skills=skills,
+    )
+
+
 @router.post(
     "/market/skills/{item_id}/distribution-preview",
     response_model=DistributionPreviewResponse,

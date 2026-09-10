@@ -39,10 +39,6 @@ def _require_manager(
     raise HTTPException(status_code=403, detail="Manager access required")
 
 
-def _is_manager(x_manager: Optional[str], x_user_role: Optional[str]) -> bool:
-    return x_manager == "true" or x_user_role in {"admin", "manager"}
-
-
 def _category_select_sql(where_suffix: str = "") -> str:
     return (
         "SELECT id, source_id, name, sort_order, "
@@ -108,10 +104,8 @@ async def get_categories(
     db: DbDep,
     x_source_id: Optional[str] = Header(default=None, alias="X-Source-Id"),
     x_bbk_id: Optional[str] = Header(default=None, alias="X-Bbk-Id"),
-    x_manager: Optional[str] = Header(default=None, alias="X-Manager"),
-    x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
 ):
-    """获取当前 source-id 下的分类列表，按 sort_order 升序."""
+    """获取当前 source-id 下的分类列表，按总行/非总行权限过滤."""
     if not x_source_id:
         raise HTTPException(
             status_code=400,
@@ -123,8 +117,8 @@ async def get_categories(
         raise HTTPException(status_code=503, detail="Database unavailable")
 
     where = "WHERE c.source_id = %s"
-    if x_bbk_id and not _is_manager(x_manager, x_user_role):
-        where += " AND c.branch_visible = 1"
+    if x_bbk_id != "100":
+        where += " AND COALESCE(c.branch_visible, 1) = 1"
     rows = await db.fetch_all(
         _category_select_sql(where) + "ORDER BY sort_order ASC",
         (x_source_id,),

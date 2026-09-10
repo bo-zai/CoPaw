@@ -44,7 +44,7 @@ def test_get_categories_returns_list():
     client = TestClient(app)
     response = client.get(
         "/api/market/categories",
-        headers={"X-Source-Id": "src_a", "X-Manager": "true"},
+        headers={"X-Source-Id": "src_a", "X-Bbk-Id": "100"},
     )
     assert response.status_code == 200
     data = response.json()
@@ -136,12 +136,37 @@ def test_branch_user_only_sees_branch_visible_categories():
 
     response = client.get(
         "/api/market/categories",
-        headers={"X-Source-Id": "src_a", "X-Bbk-Id": "100"},
+        headers={
+            "X-Source-Id": "src_a",
+            "X-Bbk-Id": "110",
+            "X-User-Role": "admin",
+        },
     )
 
     assert response.status_code == 200
     sql = mock_db.fetch_all.call_args.args[0]
-    assert "branch_visible = 1" in sql
+    assert "COALESCE(c.branch_visible, 1) = 1" in sql
+
+
+def test_head_office_sees_hidden_categories_regardless_of_role():
+    mock_db = AsyncMock()
+    mock_db.is_connected = True
+    mock_db.fetch_all = AsyncMock(return_value=[])
+    app = _make_app(mock_db)
+    client = TestClient(app)
+
+    response = client.get(
+        "/api/market/categories",
+        headers={
+            "X-Source-Id": "src_a",
+            "X-Bbk-Id": "100",
+            "X-User-Role": "user",
+        },
+    )
+
+    assert response.status_code == 200
+    sql = mock_db.fetch_all.call_args.args[0]
+    assert "WHERE c.source_id = %s ORDER BY" in sql
 
 
 def test_update_category_supports_name_and_visibility():

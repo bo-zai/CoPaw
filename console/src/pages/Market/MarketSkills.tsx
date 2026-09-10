@@ -32,7 +32,7 @@ import { MCPDetailDrawer } from "./MCPDetailDrawer";
 import { MCPUploadModal } from "./MCPUploadModal";
 import { MCPEditModal } from "./MCPEditModal";
 import { useMarket } from "./useMarket";
-import { marketApi, MarketSkill, MarketSkillDetail } from "../../api/modules/market";
+import { marketApi, MarketSkill, MarketSkillDetail, BranchCount } from "../../api/modules/market";
 import { marketMcpApi } from "../../api/modules/marketMcp";
 import { BBK_ID_TO_NAME_MAP } from "../../constants/bbk";
 import type { MarketMCPItem, MarketMCPDetail } from "../../api/types";
@@ -103,12 +103,12 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
   const [categoryManagementOpen, setCategoryManagementOpen] = useState(false);
   const [skillEditOpen, setSkillEditOpen] = useState(false);
   const [editingSkill, setEditingSkill] = useState<MarketSkill | null>(null);
-  const [allBbkIds, setAllBbkIds] = useState<string[]>([]);
+  const [allBbkIds, setAllBbkIds] = useState<BranchCount[]>([]);
 
-  // 获取所有有数据的分行 ID 列表（管理员用）
+  // 获取所有有数据的分行 ID 列表及技能数量（管理员用）
   useEffect(() => {
     if (isManager) {
-      marketApi.listBbkIds(sourceId).then(setAllBbkIds).catch(console.error);
+      marketApi.listBbkIds(sourceId).then((res) => setAllBbkIds(res.branches)).catch(console.error);
     }
   }, [sourceId, isManager]);
 
@@ -552,7 +552,7 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
                     }}
                   >
                     <span>全部</span>
-                    <Tag style={{ margin: 0 }}>{skills.length}</Tag>
+                    <Tag style={{ margin: 0 }}>{categories.reduce((sum, cat) => sum + (categoryCountMap.get(cat.id) || 0), 0)}</Tag>
                   </div>
                   {categories.map((cat) => {
                     const isActive = String(selectedCategory) === String(cat.id);
@@ -603,16 +603,15 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
                         }}
                       >
                         <span>全部</span>
-                        <Tag style={{ margin: 0 }}>{skills.length}</Tag>
+                        <Tag style={{ margin: 0 }}>{allBbkIds[0]?.total_unique_skill_count ?? 0}</Tag>
                       </div>
-                      {allBbkIds.map((bbkId) => {
-                        const isActive = selectedBbkId === bbkId;
-                        const count = bbkCountMap.get(bbkId) || 0;
-                        if (count === 0) return null;
+                      {allBbkIds.map((b) => {
+                        const isActive = selectedBbkId === b.bbk_id;
+                        if (b.skill_count === 0) return null;
                         return (
                           <div
-                            key={bbkId}
-                            onClick={() => setSelectedBbkId(isActive ? null : bbkId)}
+                            key={b.bbk_id}
+                            onClick={() => setSelectedBbkId(isActive ? null : b.bbk_id)}
                             style={{
                               display: "flex",
                               alignItems: "center",
@@ -625,8 +624,8 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
                               transition: "all 0.15s ease",
                             }}
                           >
-                            <span>{BBK_ID_TO_NAME_MAP[bbkId] || bbkId}</span>
-                            <Tag style={{ margin: 0 }}>{count}</Tag>
+                            <span>{BBK_ID_TO_NAME_MAP[b.bbk_id] || b.bbk_id}</span>
+                            <Tag style={{ margin: 0 }}>{b.skill_count}</Tag>
                           </div>
                         );
                       })}
@@ -757,16 +756,15 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
                       }}
                     >
                       <span>全部</span>
-                      <Tag style={{ margin: 0 }}>{mcpList.length}</Tag>
+                      <Tag style={{ margin: 0 }}>{allBbkIds[0]?.total_unique_mcp_count ?? 0}</Tag>
                     </div>
-                    {allBbkIds.map((bbkId) => {
-                      const isActive = selectedMcpBbkId === bbkId;
-                      const count = mcpBbkCountMap.get(bbkId) || 0;
-                      if (count === 0) return null;
+                    {allBbkIds.map((b) => {
+                      const isActive = selectedMcpBbkId === b.bbk_id;
+                      if (b.mcp_count === 0) return null;
                       return (
                         <div
-                          key={bbkId}
-                          onClick={() => setSelectedMcpBbkId(isActive ? null : bbkId)}
+                          key={b.bbk_id}
+                          onClick={() => setSelectedMcpBbkId(isActive ? null : b.bbk_id)}
                           style={{
                             display: "flex",
                             alignItems: "center",
@@ -779,8 +777,8 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
                             transition: "all 0.15s ease",
                           }}
                         >
-                          <span>{BBK_ID_TO_NAME_MAP[bbkId] || bbkId}</span>
-                          <Tag style={{ margin: 0 }}>{count}</Tag>
+                          <span>{BBK_ID_TO_NAME_MAP[b.bbk_id] || b.bbk_id}</span>
+                          <Tag style={{ margin: 0 }}>{b.mcp_count}</Tag>
                         </div>
                       );
                     })}

@@ -140,6 +140,18 @@ export interface Category {
   skill_count: number;
 }
 
+export interface BranchCount {
+  bbk_id: string;
+  skill_count: number;
+  mcp_count: number;
+  total_unique_skill_count: number;
+  total_unique_mcp_count: number;
+}
+
+export interface BranchCountsResponse {
+  branches: BranchCount[];
+}
+
 export interface PublishSkillRequest {
   name: string;
   description: string;
@@ -345,9 +357,9 @@ export const marketApi = {
     });
   },
 
-  listBbkIds: async (sourceId: string): Promise<string[]> => {
+  listBbkIds: async (sourceId: string): Promise<BranchCountsResponse> => {
     const opts = mergeHeaders({ "X-Source-Id": sourceId });
-    return request<string[]>("/market/bbk-ids", opts);
+    return request<BranchCountsResponse>("/market/bbk-ids", opts);
   },
 
   listMarketSkills: async (

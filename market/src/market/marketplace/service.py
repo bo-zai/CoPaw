@@ -506,6 +506,75 @@ def _item_visible(item: MarketItem, user_bbk_id: str) -> bool:
     return item.status == "active"
 
 
+def _is_visible_market_skill(
+    item: MarketItem,
+    visible_category_ids: set[int] | None,
+) -> bool:
+    if (
+        item.item_type == "skill"
+        and visible_category_ids is not None
+        and item.category_id is not None
+    ):
+        return item.category_id in visible_category_ids
+    return True
+
+
+def _accumulate_branch_counts(
+    item: MarketItem,
+    all_bbk_ids: set[str],
+    skill_counts: dict[str, int],
+    mcp_counts: dict[str, int],
+    unique_skill_ids: set[str],
+    unique_mcp_ids: set[str],
+) -> None:
+    all_bbk_ids.update(item.bbk_ids)
+    for bbk_id in item.bbk_ids:
+        if item.item_type == "skill":
+            skill_counts[bbk_id] = skill_counts.get(bbk_id, 0) + 1
+        elif item.item_type == "mcp":
+            mcp_counts[bbk_id] = mcp_counts.get(bbk_id, 0) + 1
+    if item.item_type == "skill":
+        unique_skill_ids.add(item.item_id)
+    elif item.item_type == "mcp":
+        unique_mcp_ids.add(item.item_id)
+
+
+def _filter_market_skills(
+    items: list[MarketItem],
+    category_id: Optional[int],
+    bbk_ids: Optional[list[str]],
+    is_manager: bool,
+    user_bbk_id: str,
+    visible_category_ids: set[int] | None,
+) -> list[MarketItem]:
+    visible = [
+        item
+        for item in items
+        if item.item_type == "skill" and item.status == "active"
+    ]
+    if category_id is not None:
+        visible = [item for item in visible if item.category_id == category_id]
+    if not is_manager:
+        if visible_category_ids is not None:
+            visible = [
+                item
+                for item in visible
+                if _is_visible_market_skill(item, visible_category_ids)
+            ]
+        visible = [
+            item
+            for item in visible
+            if item.bbk_ids == [] or user_bbk_id in item.bbk_ids
+        ]
+    if bbk_ids:
+        visible = [
+            item
+            for item in visible
+            if item.bbk_ids and any(b in item.bbk_ids for b in bbk_ids)
+        ]
+    return visible
+
+
 def _preview_sort_key(path: Path) -> tuple[int, str]:
     """统一文件预览树排序，优先展示核心入口文件。"""
     if path.name == "SKILL.md":
@@ -846,7 +915,6 @@ class MarketplaceService:
                             user_id,
                             source_id,
                         )
-                        return True
                     logger.warning(
                         "Agent reload failed on attempt %s: %s - %s",
                         attempt + 1,
@@ -2831,18 +2899,55 @@ class MarketplaceService:
 
         return True
 
-    def list_all_bbk_ids(self, source_id: str) -> list[str]:
-        """获取所有有数据的分行 ID 列表（去重、排序）。
+    def list_all_bbk_ids(
+        self,
+        source_id: str,
+        visible_category_ids: set[int] | None = None,
+    ) -> list[dict]:
+        """获取所有有数据的分行 ID 列表（含技能和 MCP 数量，去重、排序）。
 
         从 index.json 中提取所有活跃条目的 bbk_ids 字段，
+        同时统计每个分行的 skill 和 MCP 数量，
         用于前端分行菜单的固定渲染。
+
+        ``visible_category_ids`` 仅用于普通用户的技能可见性过滤；
+        MCP 和未分类技能不受该参数影响。
         """
         items = load_index(self.marketplace_root, source_id)
-        bbk_ids: set[str] = set()
+        all_bbk_ids: set[str] = set()
+        skill_counts: dict[str, int] = {}
+        mcp_counts: dict[str, int] = {}
+        unique_skill_ids: set[str] = set()
+        unique_mcp_ids: set[str] = set()
+
         for item in items:
-            if item.status == "active" and item.bbk_ids:
-                bbk_ids.update(item.bbk_ids)
-        return sorted(bbk_ids)
+            if (
+                item.status != "active"
+                or not item.bbk_ids
+                or not _is_visible_market_skill(item, visible_category_ids)
+            ):
+                continue
+            _accumulate_branch_counts(
+                item,
+                all_bbk_ids,
+                skill_counts,
+                mcp_counts,
+                unique_skill_ids,
+                unique_mcp_ids,
+            )
+
+        result: list[dict] = []
+        for bbk_id in sorted(all_bbk_ids):
+            result.append(
+                {
+                    "bbk_id": bbk_id,
+                    "skill_count": skill_counts.get(bbk_id, 0),
+                    "mcp_count": mcp_counts.get(bbk_id, 0),
+                    "total_unique_skill_count": len(unique_skill_ids),
+                    "total_unique_mcp_count": len(unique_mcp_ids),
+                },
+            )
+        return result
 
     async def list_skills(
         self,
@@ -2863,32 +2968,14 @@ class MarketplaceService:
             is_manager: 是否为管理员，管理员可查看所有技能。
         """
         items = load_index(self.marketplace_root, source_id)
-        visible = [
-            i for i in items if i.item_type == "skill" and i.status == "active"
-        ]
-        if category_id is not None:
-            visible = [i for i in visible if i.category_id == category_id]
-        if not is_manager and visible_category_ids is not None:
-            visible = [
-                i
-                for i in visible
-                if i.category_id is None
-                or i.category_id in visible_category_ids
-            ]
-        # 分级可见性过滤：非管理员只能看到总行技能和本分行技能
-        if not is_manager:
-            visible = [
-                i
-                for i in visible
-                if i.bbk_ids == [] or user_bbk_id in i.bbk_ids
-            ]
-        # 前端传参时再做交集过滤（保留原有功能）
-        if bbk_ids is not None and len(bbk_ids) > 0:
-            visible = [
-                i
-                for i in visible
-                if i.bbk_ids and any(b in i.bbk_ids for b in bbk_ids)
-            ]
+        visible = _filter_market_skills(
+            items,
+            category_id,
+            bbk_ids,
+            is_manager,
+            user_bbk_id,
+            visible_category_ids,
+        )
 
         result = []
         for item in visible:

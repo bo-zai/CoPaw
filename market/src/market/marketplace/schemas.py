@@ -516,3 +516,19 @@ class SkillQueryResponse(BaseModel):
     )
     total_requested: int = Field(description="请求查询的技能数量")
     total_found: int = Field(description="找到的技能数量")
+
+
+class BranchCount(BaseModel):
+    """分行计数."""
+
+    bbk_id: str = Field(description="分行 ID")
+    skill_count: int = Field(description="技能数量")
+    mcp_count: int = Field(description="MCP 数量")
+    total_unique_skill_count: int = Field(description="唯一技能总数（去重）")
+    total_unique_mcp_count: int = Field(description="唯一MCP总数（去重）")
+
+
+class BranchCountsResponse(BaseModel):
+    """分行列表及计数响应."""
+
+    branches: list[BranchCount] = Field(description="分行列表及计数")
