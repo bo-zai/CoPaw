@@ -32,7 +32,7 @@ import { MCPDetailDrawer } from "./MCPDetailDrawer";
 import { MCPUploadModal } from "./MCPUploadModal";
 import { MCPEditModal } from "./MCPEditModal";
 import { useMarket } from "./useMarket";
-import { marketApi, MarketSkill, MarketSkillDetail, BranchCount } from "../../api/modules/market";
+import { marketApi, MarketSkill, MarketSkillDetail, BranchCount, Category } from "../../api/modules/market";
 import { marketMcpApi } from "../../api/modules/marketMcp";
 import { BBK_ID_TO_NAME_MAP } from "../../constants/bbk";
 import type { MarketMCPItem, MarketMCPDetail } from "../../api/types";
@@ -104,6 +104,7 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
   const [skillEditOpen, setSkillEditOpen] = useState(false);
   const [editingSkill, setEditingSkill] = useState<MarketSkill | null>(null);
   const [allBbkIds, setAllBbkIds] = useState<BranchCount[]>([]);
+  const [allCategories, setAllCategories] = useState<Category[]>([]);
 
   // 获取所有有数据的分行 ID 列表及技能数量（管理员用）
   const refreshBbkIds = useCallback(() => {
@@ -112,14 +113,21 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
     }
   }, [sourceId, isManager]);
 
+  // 获取所有分类列表及技能数量（管理员用）
+  const refreshAllCategories = useCallback(() => {
+    marketApi.listCategories(sourceId).then((data) => setAllCategories(data)).catch(console.error);
+  }, [sourceId]);
+
   useEffect(() => {
     refreshBbkIds();
-  }, [refreshBbkIds]);
+    refreshAllCategories();
+  }, [refreshBbkIds, refreshAllCategories]);
 
   useEffect(() => {
     refreshCategories();
+    refreshAllCategories();
     refreshSkills();
-  }, [refreshCategories, refreshSkills]);
+  }, [refreshCategories, refreshAllCategories, refreshSkills]);
 
   // Handle unpublish skill (下架)
   const handleUnpublishSkill = async (skill: MarketSkill | MarketSkillDetail | null) => {
@@ -345,15 +353,6 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
       ?.name
     : undefined;
 
-  // 分类计数
-  const categoryCountMap = new Map<string | number, number>();
-  skills.forEach((s) => {
-    if (s.category_id) {
-      const count = categoryCountMap.get(s.category_id) || 0;
-      categoryCountMap.set(s.category_id, count + 1);
-    }
-  });
-
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       {/* Header */}
@@ -424,6 +423,7 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
               onClick={() => {
                 if (activeResourceType === "skill") {
                   refreshCategories();
+                  refreshAllCategories();
                   refreshSkills();
                 } else {
                   refreshMCP();
@@ -558,11 +558,10 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
                     }}
                   >
                     <span>全部</span>
-                    <Tag style={{ margin: 0 }}>{categories.reduce((sum, cat) => sum + (categoryCountMap.get(cat.id) || 0), 0)}</Tag>
+                    <Tag style={{ margin: 0 }}>{allCategories.reduce((sum, cat) => sum + (cat.skill_count || 0), 0)}</Tag>
                   </div>
-                  {categories.map((cat) => {
+                  {allCategories.map((cat) => {
                     const isActive = String(selectedCategory) === String(cat.id);
-                    const count = categoryCountMap.get(cat.id) || 0;
                     return (
                       <div
                         key={cat.id}
@@ -580,7 +579,7 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
                         }}
                       >
                         <span>{cat.name}</span>
-                        <Tag style={{ margin: 0 }}>{count}</Tag>
+                        <Tag style={{ margin: 0 }}>{cat.skill_count}</Tag>
                       </div>
                     );
                   })}
@@ -908,6 +907,7 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
           onClose={() => setCategoryManagementOpen(false)}
           onChanged={async () => {
             await refreshCategories();
+            await refreshAllCategories();
             await refreshSkills();
           }}
         />
