@@ -13,7 +13,6 @@ import {
   Modal,
 } from "antd";
 import {
-  PlusOutlined,
   SearchOutlined,
   ReloadOutlined,
   ShopOutlined,
@@ -22,6 +21,8 @@ import {
 } from "@ant-design/icons";
 import { SkillCard } from "./SkillCard";
 import { SkillDetailDrawer } from "./SkillDetailDrawer";
+import { CategoryManagementModal } from "./CategoryManagementModal";
+import { SkillEditModal } from "./SkillEditModal";
 import { DistributeTargetModal, DistributeTargetType } from "./DistributeTargetModal";
 import { RecallModal, RecallTargetType } from "./components/RecallModal";
 import { SkillReadinessModal } from "./SkillReadinessModal";
@@ -33,7 +34,7 @@ import { MCPEditModal } from "./MCPEditModal";
 import { useMarket } from "./useMarket";
 import { marketApi, MarketSkill, MarketSkillDetail } from "../../api/modules/market";
 import { marketMcpApi } from "../../api/modules/marketMcp";
-import { BBK_ID_MAP, BBK_ID_TO_NAME_MAP } from "../../constants/bbk";
+import { BBK_ID_TO_NAME_MAP } from "../../constants/bbk";
 import type { MarketMCPItem, MarketMCPDetail } from "../../api/types";
 
 type ResourceType = "skill" | "mcp";
@@ -99,6 +100,9 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
   const [searchQuery, setSearchQuery] = useState("");
   const [activeResourceType, setActiveResourceType] = useState<ResourceType>("skill");
   const [uploadModalOpen, setUploadModalOpen] = useState(false);
+  const [categoryManagementOpen, setCategoryManagementOpen] = useState(false);
+  const [skillEditOpen, setSkillEditOpen] = useState(false);
+  const [editingSkill, setEditingSkill] = useState<MarketSkill | null>(null);
   const [allBbkIds, setAllBbkIds] = useState<string[]>([]);
 
   // 获取所有有数据的分行 ID 列表（管理员用）
@@ -123,7 +127,7 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
         setDetailDrawerOpen(false);
       }
       refreshSkills();
-    } catch (err) {
+    } catch {
       message.error("下架失败");
     }
   };
@@ -138,7 +142,7 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
         setDetailDrawerOpen(false);
       }
       refreshSkills();
-    } catch (err) {
+    } catch {
       message.error("删除失败");
     }
   };
@@ -235,6 +239,11 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
 
   const openSkillReadiness = useCallback((skill: MarketSkill | MarketSkillDetail) => {
     setReadinessSkill(skill);
+  }, []);
+
+  const openSkillEdit = useCallback((skill: MarketSkill | MarketSkillDetail) => {
+    setEditingSkill(skill);
+    setSkillEditOpen(true);
   }, []);
 
   // 打开 MCP 撤回弹窗
@@ -355,9 +364,14 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
               </Button>
             )}
             {isManager && activeResourceType === "skill" && (
-              <Button type="primary" icon={<UploadOutlined />} onClick={() => setUploadModalOpen(true)}>
-                上传技能
-              </Button>
+              <>
+                <Button icon={<ShopOutlined />} onClick={() => setCategoryManagementOpen(true)}>
+                  分类管理
+                </Button>
+                <Button type="primary" icon={<UploadOutlined />} onClick={() => setUploadModalOpen(true)}>
+                  上传技能
+                </Button>
+              </>
             )}
           </div>
         </div>
@@ -495,6 +509,7 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
                 sourceId={sourceId}
                 onRefresh={refreshSkillsAndDetail}
                 categoryName={selectedSkillCategoryName}
+                onEdit={() => openSkillEdit(selectedSkill)}
               />
             </div>
           ) : (
@@ -877,8 +892,36 @@ export function MarketSkills({ sourceId, isManager, bbkId }: MarketSkillsProps) 
         sourceId={sourceId}
         onClose={() => setUploadModalOpen(false)}
         onSuccess={refreshSkillsAndDetail}
-        onCategoryAdded={refreshCategories}
       />
+
+      {isManager && (
+        <CategoryManagementModal
+          open={categoryManagementOpen}
+          sourceId={sourceId}
+          onClose={() => setCategoryManagementOpen(false)}
+          onChanged={async () => {
+            await refreshCategories();
+            await refreshSkills();
+          }}
+        />
+      )}
+
+      {isManager && (
+        <SkillEditModal
+          open={skillEditOpen}
+          sourceId={sourceId}
+          skill={editingSkill}
+          categories={categories}
+          onClose={() => {
+            setSkillEditOpen(false);
+            setEditingSkill(null);
+          }}
+          onSuccess={async () => {
+            await refreshSkillsAndDetail();
+            setEditingSkill(null);
+          }}
+        />
+      )}
 
       {/* 统一分发弹窗 */}
       {isManager && (

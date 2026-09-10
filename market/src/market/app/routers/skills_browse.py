@@ -673,7 +673,7 @@ async def list_skills(
     """浏览市场技能列表（按 source_id + category_id + bbk_ids 过滤）。"""
     source_id = require_source_id(x_source_id)
     user_bbk_id = x_bbk_id or "100"
-    is_manager = x_manager == "true" or x_user_role == "admin"
+    is_manager = x_manager == "true" or x_user_role in {"admin", "manager"}
 
     log_params(
         logger,
@@ -688,12 +688,21 @@ async def list_skills(
     if bbk_ids:
         parsed_bbk_ids = [b.strip() for b in bbk_ids.split(",") if b.strip()]
     svc = request.app.state.marketplace
+    visible_category_ids = None
+    if not is_manager and svc.db.is_connected:
+        category_rows = await svc.db.fetch_all(
+            "SELECT id FROM swe_marketplace_categories "
+            "WHERE source_id = %s AND COALESCE(branch_visible, 1) = 1",
+            (source_id,),
+        )
+        visible_category_ids = {int(row["id"]) for row in category_rows}
     return await svc.list_skills(
         source_id,
         user_bbk_id,
         category_id=category_id,
         bbk_ids=parsed_bbk_ids,
         is_manager=is_manager,
+        visible_category_ids=visible_category_ids,
     )
 
 
@@ -759,6 +768,8 @@ async def get_skill_detail(
     request: Request,
     x_source_id: Optional[str] = Header(default=None, alias="X-Source-Id"),
     x_bbk_id: Optional[str] = Header(default=None, alias="X-Bbk-Id"),
+    x_manager: Optional[str] = Header(default=None, alias="X-Manager"),
+    x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
 ):
     """预览技能详情."""
     source_id = require_source_id(x_source_id)
@@ -767,7 +778,22 @@ async def get_skill_detail(
     log_params(logger, request.method, request.url.path, item_id=item_id)
 
     svc = request.app.state.marketplace
-    detail = await svc.get_skill_detail(source_id, item_id, user_bbk_id)
+    is_manager = x_manager == "true" or x_user_role in {"admin", "manager"}
+    visible_category_ids = None
+    if not is_manager and svc.db.is_connected:
+        category_rows = await svc.db.fetch_all(
+            "SELECT id FROM swe_marketplace_categories "
+            "WHERE source_id = %s AND COALESCE(branch_visible, 1) = 1",
+            (source_id,),
+        )
+        visible_category_ids = {int(row["id"]) for row in category_rows}
+    detail = await svc.get_skill_detail(
+        source_id,
+        item_id,
+        user_bbk_id,
+        is_manager=is_manager,
+        visible_category_ids=visible_category_ids,
+    )
     if detail is None:
         raise HTTPException(status_code=404, detail="Skill not found")
     return detail

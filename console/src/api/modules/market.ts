@@ -136,6 +136,8 @@ export interface Category {
   source_id: string;
   name: string;
   sort_order: number;
+  branch_visible: boolean;
+  skill_count: number;
 }
 
 export interface PublishSkillRequest {
@@ -300,6 +302,47 @@ export const marketApi = {
       body: JSON.stringify({ name }),
     };
     return request<Category>("/market/categories", opts);
+  },
+
+  updateCategory: async (
+    sourceId: string,
+    categoryId: number,
+    data: { name?: string; branch_visible?: boolean },
+  ): Promise<Category> => {
+    return request<Category>(`/market/categories/${categoryId}`, {
+      method: "PATCH",
+      ...mergeHeaders({
+        "Content-Type": "application/json",
+        "X-Source-Id": sourceId,
+        "X-Manager": "true",
+      }),
+      body: JSON.stringify(data),
+    });
+  },
+
+  reorderCategories: async (
+    sourceId: string,
+    categoryIds: number[],
+  ): Promise<{ success: boolean }> => {
+    return request<{ success: boolean }>("/market/categories/reorder", {
+      method: "PUT",
+      ...mergeHeaders({
+        "Content-Type": "application/json",
+        "X-Source-Id": sourceId,
+        "X-Manager": "true",
+      }),
+      body: JSON.stringify({ category_ids: categoryIds }),
+    });
+  },
+
+  deleteCategory: async (sourceId: string, categoryId: number): Promise<void> => {
+    await request(`/market/categories/${categoryId}`, {
+      method: "DELETE",
+      ...mergeHeaders({
+        "X-Source-Id": sourceId,
+        "X-Manager": "true",
+      }),
+    });
   },
 
   listBbkIds: async (sourceId: string): Promise<string[]> => {
@@ -781,6 +824,8 @@ export const marketApi = {
     data: {
       skill_id: string;
       chinese_name: string;
+      category_id?: number;
+      bbk_ids?: string[];
       sync_to_users?: boolean;
       target_user_ids?: string[];
     },
@@ -790,6 +835,7 @@ export const marketApi = {
     synced_users: number;
     skipped_users: number;
     errors: Array<{ user_id: string; reason: string }>;
+    synced_category_users?: number;
   }> => {
     const opts: RequestInit = {
       method: "PATCH",

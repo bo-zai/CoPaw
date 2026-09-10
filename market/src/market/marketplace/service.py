@@ -2851,6 +2851,7 @@ class MarketplaceService:
         category_id: Optional[int] = None,
         bbk_ids: Optional[list[str]] = None,
         is_manager: bool = False,
+        visible_category_ids: set[int] | None = None,
     ) -> list[MarketSkillResponse]:
         """列出市场技能，可选按分类和分行过滤。
 
@@ -2867,6 +2868,13 @@ class MarketplaceService:
         ]
         if category_id is not None:
             visible = [i for i in visible if i.category_id == category_id]
+        if not is_manager and visible_category_ids is not None:
+            visible = [
+                i
+                for i in visible
+                if i.category_id is None
+                or i.category_id in visible_category_ids
+            ]
         # 分级可见性过滤：非管理员只能看到总行技能和本分行技能
         if not is_manager:
             visible = [
@@ -2915,9 +2923,17 @@ class MarketplaceService:
         source_id: str,
         item_id: str,
         user_bbk_id: str,
+        is_manager: bool = False,
+        visible_category_ids: set[int] | None = None,
     ) -> Optional[MarketSkillDetail]:
         """获取技能详情（含调用客户明细）。"""
-        item = self._get_visible_skill_item(source_id, item_id, user_bbk_id)
+        item = self._get_visible_skill_item(
+            source_id,
+            item_id,
+            user_bbk_id,
+            is_manager=is_manager,
+            visible_category_ids=visible_category_ids,
+        )
         if item is None:
             return None
 
@@ -2949,6 +2965,8 @@ class MarketplaceService:
         source_id: str,
         item_id: str,
         user_bbk_id: str,
+        is_manager: bool = False,
+        visible_category_ids: set[int] | None = None,
     ) -> MarketItem | None:
         """获取当前用户可见的市场技能条目。"""
         items = load_index(self.marketplace_root, source_id)
@@ -2961,6 +2979,13 @@ class MarketplaceService:
             None,
         )
         if item is None or not _item_visible(item, user_bbk_id):
+            return None
+        if (
+            not is_manager
+            and visible_category_ids is not None
+            and item.category_id is not None
+            and item.category_id not in visible_category_ids
+        ):
             return None
         return item
 
@@ -3016,6 +3041,7 @@ class MarketplaceService:
                     version=item.version,
                     skill_id=skill_id,
                     cn_name=cn_name,
+                    category_id=item.category_id,
                 )
 
                 if result.get("status") == "conflict":
@@ -5443,6 +5469,137 @@ class MarketplaceService:
             "synced_users": synced_users,
             "skipped_users": (
                 distribution_count - synced_users if sync_to_users else 0
+            ),
+            "errors": errors,
+        }
+
+    async def _sync_skill_category_to_user(
+        self,
+        user_id: str,
+        skill_name: str,
+        category_id: int | None,
+        source_id: str,
+    ) -> bool:
+        """更新已分发用户 manifest 中的市场分类，不触碰技能文件。"""
+
+        def _update(payload: dict) -> bool:
+            entry = payload.get("skills", {}).get(skill_name)
+            if not isinstance(entry, dict):
+                return False
+            metadata = entry.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            if category_id is None:
+                metadata.pop("category_id", None)
+            else:
+                metadata["category_id"] = category_id
+            entry["metadata"] = metadata
+            return True
+
+        return mutate_user_skill_manifest(
+            self.swe_root,
+            user_id,
+            "default",
+            _update,
+            source_id,
+        )
+
+    async def update_skill_metadata(
+        self,
+        *,
+        source_id: str,
+        item_id: str,
+        skill_id: str,
+        skill_name: str,
+        chinese_name: str,
+        category_id: int | None,
+        bbk_ids: list[str],
+        sync_to_users: bool = False,
+        target_user_ids: list[str] | None = None,
+    ) -> dict:
+        """更新技能市场元数据，并按需同步已分发用户。"""
+        items = load_index(self.marketplace_root, source_id)
+        item = next(
+            (
+                candidate
+                for candidate in items
+                if candidate.item_id == item_id
+                and candidate.item_type == "skill"
+            ),
+            None,
+        )
+        if item is None:
+            raise ValueError(f"Skill item '{item_id}' not found")
+        item.chinese_name = chinese_name
+        item.category_id = category_id
+        item.bbk_ids = bbk_ids
+        item.updated_at = datetime.now(timezone.utc).isoformat()
+        save_index(self.marketplace_root, source_id, items)
+
+        if self.db.is_connected:
+            await self.db.execute(
+                """UPDATE swe_marketplace_skills
+                SET cn_name = %s, updated_at = NOW()
+                WHERE source_id = %s AND item_id = %s""",
+                (chinese_name, source_id, item_id),
+            )
+
+        distributions = await self.get_distributions(
+            source_id,
+            item_id,
+            "skill",
+            skill_name=skill_name,
+        )
+        synced = 0
+        synced_names = 0
+        errors: list[dict[str, str]] = []
+        for distribution in distributions:
+            user_id = distribution.target_user_id
+            try:
+                if await self._sync_skill_category_to_user(
+                    user_id,
+                    skill_name,
+                    category_id,
+                    source_id,
+                ):
+                    synced += 1
+                else:
+                    errors.append(
+                        {
+                            "user_id": user_id,
+                            "reason": "workspace sync failed",
+                        },
+                    )
+                if sync_to_users and (
+                    not target_user_ids or user_id in target_user_ids
+                ):
+                    if self.skill_registry.is_connected():
+                        await self.skill_registry.update_cn_name_by_skill_id(
+                            skill_id,
+                            user_id,
+                            chinese_name,
+                        )
+                    if self._sync_cn_name_to_user_workspace(
+                        user_id,
+                        skill_name,
+                        chinese_name,
+                        source_id,
+                    ):
+                        synced_names += 1
+                    else:
+                        errors.append(
+                            {"user_id": user_id, "reason": "name sync failed"},
+                        )
+            except Exception as exc:
+                errors.append({"user_id": user_id, "reason": str(exc)})
+
+        return {
+            "success": True,
+            "market_updated": True,
+            "synced_category_users": synced,
+            "synced_users": synced_names,
+            "skipped_users": (
+                len(distributions) - synced_names if sync_to_users else 0
             ),
             "errors": errors,
         }
