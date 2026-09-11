@@ -348,7 +348,7 @@ def test_branch_user_selecting_head_office_only_returns_head_office_resources(
     }
 
 
-def test_mcp_browse_uses_the_same_branch_and_category_facet_rules(tmp_path):
+def test_mcp_browse_does_not_expose_skill_categories(tmp_path):
     from market.marketplace.fs import save_index
     from market.marketplace.models import MarketItem
 
@@ -391,16 +391,20 @@ def test_mcp_browse_uses_the_same_branch_and_category_facet_rules(tmp_path):
 
     assert response.status_code == 200
     data = response.json()
-    assert data["total"] == 2
-    assert {item["name"] for item in data["items"]} == {"mcp-hq", "mcp-branch"}
-    assert {item["id"]: item["count"] for item in data["categories"]} == {1: 2}
+    assert data["total"] == 3
+    assert {item["name"] for item in data["items"]} == {
+        "mcp-hq",
+        "mcp-branch",
+        "mcp-hidden",
+    }
+    assert data["categories"] == []
     assert {item["bbk_id"]: item["count"] for item in data["branches"]} == {
         "100": 1,
-        "110": 1,
+        "110": 2,
     }
 
 
-def test_mcp_browse_can_select_uncategorized_resources(tmp_path):
+def test_mcp_browse_does_not_expose_uncategorized_skill_category(tmp_path):
     from market.marketplace.fs import save_index
     from market.marketplace.models import MarketItem
 
@@ -429,22 +433,21 @@ def test_mcp_browse_can_select_uncategorized_resources(tmp_path):
     )
 
     response = TestClient(app).get(
-        "/api/market/browse?resource_type=mcp&uncategorized=true",
+        "/api/market/browse?resource_type=mcp",
         headers={"X-Source-Id": "src_a", "X-Bbk-Id": "100"},
     )
 
     assert response.status_code == 200
     data = response.json()
-    assert data["total"] == 1
-    assert [item["name"] for item in data["items"]] == ["mcp-uncategorized"]
-    assert {item["id"]: item["count"] for item in data["categories"]} == {
-        1: 1,
-        2: 0,
-        -1: 1,
+    assert data["total"] == 2
+    assert {item["name"] for item in data["items"]} == {
+        "mcp-categorized",
+        "mcp-uncategorized",
     }
+    assert data["categories"] == []
 
 
-def test_mcp_browse_exposes_orphaned_category(tmp_path):
+def test_mcp_browse_does_not_expose_orphaned_skill_category(tmp_path):
     from market.marketplace.fs import save_index
     from market.marketplace.models import MarketItem
 
@@ -465,7 +468,7 @@ def test_mcp_browse_exposes_orphaned_category(tmp_path):
     )
 
     response = TestClient(app).get(
-        "/api/market/browse?resource_type=mcp&orphaned=true",
+        "/api/market/browse?resource_type=mcp",
         headers={"X-Source-Id": "src_a", "X-Bbk-Id": "100"},
     )
 
@@ -473,11 +476,7 @@ def test_mcp_browse_exposes_orphaned_category(tmp_path):
     data = response.json()
     assert data["total"] == 1
     assert [item["name"] for item in data["items"]] == ["mcp-orphaned"]
-    assert {item["id"]: item["count"] for item in data["categories"]} == {
-        1: 0,
-        2: 0,
-        -2: 1,
-    }
+    assert data["categories"] == []
 
 
 def test_selected_facets_keep_independent_all_totals(tmp_path):

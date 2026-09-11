@@ -247,20 +247,24 @@ export function CategoryManagementModal({
       <div style={{ color: "#4b5563", fontSize: 13, marginBottom: 16 }}>
         仅技能使用此分类体系。分类关闭分行可见后，分行用户将不会看到该分类及其技能；总行仍可见。
       </div>
-      <Alert
-        type="info"
-        showIcon
-        message={`未分类技能：${uncategorizedSkillCount} 个`}
-        description="历史未设置分类的技能会归入“未分类”。该分组仅用于筛选，不支持改名、删除或排序。"
-        style={{ marginBottom: 16 }}
-      />
-      <Alert
-        type="warning"
-        showIcon
-        message={`待整理技能：${orphanedSkillCount} 个`}
-        description="引用已不存在分类的历史技能会归入“待整理分类”，请通过技能编辑逐个设置真实分类。该分组仅用于定位，不支持改名、删除或排序。"
-        style={{ marginBottom: 16 }}
-      />
+      {uncategorizedSkillCount > 0 && (
+        <Alert
+          type="info"
+          showIcon
+          message={`未分类技能：${uncategorizedSkillCount} 个`}
+          description="历史未设置分类的技能会归入“未分类”。该分组仅用于筛选，不支持改名、删除或排序。"
+          style={{ marginBottom: 16 }}
+        />
+      )}
+      {orphanedSkillCount > 0 && (
+        <Alert
+          type="warning"
+          showIcon
+          message={`待整理技能：${orphanedSkillCount} 个`}
+          description="引用已不存在分类的历史技能会归入“待整理分类”，请通过技能编辑逐个设置真实分类。该分组仅用于定位，不支持改名、删除或排序。"
+          style={{ marginBottom: 16 }}
+        />
+      )}
       <Alert
         type="info"
         showIcon

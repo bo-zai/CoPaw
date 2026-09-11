@@ -159,4 +159,27 @@ describe("CategoryManagementModal", () => {
     expect(screen.queryByRole("button", { name: "编辑待整理分类" })).toBeNull();
     expect(screen.queryByRole("button", { name: "删除待整理分类" })).toBeNull();
   });
+
+  it("hides empty virtual category guidance", async () => {
+    mocks.listCategories.mockResolvedValue([category]);
+    mocks.browseMarket.mockResolvedValue({
+      categories: [
+        { id: -1, name: "未分类", count: 0 },
+        { id: -2, name: "待整理分类", count: 0 },
+      ],
+    });
+
+    render(
+      <CategoryManagementModal
+        open
+        sourceId="source"
+        onClose={vi.fn()}
+        onChanged={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByText("业务技能")).toBeTruthy());
+    expect(screen.queryByText(/未分类技能：0 个/)).toBeNull();
+    expect(screen.queryByText(/待整理技能：0 个/)).toBeNull();
+  });
 });

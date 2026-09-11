@@ -41,8 +41,6 @@ import {
   MarketSkillDetail,
   Category,
   MarketBrowseResponse,
-  ORPHANED_CATEGORY_ID,
-  UNCATEGORIZED_CATEGORY_ID,
 } from "../../api/modules/market";
 import { marketMcpApi } from "../../api/modules/marketMcp";
 import { BBK_ID_TO_NAME_MAP } from "../../constants/bbk";
@@ -191,22 +189,13 @@ export function MarketSkills({
   };
 
   // 刷新 MCP 列表
-  const [selectedMcpCategory, setSelectedMcpCategory] = useState<number | null>(
-    null,
-  );
   const [selectedMcpBbkId, setSelectedMcpBbkId] = useState<string | null>(null);
   const [mcpBrowse, setMcpBrowse] = useState<MarketBrowseResponse | null>(null);
   const refreshMCP = useCallback(async () => {
     setMcpLoading(true);
     try {
       const data = await marketApi.browseMarket(sourceId, "mcp", {
-        categoryId:
-          selectedMcpCategory === UNCATEGORIZED_CATEGORY_ID
-            ? null
-            : selectedMcpCategory,
         bbkId: selectedMcpBbkId,
-        uncategorized: selectedMcpCategory === UNCATEGORIZED_CATEGORY_ID,
-        orphaned: selectedMcpCategory === ORPHANED_CATEGORY_ID,
       });
       setMcpBrowse(data);
       setMcpList(data.items as MarketMCPItem[]);
@@ -215,7 +204,7 @@ export function MarketSkills({
     } finally {
       setMcpLoading(false);
     }
-  }, [sourceId, selectedMcpCategory, selectedMcpBbkId]);
+  }, [sourceId, selectedMcpBbkId]);
 
   // 切换资源类型时刷新
   useEffect(() => {
@@ -235,18 +224,6 @@ export function MarketSkills({
       setSelectedCategory(null);
     }
   }, [selectedCategory, setSelectedCategory, skillBrowse]);
-
-  useEffect(() => {
-    if (
-      mcpBrowse &&
-      selectedMcpCategory !== null &&
-      !mcpBrowse.categories.some(
-        (category) => category.id === selectedMcpCategory,
-      )
-    ) {
-      setSelectedMcpCategory(null);
-    }
-  }, [mcpBrowse, selectedMcpCategory]);
 
   // 获取 MCP 详情
   const openMCPDetail = useCallback(
@@ -429,7 +406,6 @@ export function MarketSkills({
     skill_count: facet.count,
   }));
   const skillBranches = skillBrowse?.branches ?? [];
-  const mcpCategories = mcpBrowse?.categories ?? [];
   const mcpBranches = mcpBrowse?.branches ?? [];
 
   const isSkillDetailMode =
@@ -953,66 +929,6 @@ export function MarketSkills({
                 overflow: "auto",
               }}
             >
-              <div style={{ marginBottom: 12 }}>
-                <Text strong style={{ fontSize: 14 }}>
-                  分类
-                </Text>
-                {selectedMcpCategory !== null && (
-                  <Button
-                    type="link"
-                    size="small"
-                    style={{ fontSize: 12, padding: "0 0 0 8px" }}
-                    onClick={() => setSelectedMcpCategory(null)}
-                  >
-                    清除
-                  </Button>
-                )}
-              </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                <div
-                  onClick={() => setSelectedMcpCategory(null)}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    padding: "8px 12px",
-                    borderRadius: 6,
-                    cursor: "pointer",
-                    backgroundColor:
-                      selectedMcpCategory === null ? "#e6f7ff" : "transparent",
-                    color: selectedMcpCategory === null ? "#1890ff" : "inherit",
-                  }}
-                >
-                  <span>全部</span>
-                  <Tag style={{ margin: 0 }}>
-                    {mcpBrowse?.category_total ?? 0}
-                  </Tag>
-                </div>
-                {mcpCategories.map((category) => {
-                  const isActive = selectedMcpCategory === category.id;
-                  return (
-                    <div
-                      key={category.id}
-                      onClick={() =>
-                        setSelectedMcpCategory(isActive ? null : category.id)
-                      }
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        padding: "8px 12px",
-                        borderRadius: 6,
-                        cursor: "pointer",
-                        backgroundColor: isActive ? "#e6f7ff" : "transparent",
-                        color: isActive ? "#1890ff" : "inherit",
-                      }}
-                    >
-                      <span>{category.name}</span>
-                      <Tag style={{ margin: 0 }}>{category.count}</Tag>
-                    </div>
-                  );
-                })}
-              </div>
               <div style={{ marginBottom: 12 }}>
                 <Text strong style={{ fontSize: 14 }}>
                   所属分行
