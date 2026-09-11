@@ -520,6 +520,109 @@ def _is_visible_market_skill(
     return True
 
 
+def _filter_skill_category(
+    items: list[MarketItem],
+    category_id: Optional[int],
+    selected_uncategorized: bool,
+    selected_orphaned: bool,
+    known_category_ids: set[int] | None,
+) -> list[MarketItem]:
+    if selected_uncategorized:
+        return [item for item in items if item.category_id is None]
+    if selected_orphaned:
+        return [
+            item
+            for item in items
+            if known_category_ids is not None
+            and is_orphaned_item(item, known_category_ids)
+        ]
+    if category_id is not None:
+        return [item for item in items if item.category_id == category_id]
+    return items
+
+
+def _filter_skill_scope(
+    items: list[MarketItem],
+    is_manager: bool,
+    user_bbk_id: str,
+    bbk_ids: Optional[list[str]],
+    visible_category_ids: set[int] | None,
+) -> list[MarketItem]:
+    if is_manager:
+        return items
+    visible = items
+    if visible_category_ids is not None:
+        visible = [
+            item
+            for item in visible
+            if _is_visible_market_skill(item, visible_category_ids)
+        ]
+    if not bbk_ids:
+        visible = [
+            item
+            for item in visible
+            if (
+                item.bbk_ids == []
+                or user_bbk_id in item.bbk_ids
+                or "100" in item.bbk_ids
+            )
+        ]
+    return visible
+
+
+def _filter_market_bbk_scope(
+    items: list[MarketItem],
+    bbk_ids: Optional[list[str]],
+) -> list[MarketItem]:
+    if not bbk_ids:
+        return items
+    return [
+        item
+        for item in items
+        if item.bbk_ids == []
+        or (item.bbk_ids and any(b in item.bbk_ids for b in bbk_ids))
+    ]
+
+
+def _filter_mcp_items_for_request(
+    items: list[MarketItem],
+    user_bbk_id: str,
+    bbk_ids: Optional[list[str]],
+    category_id: Optional[int],
+    is_head_office: bool,
+    visible_category_ids: set[int] | None,
+    selected_uncategorized: bool,
+    selected_orphaned: bool,
+    known_category_ids: set[int] | None,
+) -> list[MarketItem]:
+    if not bbk_ids or len(bbk_ids) == 1:
+        return filter_market_items(
+            items,
+            "mcp",
+            user_bbk_id,
+            bbk_ids[0] if bbk_ids else None,
+            category_id,
+            is_head_office,
+            visible_category_ids,
+            selected_uncategorized,
+            selected_orphaned,
+            known_category_ids,
+        )
+    mcp_items = [
+        item
+        for item in items
+        if item.item_type == "mcp" and item.status == "active"
+    ]
+    mcp_items = _filter_skill_category(
+        mcp_items,
+        category_id,
+        selected_uncategorized,
+        selected_orphaned,
+        known_category_ids,
+    )
+    return _filter_market_bbk_scope(mcp_items, bbk_ids)
+
+
 def _accumulate_branch_counts(
     item: MarketItem,
     all_bbk_ids: set[str],
@@ -556,43 +659,21 @@ def _filter_market_skills(
         for item in items
         if item.item_type == "skill" and item.status == "active"
     ]
-    if selected_uncategorized:
-        visible = [item for item in visible if item.category_id is None]
-    elif selected_orphaned:
-        visible = [
-            item
-            for item in visible
-            if known_category_ids is not None
-            and is_orphaned_item(item, known_category_ids)
-        ]
-    elif category_id is not None:
-        visible = [item for item in visible if item.category_id == category_id]
-    if not is_manager:
-        if visible_category_ids is not None:
-            visible = [
-                item
-                for item in visible
-                if _is_visible_market_skill(item, visible_category_ids)
-            ]
-        if not bbk_ids:
-            # 分行用户可见：总行技能(bbk_ids=空) + 自己分行的技能 + 总行分行的技能
-            visible = [
-                item
-                for item in visible
-                if (
-                    item.bbk_ids == []
-                    or user_bbk_id in item.bbk_ids
-                    or "100" in item.bbk_ids
-                )
-            ]
-    if bbk_ids:
-        visible = [
-            item
-            for item in visible
-            if item.bbk_ids == []
-            or (item.bbk_ids and any(b in item.bbk_ids for b in bbk_ids))
-        ]
-    return visible
+    visible = _filter_skill_category(
+        visible,
+        category_id,
+        selected_uncategorized,
+        selected_orphaned,
+        known_category_ids,
+    )
+    visible = _filter_skill_scope(
+        visible,
+        is_manager,
+        user_bbk_id,
+        bbk_ids,
+        visible_category_ids,
+    )
+    return _filter_market_bbk_scope(visible, bbk_ids)
 
 
 def _preview_sort_key(path: Path) -> tuple[int, str]:
@@ -4829,6 +4910,38 @@ class MarketplaceService:
 
         return item, version_unchanged
 
+    async def _build_market_mcp_items(
+        self,
+        items: list[MarketItem],
+        source_id: str,
+    ) -> list[MarketMCPItem]:
+        result = []
+        for item in items:
+            call_count, user_count = await self._get_mcp_stats(
+                item.client_key,
+                source_id,
+            )
+            result.append(
+                MarketMCPItem(
+                    item_id=item.item_id,
+                    client_key=item.client_key,
+                    name=item.name,
+                    chinese_name=item.chinese_name,
+                    description=item.description,
+                    guidance=item.guidance,
+                    version=item.version,
+                    creator_id=item.creator_id,
+                    creator_name=_decode_creator_name(item.creator_name),
+                    category_id=item.category_id,
+                    bbk_ids=item.bbk_ids,
+                    created_at=item.created_at,
+                    updated_at=item.updated_at,
+                    call_count=call_count,
+                    user_count=user_count,
+                ),
+            )
+        return result
+
     async def list_mcp_items(
         self,
         source_id: str,
@@ -4855,74 +4968,21 @@ class MarketplaceService:
         """
         items = load_index(self.marketplace_root, source_id)
         is_head_office = is_manager or user_bbk_id == "100"
-        if not bbk_ids or len(bbk_ids) == 1:
-            mcp_items = filter_market_items(
-                items,
-                "mcp",
-                user_bbk_id,
-                bbk_ids[0] if bbk_ids else None,
-                category_id,
-                is_head_office,
-                visible_category_ids,
-                selected_uncategorized,
-                selected_orphaned,
-                known_category_ids,
-            )
-        else:
-            mcp_items = [
-                i
-                for i in items
-                if i.item_type == "mcp" and i.status == "active"
-            ]
-            if selected_uncategorized:
-                mcp_items = [i for i in mcp_items if i.category_id is None]
-            elif selected_orphaned:
-                mcp_items = [
-                    i
-                    for i in mcp_items
-                    if known_category_ids is not None
-                    and is_orphaned_item(i, known_category_ids)
-                ]
-            elif category_id is not None:
-                mcp_items = [
-                    i for i in mcp_items if i.category_id == category_id
-                ]
-        mcp_items = _sort_items_by_updated_at_desc(mcp_items)
-
-        if bbk_ids and len(bbk_ids) > 1:
-            mcp_items = [
-                i
-                for i in mcp_items
-                if i.bbk_ids == []
-                or (i.bbk_ids and any(b in i.bbk_ids for b in bbk_ids))
-            ]
-
-        result = []
-        for item in mcp_items:
-            call_count, user_count = await self._get_mcp_stats(
-                item.client_key,
-                source_id,
-            )
-            result.append(
-                MarketMCPItem(
-                    item_id=item.item_id,
-                    client_key=item.client_key,
-                    name=item.name,
-                    chinese_name=item.chinese_name,
-                    description=item.description,
-                    guidance=item.guidance,
-                    version=item.version,
-                    creator_id=item.creator_id,
-                    creator_name=_decode_creator_name(item.creator_name),
-                    category_id=item.category_id,
-                    bbk_ids=item.bbk_ids,
-                    created_at=item.created_at,
-                    updated_at=item.updated_at,
-                    call_count=call_count,
-                    user_count=user_count,
-                ),
-            )
-        return result
+        mcp_items = _filter_mcp_items_for_request(
+            items,
+            user_bbk_id,
+            bbk_ids,
+            category_id,
+            is_head_office,
+            visible_category_ids,
+            selected_uncategorized,
+            selected_orphaned,
+            known_category_ids,
+        )
+        return await self._build_market_mcp_items(
+            _sort_items_by_updated_at_desc(mcp_items),
+            source_id,
+        )
 
     async def get_mcp_detail(
         self,

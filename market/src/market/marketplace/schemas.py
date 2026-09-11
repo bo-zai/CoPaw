@@ -173,7 +173,7 @@ class MySkillItem(BaseModel):
     updated_at: Optional[str] = None  # 技能最后更新时间
     # 新增字段
     skill_id: str = ""  # 唯一标识符，跨租户共享
-    cn_name: str = Field(default="", max_length=50)  # 中文展示名
+    cn_name: str = Field(default="", max_length=256)  # 中文展示名
 
 
 class BatchOperationRequest(BaseModel):
