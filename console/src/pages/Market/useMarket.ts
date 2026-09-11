@@ -1,15 +1,26 @@
 import { useState, useCallback } from "react";
-import { marketApi, Category, MarketSkill, MarketSkillDetail } from "../../api/modules/market";
+import {
+  marketApi,
+  Category,
+  MarketSkill,
+  MarketSkillDetail,
+  MarketBrowseResponse,
+  ORPHANED_CATEGORY_ID,
+  UNCATEGORIZED_CATEGORY_ID,
+} from "../../api/modules/market";
 
-export function useMarket(sourceId: string, isManager: boolean = true) {
+export function useMarket(sourceId: string) {
   const [categories, setCategories] = useState<Category[]>([]);
   const [skills, setSkills] = useState<MarketSkill[]>([]);
   const [loading, setLoading] = useState(false);
   const [selectedCategory, setSelectedCategory] = useState<number | null>(null);
   const [selectedBbkId, setSelectedBbkId] = useState<string | null>(null);
-  const [selectedSkill, setSelectedSkill] = useState<MarketSkillDetail | null>(null);
+  const [selectedSkill, setSelectedSkill] = useState<MarketSkillDetail | null>(
+    null,
+  );
   const [detailDrawerOpen, setDetailDrawerOpen] = useState(false);
   const [publishModalOpen, setPublishModalOpen] = useState(false);
+  const [browse, setBrowse] = useState<MarketBrowseResponse | null>(null);
 
   const refreshCategories = useCallback(async () => {
     try {
@@ -23,26 +34,32 @@ export function useMarket(sourceId: string, isManager: boolean = true) {
   const refreshSkills = useCallback(async () => {
     setLoading(true);
     try {
-      // 非管理员不传 bbkIds，由后端根据 X-Bbk-Id header 隐式过滤
-      const bbkIdsToUse = isManager ? (selectedBbkId ?? undefined) : undefined;
-      const data = await marketApi.listMarketSkills(
-        sourceId,
-        selectedCategory ?? undefined,
-        bbkIdsToUse,
-      );
-      setSkills(data);
+      const data = await marketApi.browseMarket(sourceId, "skill", {
+        categoryId:
+          selectedCategory === UNCATEGORIZED_CATEGORY_ID
+            ? null
+            : selectedCategory,
+        bbkId: selectedBbkId,
+        uncategorized: selectedCategory === UNCATEGORIZED_CATEGORY_ID,
+        orphaned: selectedCategory === ORPHANED_CATEGORY_ID,
+      });
+      setBrowse(data);
+      setSkills(data.items as MarketSkill[]);
     } catch (err) {
       console.error("Failed to load skills:", err);
     } finally {
       setLoading(false);
     }
-  }, [sourceId, selectedCategory, selectedBbkId, isManager]);
+  }, [sourceId, selectedCategory, selectedBbkId]);
 
   // 刷新当前选中技能的详情
   const refreshSelectedSkill = useCallback(async () => {
     if (!selectedSkill) return;
     try {
-      const detail = await marketApi.getSkillDetail(sourceId, selectedSkill.item_id);
+      const detail = await marketApi.getSkillDetail(
+        sourceId,
+        selectedSkill.item_id,
+      );
       if (detail) {
         setSelectedSkill(detail);
       }
@@ -69,13 +86,14 @@ export function useMarket(sourceId: string, isManager: boolean = true) {
         console.error("Failed to load skill detail:", err);
       }
     },
-    [sourceId]
+    [sourceId],
   );
 
   return {
     categories,
     skills,
     loading,
+    browse,
     selectedCategory,
     setSelectedCategory,
     selectedBbkId,

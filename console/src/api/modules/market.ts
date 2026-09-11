@@ -3,6 +3,7 @@ import { mergeHeaders } from "../mergeHeaders";
 import { getApiUrl } from "../config";
 import type { FileContentResponse, FileTreeNode, MySkill } from "./mySkills";
 import type { DistributionRecord, RecallResponse } from "../types";
+import type { MarketMCPItem } from "../types/marketMcp";
 
 export interface MarketSkill {
   item_id: string;
@@ -151,6 +152,30 @@ export interface BranchCount {
 export interface BranchCountsResponse {
   branches: BranchCount[];
 }
+
+export interface MarketBrowseFacet {
+  id: number;
+  name: string;
+  count: number;
+}
+
+export interface MarketBrowseBranch {
+  bbk_id: string;
+  count: number;
+}
+
+export interface MarketBrowseResponse {
+  resource_type: "skill" | "mcp";
+  items: Array<MarketSkill | MarketMCPItem>;
+  total: number;
+  category_total: number;
+  branch_total: number;
+  categories: MarketBrowseFacet[];
+  branches: MarketBrowseBranch[];
+}
+
+export const UNCATEGORIZED_CATEGORY_ID = -1;
+export const ORPHANED_CATEGORY_ID = -2;
 
 export interface PublishSkillRequest {
   name: string;
@@ -347,7 +372,10 @@ export const marketApi = {
     });
   },
 
-  deleteCategory: async (sourceId: string, categoryId: number): Promise<void> => {
+  deleteCategory: async (
+    sourceId: string,
+    categoryId: number,
+  ): Promise<void> => {
     await request(`/market/categories/${categoryId}`, {
       method: "DELETE",
       ...mergeHeaders({
@@ -380,6 +408,35 @@ export const marketApi = {
     }
     const opts = mergeHeaders({ "X-Source-Id": sourceId });
     return request<MarketSkill[]>(url, opts);
+  },
+
+  browseMarket: async (
+    sourceId: string,
+    resourceType: "skill" | "mcp",
+    options?: {
+      categoryId?: number | null;
+      bbkId?: string | null;
+      uncategorized?: boolean;
+      orphaned?: boolean;
+    },
+  ): Promise<MarketBrowseResponse> => {
+    const params = new URLSearchParams({ resource_type: resourceType });
+    if (options?.categoryId != null) {
+      params.set("category_id", String(options.categoryId));
+    }
+    if (options?.bbkId) {
+      params.set("bbk_id", options.bbkId);
+    }
+    if (options?.uncategorized) {
+      params.set("uncategorized", "true");
+    }
+    if (options?.orphaned) {
+      params.set("orphaned", "true");
+    }
+    return request<MarketBrowseResponse>(
+      `/market/browse?${params.toString()}`,
+      mergeHeaders({ "X-Source-Id": sourceId }),
+    );
   },
 
   listMarketExperts: async (

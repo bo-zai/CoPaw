@@ -19,7 +19,12 @@ import {
   PlusOutlined,
   SaveOutlined,
 } from "@ant-design/icons";
-import { marketApi, type Category } from "../../api/modules/market";
+import {
+  marketApi,
+  ORPHANED_CATEGORY_ID,
+  UNCATEGORIZED_CATEGORY_ID,
+  type Category,
+} from "../../api/modules/market";
 
 interface CategoryManagementModalProps {
   open: boolean;
@@ -63,11 +68,27 @@ export function CategoryManagementModal({
   const [draftName, setDraftName] = useState("");
   const [draftBranchVisible, setDraftBranchVisible] = useState(true);
   const [savingId, setSavingId] = useState<EditingId>(null);
+  const [uncategorizedSkillCount, setUncategorizedSkillCount] = useState(0);
+  const [orphanedSkillCount, setOrphanedSkillCount] = useState(0);
 
   const loadCategories = useCallback(async () => {
     setLoading(true);
     try {
-      setCategories(await marketApi.listCategories(sourceId));
+      const [categoryData, browseData] = await Promise.all([
+        marketApi.listCategories(sourceId),
+        marketApi.browseMarket(sourceId, "skill"),
+      ]);
+      setCategories(categoryData);
+      setUncategorizedSkillCount(
+        browseData.categories.find(
+          (category) => category.id === UNCATEGORIZED_CATEGORY_ID,
+        )?.count ?? 0,
+      );
+      setOrphanedSkillCount(
+        browseData.categories.find(
+          (category) => category.id === ORPHANED_CATEGORY_ID,
+        )?.count ?? 0,
+      );
     } catch (error) {
       message.error(getErrorMessage(error));
     } finally {
@@ -226,6 +247,20 @@ export function CategoryManagementModal({
       <div style={{ color: "#4b5563", fontSize: 13, marginBottom: 16 }}>
         仅技能使用此分类体系。分类关闭分行可见后，分行用户将不会看到该分类及其技能；总行仍可见。
       </div>
+      <Alert
+        type="info"
+        showIcon
+        message={`未分类技能：${uncategorizedSkillCount} 个`}
+        description="历史未设置分类的技能会归入“未分类”。该分组仅用于筛选，不支持改名、删除或排序。"
+        style={{ marginBottom: 16 }}
+      />
+      <Alert
+        type="warning"
+        showIcon
+        message={`待整理技能：${orphanedSkillCount} 个`}
+        description="引用已不存在分类的历史技能会归入“待整理分类”，请通过技能编辑逐个设置真实分类。该分组仅用于定位，不支持改名、删除或排序。"
+        style={{ marginBottom: 16 }}
+      />
       <Alert
         type="info"
         showIcon

@@ -11,6 +11,7 @@ import { CategoryManagementModal } from "./CategoryManagementModal";
 
 const mocks = vi.hoisted(() => ({
   listCategories: vi.fn(),
+  browseMarket: vi.fn(),
   updateCategory: vi.fn(),
   createCategory: vi.fn(),
   deleteCategory: vi.fn(),
@@ -19,6 +20,8 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("../../api/modules/market", () => ({
   marketApi: mocks,
+  ORPHANED_CATEGORY_ID: -2,
+  UNCATEGORIZED_CATEGORY_ID: -1,
 }));
 
 const category = {
@@ -41,6 +44,9 @@ describe("CategoryManagementModal", () => {
 
   it("keeps category names read-only until one row enters edit mode", async () => {
     mocks.listCategories.mockResolvedValue([category]);
+    mocks.browseMarket.mockResolvedValue({
+      categories: [{ id: -1, name: "未分类", count: 5 }],
+    });
 
     render(
       <CategoryManagementModal
@@ -69,6 +75,9 @@ describe("CategoryManagementModal", () => {
 
   it("saves edited name and branch visibility together", async () => {
     mocks.listCategories.mockResolvedValue([category]);
+    mocks.browseMarket.mockResolvedValue({
+      categories: [{ id: -1, name: "未分类", count: 5 }],
+    });
     mocks.updateCategory.mockResolvedValue({
       ...category,
       name: "工具技能",
@@ -105,5 +114,49 @@ describe("CategoryManagementModal", () => {
       }),
     );
     expect(onChanged).toHaveBeenCalled();
+  });
+
+  it("shows the uncategorized skill count without exposing it as a managed row", async () => {
+    mocks.listCategories.mockResolvedValue([category]);
+    mocks.browseMarket.mockResolvedValue({
+      categories: [{ id: -1, name: "未分类", count: 5 }],
+    });
+
+    render(
+      <CategoryManagementModal
+        open
+        sourceId="source"
+        onClose={vi.fn()}
+        onChanged={vi.fn()}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByText(/未分类技能：5 个/)).toBeTruthy(),
+    );
+    expect(screen.queryByRole("button", { name: "编辑未分类" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "删除未分类" })).toBeNull();
+  });
+
+  it("shows orphaned skill guidance without exposing it as a managed row", async () => {
+    mocks.listCategories.mockResolvedValue([category]);
+    mocks.browseMarket.mockResolvedValue({
+      categories: [{ id: -2, name: "待整理分类", count: 12 }],
+    });
+
+    render(
+      <CategoryManagementModal
+        open
+        sourceId="source"
+        onClose={vi.fn()}
+        onChanged={vi.fn()}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByText(/待整理技能：12 个/)).toBeTruthy(),
+    );
+    expect(screen.queryByRole("button", { name: "编辑待整理分类" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "删除待整理分类" })).toBeNull();
   });
 });

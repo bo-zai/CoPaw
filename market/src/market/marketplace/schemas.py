@@ -532,3 +532,30 @@ class BranchCountsResponse(BaseModel):
     """分行列表及计数响应."""
 
     branches: list[BranchCount] = Field(description="分行列表及计数")
+
+
+class MarketBrowseCategory(BaseModel):
+    """统一市场浏览的分类 facet."""
+
+    id: int
+    name: str
+    count: int = 0
+
+
+class MarketBrowseBranch(BaseModel):
+    """统一市场浏览的分行 facet."""
+
+    bbk_id: str
+    count: int = 0
+
+
+class MarketBrowseResponse(BaseModel):
+    """统一市场浏览结果及两侧 facet 统计."""
+
+    resource_type: str
+    items: list[dict] = Field(default_factory=list)
+    total: int = 0
+    category_total: int = 0
+    branch_total: int = 0
+    categories: list[MarketBrowseCategory] = Field(default_factory=list)
+    branches: list[MarketBrowseBranch] = Field(default_factory=list)

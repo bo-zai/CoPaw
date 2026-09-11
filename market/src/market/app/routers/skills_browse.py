@@ -719,7 +719,9 @@ async def list_skills(
         parsed_bbk_ids = [b.strip() for b in bbk_ids.split(",") if b.strip()]
     svc = request.app.state.marketplace
     visible_category_ids = None
-    if not is_head_office and svc.db.is_connected:
+    if not is_head_office:
+        if not svc.db.is_connected:
+            raise HTTPException(status_code=503, detail="Database unavailable")
         category_rows = await svc.db.fetch_all(
             "SELECT id FROM swe_marketplace_categories "
             "WHERE source_id = %s AND COALESCE(branch_visible, 1) = 1",
